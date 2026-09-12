@@ -1,0 +1,38 @@
+# Parallel Module Generation
+
+Use parallel workers only after the coordinator has completed the global inventory. The point of parallelism is independent module ownership; it is not permission to skip contract reconciliation or run shared test data concurrently.
+
+## Phases
+
+1. **Coordinator, sequential:** discover repository rules, locate the offline OpenAPI file, parse every operation, inspect source mappings and shared security/fixtures, classify the business-code version, freeze `module-map.yaml`, and identify cross-module dependencies.
+2. **Workers, parallel where independent:** start one worker per independent module. Each worker generates and tests only its assigned module.
+3. **Coordinator, sequential:** review worker reports, regenerate `index.yaml`, reconcile all modules, validate cross-module flows, run the final collection, and advance `version-lock.yaml` only after all required evidence is present.
+
+## Ownership
+
+| Owner | Writable scope |
+| --- | --- |
+| Coordinator | `module-map.yaml`, `index.yaml`, `version-lock.yaml`, `impact-rules.yaml`, `flows/cross-module.yaml`, shared environments, global scripts, and business-repository metadata |
+| Module worker | `contracts/modules/<module>/{endpoints,logic,cases,flows,exclusions}.yaml`, `contracts/modules/<module>/CASES.md`, and `bruno/<module>/` |
+
+Workers must not edit another module, business source code, shared credentials, or coordinator-owned files. A worker may read shared files and must return its case IDs, logic IDs, execution evidence, changed paths, and unresolved blockers to the coordinator.
+
+## Scheduling
+
+- Workers may generate modules concurrently when their endpoint sets, fixtures, and flows are independent.
+- A module that requires another module's captured ID, shared mutable account, or ordered setup belongs in the coordinator phase or waits for its dependency.
+- Parallel execution requires isolated users, tenants, database records, and environment variables. Without demonstrated isolation, execute module collections sequentially even if generation was parallel.
+- A worker failure does not authorize silently dropping the module. The coordinator records the failure and the final coverage check remains failing until the module is repaired or explicitly excluded with a reason.
+
+## Handoff
+
+Each worker reports:
+
+- module ID and owned paths;
+- generated endpoint, logic, case, and flow IDs;
+- Bruno files created or changed;
+- execution evidence and command output;
+- missing CRUD operations or exclusions with reasons;
+- blockers and required coordinator actions.
+
+The coordinator treats worker reports as input, not proof. The global coverage and flow validators, plus the final Bruno run, are authoritative.

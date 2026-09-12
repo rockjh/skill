@@ -1,0 +1,4 @@
+interface:
+  display_name: "Python E2E Test Generator"
+short_description: "Generate multi-service pytest E2E tests with optional integration checks"
+default_prompt: "Use $python-e2e-test-generator to design and verify Python pytest E2E scenarios across this business system's services and any project-approved Kafka, MySQL, EMQ/EMQX, Redis, or XXL-JOB integrations."

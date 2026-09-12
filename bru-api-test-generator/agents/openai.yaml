@@ -1,0 +1,4 @@
+interface:
+  display_name: "bru-api-test-generator"
+  short_description: "Generate modular Bruno tests from offline Swagger"
+  default_prompt: "Use $bru-api-test-generator to locate or acquire the local Swagger contract (probing an already-running loopback app only when no file exists), then generate verified Bruno API tests, record a complete scenario matrix, run strict offline-OpenAPI reconciliation, validate flow cleanup evidence, and perform coordinator-owned global reconciliation."
