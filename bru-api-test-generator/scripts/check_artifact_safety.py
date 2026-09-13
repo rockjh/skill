@@ -46,8 +46,8 @@ def scan(paths: list[Path]) -> list[str]:
                 continue
             seen.add(path)
             try:
-                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-            except OSError as exc:
+                lines = path.read_text(encoding="utf-8", errors="strict").splitlines()
+            except (OSError, UnicodeDecodeError) as exc:
                 findings.append(f"{path}: cannot read artifact: {exc}")
                 continue
             for line_no, line in enumerate(lines, 1):

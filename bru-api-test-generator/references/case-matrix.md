@@ -22,6 +22,10 @@ applications (including RuoYi-style Ajax responses) return HTTP 200 with a
 business `code: 401`; copying an assumed HTTP 401 expectation creates a suite
 that looks security-aware but fails every request.
 
+If the representative probe is unavailable or returns an unexpected 5xx,
+keep generated authentication cases pending and mark execution blocked; do
+not template guessed status or business-code values across the module.
+
 The minimum contract-driven decisions are: success for every reachable operation; authentication for secured operations; validation for operations with parameters or request bodies; query behavior for list/search operations with filters, pagination, or sorting; and file behavior for multipart/upload/download operations. Authorization, business-error, safety, and boundary cases are required whenever source/configuration exposes those branches. A decision is not evidence by itself: the linked Bruno file must contain the corresponding request and assertions.
 
 Do not manufacture cases that have no observable behavior. Explain exclusions in the manifest so the coverage checker can distinguish intentional scope from a missing test.
@@ -34,7 +38,8 @@ usually needs `?userName=admin&pageNum=1&pageSize=10`, not
 
 ## Module Flow
 
-For a module that exposes CRUD operations, add a separate ordered flow in `flows.yaml`:
+For a module or endpoint explicitly marked `flow_required: true` (or with a
+non-empty `flow_kind`), add a separate ordered flow in `flows.yaml`:
 
 ```yaml
 - id: USER_CRUD_FLOW

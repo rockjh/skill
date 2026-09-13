@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Build reviewable Java logic candidates for API test planning.
+"""Build reviewable Java/Spring logic candidates for API test planning.
 
-This is intentionally a lightweight scanner. It finds evidence for review; it
-does not claim that regex matching proves Java branch coverage.
+This is an optional Java/Spring adapter. The generic workflow uses
+``analyze_source_logic.py`` for cross-language candidates. It finds evidence
+for review; it does not claim that regex matching proves branch coverage.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -28,14 +30,19 @@ def clean_evidence(line: str) -> str:
 
 
 def add_candidate(items: list[dict[str, Any]], kind: str, path: Path, line_no: int, symbol: str, line: str) -> None:
+    evidence = clean_evidence(line)
+    stable_key = f"{kind}|{path.stem}|{symbol}|{evidence}"
+    stable_id = "_".join(
+        part for part in (kind.upper(), path.stem.upper(), symbol.replace(".", "_").upper()) if part
+    ) + "_" + hashlib.sha1(stable_key.encode("utf-8")).hexdigest()[:10]
     items.append(
         {
-            "id": f"{kind.upper()}_{path.stem.upper()}_{line_no}",
+            "id": stable_id,
             "kind": kind,
             "file": str(path),
             "line": line_no,
             "symbol": symbol,
-            "evidence": clean_evidence(line),
+            "evidence": evidence,
             "needs_case": True,
         }
     )
@@ -72,7 +79,12 @@ def scan(roots: list[Path]) -> dict[str, Any]:
                 add_candidate(candidates, "validation", path, line_no, symbol, line)
             if ERROR_RE.search(line):
                 add_candidate(candidates, "error_builder", path, line_no, symbol, line)
-            if BRANCH_RE.search(line):
+            observable = re.search(
+                r"\b(?:throw|return|catch|permission|forbidden|unauthor|duplicate|exists|not\s*found|error|fail|status|code)\b",
+                line,
+                re.IGNORECASE,
+            )
+            if BRANCH_RE.search(line) and observable:
                 add_candidate(candidates, "branch", path, line_no, symbol, line)
     return {
         "version": 1,

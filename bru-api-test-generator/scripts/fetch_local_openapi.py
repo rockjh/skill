@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import http.client
 import ipaddress
 import json
@@ -16,6 +17,7 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -70,7 +72,7 @@ def listening_ports() -> set[int]:
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
-                errors="replace",
+                errors="strict",
                 timeout=2,
             )
         except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
@@ -229,6 +231,9 @@ def main() -> int:
         help="OpenAPI path to probe; may be repeated",
     )
     parser.add_argument("--timeout", type=float, default=2.0)
+    parser.add_argument("--application-sha", default=os.environ.get("BUSINESS_GIT_SHA"))
+    parser.add_argument("--application-pid", default=os.environ.get("APP_PID"))
+    parser.add_argument("--startup-command", default=os.environ.get("APP_STARTUP_COMMAND"))
     args = parser.parse_args()
     project_root = args.project_root.resolve()
     if not project_root.is_dir():
@@ -273,6 +278,20 @@ def main() -> int:
         return 3
     if valid:
         url, document = valid[0]
+        raw_contract = json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        provenance = {
+            "source_url": url,
+            "acquired_at": datetime.now(timezone.utc).isoformat(),
+            "contract_sha256": hashlib.sha256(raw_contract).hexdigest(),
+            "application_sha": args.application_sha,
+            "application_pid": args.application_pid,
+            "startup_command": args.startup_command,
+            "status": "verified"
+            if args.application_sha and args.application_pid and args.startup_command
+            else "contract_provenance_unverified",
+        }
+        document = dict(document)
+        document["provenance"] = provenance
         try:
             write_atomic(output, render_document(document, output))
         except (OSError, SystemExit) as exc:

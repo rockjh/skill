@@ -48,8 +48,24 @@ Support OpenAPI 2.0 and OpenAPI 3.x in JSON. Support YAML only when an existing 
 
 Full schema generation and exhaustive `$ref` dereferencing are not required for the initial inventory. Preserve unresolved references in the manifest and inspect the referenced definitions when concrete request/response assertions need them. A malformed or unsupported document is a blocker, not a reason to guess.
 
-The repository may use the bundled `scripts/parse_openapi.py` to produce a JSON or YAML manifest based on the output extension. The parser is an inventory aid; source-code inspection remains mandatory for normal and error logic.
+`scripts/parse_openapi.py` resolves local `#/...` references for parameter,
+request-body, and response metadata while retaining the original `$ref`. The
+generated source records the document SHA. When the document came from
+`fetch_local_openapi.py`, retain its `provenance` block; missing application
+build metadata is reported as `contract_provenance_unverified` and must be
+resolved before a collection is called verified.
+
+The repository may use the bundled `scripts/parse_openapi.py` to produce a JSON or YAML manifest based on the output extension. The parser is an inventory aid. When source is available, inspect it for normal and error logic; otherwise use contract-only mode and record source-derived logic as unavailable.
 
 ## Module Partition
 
-When the application has more than one business domain, provide a module-map.yaml file and use the parser's module-map and output-dir options. The parser should write one endpoints.yaml per module and a generated index.yaml. Use Swagger tags first, then path prefixes, then reviewed controller mappings. Do not silently put unmatched operations into an arbitrary module.
+Provide a `module-map.yaml` file with one stable ASCII `id`, an optional
+human-readable `directory`, and at most one `swagger_tags` value per original
+OpenAPI Tag, then use the parser's `--module-map` and `--output-dir` options.
+For untagged operations, declare `operation_ids`, `path_prefixes`, one
+`default: true` module, or a single-module map. The parser writes one isolated
+`endpoints.yaml`, `parameters.yaml`, `definitions.yaml`, and `responses.yaml`
+per module, plus a generated `index.yaml`. An operation with multiple Tags
+needs an explicit `primary_tags` override. A missing fallback owner remains a
+blocker; URL prefixes are only fallback configuration for operations that have
+no Tag.

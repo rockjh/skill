@@ -19,16 +19,88 @@ def as_names(value: Any) -> set[str]:
     return set()
 
 
+def case_module_index(contracts_root: Path) -> dict[str, str]:
+    index: dict[str, str] = {}
+    modules_root = contracts_root / "modules"
+    if not modules_root.is_dir():
+        return index
+    for module_dir in sorted(path for path in modules_root.iterdir() if path.is_dir()):
+        path = module_dir / "cases.yaml"
+        if not path.is_file():
+            continue
+        for case in first_list(load_data(path), "cases"):
+            if case.get("id"):
+                index[str(case["id"])] = module_dir.name
+    return index
+
+
+def requires_flow(endpoints_doc: Any, endpoints: list[dict[str, Any]]) -> bool:
+    """Use explicit manifest intent instead of inferring CRUD from HTTP methods."""
+
+    if isinstance(endpoints_doc, dict) and endpoints_doc.get("flow_required") is True:
+        return True
+    return any(
+        endpoint.get("flow_required") is True or bool(str(endpoint.get("flow_kind", "")).strip())
+        for endpoint in endpoints
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("flows", type=Path)
     parser.add_argument("--results", type=Path, required=True)
+    parser.add_argument("--endpoints", type=Path, help="module endpoints.yaml used to detect explicitly flow-required operations")
+    parser.add_argument("--exclusions", type=Path, help="module exclusions.yaml with an approved cleanup plan")
+    parser.add_argument(
+        "--contracts-root",
+        type=Path,
+        help="contracts root used to enforce module-local versus cross-module case ownership",
+    )
     args = parser.parse_args()
     flows_doc = load_data(args.flows)
     results = load_data(args.results)
     declared = first_list(flows_doc, "flows") or (flows_doc if isinstance(flows_doc, list) else [])
     actual_flows = results.get("flows", {}) if isinstance(results, dict) else {}
     errors: list[str] = []
+    case_modules = case_module_index(args.contracts_root) if args.contracts_root else {}
+    flow_is_cross_module = args.flows.parent.name == "flows" and args.flows.name == "cross-module.yaml"
+
+    if not declared:
+        endpoint_items = []
+        if args.endpoints and args.endpoints.is_file():
+            endpoint_items = first_list(load_data(args.endpoints), "endpoints")
+        has_crud = requires_flow(
+            load_data(args.endpoints) if args.endpoints and args.endpoints.is_file() else {},
+            endpoint_items,
+        )
+        exclusions = []
+        if args.exclusions and args.exclusions.is_file():
+            exclusions = first_list(load_data(args.exclusions), "exclusions")
+        approved_cleanup = any(
+            str(item.get("status", "approved")).lower() == "approved"
+            and str(item.get("reason", "")).strip()
+            and str(item.get("cleanup_plan", item.get("reset_procedure", ""))).strip()
+            and (str(item.get("kind", item.get("type", ""))).lower() in {"flow", "cleanup"} or item.get("flow_id"))
+            for item in exclusions
+        )
+        if has_crud and not exclusions:
+            print("flow execution check failed")
+            print("ERROR: module declares flow_required operations but flows.yaml declares no flow or exclusion")
+            return 1
+        if has_crud and any(
+            str(item.get("status", "approved")).lower() == "approved"
+            and str(item.get("reason", "")).strip()
+            and not str(item.get("cleanup_plan", item.get("reset_procedure", ""))).strip()
+            for item in exclusions
+        ):
+            print("flow execution check failed")
+            print("ERROR: approved flow exclusion must include a cleanup/reset plan")
+            return 1
+        if has_crud and not approved_cleanup:
+            print("skipped: no declared flows (pending exclusion)")
+            return 0
+        print("skipped: no declared flows")
+        return 0
 
     for flow in declared:
         flow_id = str(flow.get("id"))
@@ -46,6 +118,26 @@ def main() -> int:
         actual_steps = actual.get("steps", []) if isinstance(actual, dict) else []
         actual_ids = [step.get("case_id") for step in actual_steps if isinstance(step, dict)]
         expected_ids = [step.get("case_id") for step in expected_steps if isinstance(step, dict)]
+        if case_modules:
+            referenced_modules = {
+                case_modules.get(str(case_id))
+                for case_id in expected_ids
+                if str(case_id) in case_modules
+            }
+            unknown_cases = sorted(str(case_id) for case_id in expected_ids if str(case_id) not in case_modules)
+            errors.extend(
+                f"flow {flow_id} references unknown case {case_id}"
+                for case_id in unknown_cases
+            )
+            if flow_is_cross_module:
+                if len(referenced_modules) < 2:
+                    errors.append(f"cross-module flow {flow_id} does not span multiple Tag modules")
+            else:
+                inferred_module = args.flows.parent.name
+                if any(module != inferred_module for module in referenced_modules):
+                    errors.append(
+                        f"module flow {flow_id} references another Tag module; move it to flows/cross-module.yaml"
+                    )
         if actual_ids != expected_ids:
             errors.append(f"flow {flow_id} executed order {actual_ids}, expected {expected_ids}")
         if actual.get("status") != "passed":

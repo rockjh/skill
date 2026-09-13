@@ -17,9 +17,13 @@ Keep three concerns separate:
 3. **Scenario tests** express business intent, checkpoints, correlation, and
    cleanup. They must not hide the complete journey inside a generic helper.
 
-Create an adapter only for an approved scenario that needs it. Reuse a client
-or library already used by the E2E project or business project where possible;
-do not silently add a dependency or create a universal middleware abstraction.
+Create or enable an adapter only for an approved scenario that needs it. MySQL,
+Kafka, EMQ/EMQX, Redis, and similar public components should have one generic,
+configuration-driven adapter per component in the shared integration area; the
+scenario supplies project-specific table/topic/key/payload mapping. Reuse a
+client or library already used by the E2E project or business project where
+possible; do not silently add a dependency or create a universal middleware
+abstraction that hides business intent.
 
 ## Configuration and lifecycle
 
@@ -43,6 +47,29 @@ do not silently add a dependency or create a universal middleware abstraction.
   when the scenario explicitly models that actor and the business project
   approves the input interface. Mark the input as scenario-owned and clean it
   up or expire it according to the project convention.
+
+## Enable/disable contract
+
+- Declare every public component in the project configuration with `enabled`
+  and `required` semantics, plus its configuration source and adapter scope.
+- Treat `system.integration_config.<kind>.enabled` as the global capability and
+  `scenario.integration_dependencies[].enabled` as the scenario opt-in. The
+  effective value is their logical AND when the scenario dependency exists; no
+  dependency entry means the scenario does not opt in. A scenario cannot
+  broaden a global disable. Keep the legacy `enabled_integrations` list derived
+  from the global map and fail reconciliation when it disagrees with that map.
+- A missing or malformed `enabled` value is a configuration error; do not infer
+  enabled or disabled from client-library availability or a guessed default.
+- `enabled: false` means no client construction, connection, health check,
+  fixture setup, polling, write, or evidence claim for that component. The
+  generated report records it as disabled rather than as a passing checkpoint.
+- `enabled: true` requires a non-destructive preflight before business data is
+  created. Missing credentials, schema access, or isolation values are a
+  blocked precondition for required scenarios and an explicit skip for optional
+  scenarios only.
+- Keep adapter APIs generic and typed around project-provided mappings. Do not
+  put scenario business rules, hard-coded topics/tables/keys, or secrets in a
+  shared adapter.
 
 ## Preflight and optional components
 
@@ -135,3 +162,8 @@ correlation values, query/topic/key identifiers, polling deadline, and the last
 observed state. Secrets and message payload fields classified as sensitive by
 the business project must be redacted before they reach pytest output or test
 reports.
+
+Generated adapter modules and fixtures must contain Chinese module/class/function
+docstrings and comments for connection scope, enabled-state branching,
+correlation, polling, redaction, and cleanup. Identifiers may remain in the
+project's conventional language.
