@@ -1,108 +1,107 @@
 ---
 name: python-e2e-test-generator
-description: Run a gated workflow for designing and implementing black-box Python/pytest business E2E scenarios across microservices, APIs, asynchronous components, and data stores, with isolated environments, configurable headers/signatures, and scenario-owned artifacts. Use for an independent E2E test project; do not use for single-endpoint Bruno coverage.
+description: Design, generate, and incrementally maintain independent black-box Python/pytest business E2E scenarios across services, APIs, messages, and data stores. Use when tests must be derived from service source, remain collectable without runtime environment values, and keep Chinese scenario-owned artifacts with per-scenario Git impact tracking; do not use for exhaustive single-endpoint coverage.
 ---
 
-# Python E2E Workflow
+# Python E2E Test Generator
 
-Use this skill as a workflow, not as a blind test-file generator. The independent Python project should behave like an external consumer of the deployed system. A business system may contain several service repositories; inspect them read-only to reconstruct the service graph, contracts, and observable side effects. The business repositories must not be modified to make E2E tests pass.
+Build an independent E2E project that behaves as an external consumer of the deployed system. Inspect business repositories read-only to reconstruct public entrypoints, service calls, messages, persistence, jobs, configuration, and observable completion signals. Never modify application repositories to make generated tests pass.
 
-Invoke it from either the business workspace or an existing E2E project. If no
-independent E2E project exists, identify a user-approved location during
-discovery and create the test project there after plan approval; do not scatter
-test code into individual service repositories.
+## Naming and ownership
 
-## Boundary
+Keep technical structure and configuration names in English:
 
-This workflow owns cross-interface business behavior:
+- `config/`, `common/`, `scripts/`, `environments/`
+- `common.yaml`, `example.yaml`, environment profile names, `pyproject.toml`, `conftest.py`
+- reusable Python package/module identifiers
 
-- multi-step journeys and state transitions.
-- cross-service workflows spanning HTTP/gRPC, events, jobs, and callbacks.
-- role/tenant/data-permission flows.
-- database-, message-, cache-, and job-visible side effects when API assertions are insufficient.
-- asynchronous processing, polling, files, external dependencies, idempotency, and recovery.
-- deterministic fixtures, cleanup, reporting, and CI execution.
+Use a clear Chinese business name for each directory under `scenarios/` and for scenario-owned business artifacts:
 
-The Bruno collection owns the exhaustive single-endpoint matrix. Do not duplicate every Bruno validation case in Python. If a browser is required, use the project's approved Playwright/Selenium layer and keep the scenario model and cleanup rules below.
+- `场景定义.yaml`
+- `场景说明.md`
+- `业务流程图.md`
+- `自动化测试流程图.md`
+- `版本变更记录.md`
+- `test_<中文业务名称>.py`
 
-## Gated Phases
+Keep the stable scenario ID only in `场景定义.yaml` and a pytest marker. Do not put it in a directory name or maintain any global scenario manifest. `E2E_PLAN.md` may document project-wide strategy, commands, and constraints, but it must not duplicate a scenario inventory.
 
-1. **Discover.** Inspect the independent E2E project's `AGENTS.md`, `pyproject.toml`, fixtures, clients, reporting, and test commands. Inspect every relevant service repository, its build/deployment manifests, API/event contracts, database migrations, job definitions, and the user's business description. Build a service and dependency map: entrypoints, downstream calls, topics/queues, tables, keys, jobs, and observable completion signals. Identify actors, preconditions, state transitions, data ownership, external dependencies, environment profiles, isolation primitives, request-header/signature rules, and the business project's configuration contract. Do not invent generic configuration names or defaults; use the project-defined sources, values, and fixture scopes.
-2. **Plan only.** Before writing test code, produce or update `E2E_PLAN.md` and machine-readable `scenarios.yaml`. Each scenario gets a stable ID and status (`planned`, `implemented`, `blocked`, or `excluded`), an `artifact_dir`, a required swimlane diagram path, actor, preconditions, involved services/interfaces, request headers and optional signing configuration, required or optional integration dependencies, configuration source and scope, environment/isolation contract, business steps, observable checkpoints, expected outcomes, cleanup strategy, and dependencies on API case IDs. A checkpoint must identify the owning service, evidence source (HTTP/application response, database row, message, cache entry, job execution, file, or other project-approved observable), and its correlation key. Separate applicable scenarios from explicit exclusions with reasons. Stop for review by default; a user request that explicitly asks to implement or generate the scripts is approval to continue after the plan is recorded, not permission to skip planning.
-3. **Golden sample.** After approval, implement one representative login/permission flow and one representative cross-service or state-transition flow. When the system uses an enabled asynchronous component, the sample must demonstrate its adapter, bounded polling, correlation, assertion, and cleanup. Run the samples in the real test environment and use review feedback to update the local `AGENTS.md` or workflow policy.
-4. **Batch implementation.** Generate at most one or two related business workflows per batch. Keep the scenario ID visible in pytest markers and report output. Add only the integration adapters required by the approved scenarios; keep transport clients, component adapters, and business intent separate. After each batch, run the narrow tests, inspect failures and diagnostics, update the plan, and only then continue.
-5. **Full verification.** Run the full pytest command, scenario reconciliation, and all planned database, message, cache, job, file, or artifact checks. Verify cleanup and isolation, including owned middleware records. Report the exact environment/build version, command, pass/fail result, skipped scenarios, missing observables, and remaining blockers.
+## Workflow
 
-## Test Design Rules
+1. **Discover source and project conventions.** Read the E2E project's `AGENTS.md`, `pyproject.toml`, configuration, clients, fixtures, and commands. Inspect relevant application repositories, contracts, migrations, producers/consumers, jobs, and deployment configuration. Identify business actors, preconditions, state transitions, public inputs, correlation keys, observables, cleanup, environment contract, and source anchors.
+2. **Write the scenario contract.** Create or update the scenario's own `场景定义.yaml`, explanation, and both diagrams. Record its stable ID, business definition, dependencies, checkpoints, cleanup, execution status, and `source_versions`. Do not create `scenarios.yaml`, `场景清单.yaml`, or an equivalent registry. Stop for review when the user asked only for planning; an explicit implementation/generation request authorizes continuing after the scenario contract is recorded.
+3. **Generate collectable code.** Generate the complete pytest business flow, required reusable clients/adapters, assertions, and cleanup even when URLs, credentials, VIN, ICCID, brokers, or database connections are unavailable. Configuration access must be lazy enough that `pytest --collect-only` succeeds without runtime environment values.
+4. **Preflight before side effects.** On real execution, validate the selected environment, isolation, service access, credentials, and required integrations before producing business data. Missing runtime values set the scenario execution status to `pending_environment` and fail preflight; do not use `skip` or treat the scenario as passed.
+5. **Verify behavior.** When an environment is available, run focused tests, then the full suite and reconciliation scripts. Preserve redacted diagnostics, verify cleanup, and report the environment and source versions actually exercised.
+6. **Incremental maintenance.** Before updating or regenerating a scenario, run the per-scenario Git impact workflow in [references/version-sync-policy.md](references/version-sync-policy.md). Change only scenarios whose source changes affect inputs, steps, assertions, correlation, or cleanup.
 
-- `base_url`, credentials, tokens, tenant, feature flags, and any other runtime settings come from the business project's approved `conftest.py` fixtures, environment contract, or configuration provider; no secrets, developer URLs, or invented defaults in source.
-- Every run selects a named project environment profile and an explicit isolation mechanism (for example, tenant, namespace, schema, topic prefix, cache prefix, or equivalent). Fail preflight when the profile or isolation value is missing; never silently fall back to a developer or shared environment. Record the source and scope in the scenario plan. Immutable settings may be session-scoped, run-level settings may be shared only within one isolated test run, and mutable settings must be scenario-owned or restored during cleanup.
-- Transport clients must accept a per-request `headers` mapping. Merge project/common, environment, scenario, and request headers using the project's documented precedence, and redact sensitive values in diagnostics. Apply signing after ordinary header merging; configured signature headers are reserved and cannot be overridden by scenario/request headers. Do not hide scenario-specific headers in a global fixture.
-- Support request signing behind an explicit project configuration switch. For the supplied Seres contract, `seres.sign=true` enables the exact SHA-256 procedure and `seres.sign=false` disables it; do not calculate a signature or send signature-derived headers when disabled. When enabled, require the project-declared algorithm, canonicalization, key source, header names, and raw-body mode; reject unknown algorithms or non-raw body modes, never guess defaults, and never commit keys. Read [references/fixture-policy.md](references/fixture-policy.md) and [references/request-signing-template.md](references/request-signing-template.md) for the header/signing contract and commented templates.
-- Use an API client/helper for transport, but keep business intent visible in the scenario test. Do not hide the entire workflow in generic helper code.
-- Model each microservice boundary explicitly. Use the public entrypoint for the user action, then use project-approved clients or read-only observers for downstream evidence; do not fake internal calls that the deployed system would make.
-- Every scenario asserts the important business outcome, not merely that a request returned `2xx`. Include HTTP/application codes where they are part of the contract, plus at least one non-HTTP checkpoint whenever the business outcome crosses an asynchronous, persistence, cache, or scheduling boundary.
-- MySQL, Kafka, EMQ/EMQX, Redis, XXL-JOB, and other public components use shared, generic adapters with project-provided mapping/configuration. The effective setting is `system.integration_config.<kind>.enabled AND scenario dependency exists AND scenario.integration_dependencies[].enabled`; a scenario may narrow a globally enabled component but may not override a global disable. Keep `enabled_integrations` as a derived compatibility list. If disabled or not opted in, do not instantiate its client, run its health check, create its fixture, or claim its checkpoint; if enabled, verify its configuration and lifecycle. Read [references/integration-policy.md](references/integration-policy.md) for component-specific evidence and isolation rules.
-- Classify each integration dependency as required or optional. A required dependency that is unavailable, unauthorized, or misconfigured fails the precondition and blocks the scenario; an optional dependency may be skipped only with an explicit plan reason and report entry. Never silently downgrade an integration checkpoint to an HTTP-only assertion.
-- Run a non-destructive preflight for every involved service and enabled observer before creating business data. Verify connectivity, credentials, protocol/schema access, and required read permissions; record the exact failure instead of masking it with retries.
-- Correlate every side-effect assertion with a run/scenario identifier, business key, trace ID, or project-defined equivalent. Poll with a bounded deadline and report the last observed state; never consume or query unscoped data and call it a pass.
-- Writes use unique run/case identifiers and have teardown that runs on failure as well as success. Prefer API cleanup; use direct DB cleanup only where it is necessary and documented.
-- Tests must be independently repeatable. Do not rely on execution order, a developer's existing records, or a previous test's token/session.
-- Parallel execution is allowed only when service, tenant, topic, consumer, database, cache, job, and mutable configuration ownership is scenario-safe. If a project-wide setting cannot be isolated, mark the affected scenarios serial and snapshot/restore it with an explicit lock.
-- Use polling with a bounded timeout for eventual consistency. Do not use blind sleeps or broad retries that conceal defects.
-- Keep fixtures narrowly scoped and make ownership explicit: session, run, scenario, and step data should not leak across tests.
-- Keep non-public code, data, scripts, and explanatory documents inside `scenarios/<SCENARIO_ID>/`; only genuinely reusable transport, fixtures, signing helpers, and component adapters belong in shared modules. Every scenario must include a Mermaid swimlane diagram covering actors, service boundaries, enabled observers, correlation, and cleanup. Read [references/scenario-artifact-policy.md](references/scenario-artifact-policy.md).
-- Generated Python must use Chinese comments/docstrings at high density for modules, classes, fixtures, public helpers, scenario steps, configuration fields, non-trivial branches, correlation, polling, and cleanup. Keep identifiers aligned with the project, but explain business intent and operational ownership in Chinese; do not emit unexplained English-only scaffolding.
-- A Python scenario can reference Bruno/API case IDs, but it does not satisfy endpoint coverage unless the manifest explicitly says so.
-- Generate a project-specific reconciliation check that fails on plan IDs without tests, tests without plan IDs, conflicting integration/signing enablement sources, enabled integrations without checkpoints, non-raw signed bodies, unmaterialized template paths, or scenarios without cleanup evidence. Keep its command in the project test instructions and CI configuration.
-- Reuse existing approved dependencies. Any new client library needed for an integration must be explicitly approved, pinned in the E2E project's dependency file, and covered by the plan; never install an unpinned client as an implicit implementation detail.
-- Do not modify application source, schema, production data, or deployment configuration as part of test generation.
+Use `contract_blocked` only when source discovery cannot establish an interface, message/schema contract, or expected business rule. Environment unavailability is `pending_environment`, not `contract_blocked`.
 
-## Generated Deliverables
+## Configuration contract
 
-After approval, produce the smallest complete set of project-conforming
-artifacts: the approved scenario plan, one artifact directory per scenario
-containing its pytest code, docs/templates, data, scripts, README, and swimlane, shared generic
-fixtures/transport/signing clients, and generic component adapters activated
-only when configured and needed by an approved scenario, plus configuration,
-preflight documentation, and scenario reconciliation/verification scripts.
-The project must document required versus optional integrations and the command
-that checks plan-to-test coverage. Keep service and component identifiers
-visible in test names, markers, logs, and reports.
-Do not generate placeholder tests for unknown services, configuration, or
-observables; leave those scenarios planned with an explicit missing-input or
-blocked reason.
+`config/common.yaml` contains only shared technical behavior such as integration capability switches and polling defaults. `config/environments/<profile>.yaml` contains environment-specific endpoints, credentials references, authentication, and integration connection settings. Resolve secrets through environment variables or an approved secret provider; never commit them.
 
-## Recommended Project Shape
+A scenario declares only the integrations it needs and whether each is required or optional. It must not repeat connection details or capability switches. Instantiate and preflight an adapter only when the shared capability is enabled and the scenario declares the dependency. A disabled shared capability cannot be re-enabled by a scenario.
+
+Transport clients accept per-request headers. Merge common, environment, scenario, and request headers using the project-defined precedence, then apply signing so reserved signing headers cannot be overridden. Signing settings and key references come from the selected environment configuration. Read [references/fixture-policy.md](references/fixture-policy.md) and [references/request-signing-template.md](references/request-signing-template.md).
+
+## Test invariants
+
+- Call the public business entrypoint; use approved read-only observers for downstream evidence.
+- Assert business/application results, not only HTTP `2xx`.
+- Correlate every asynchronous or persistence assertion by an order ID, atomic order ID, trace ID, or another source-confirmed business key.
+- Use bounded polling with useful last-state diagnostics; do not use blind sleeps.
+- Register idempotent cleanup immediately after resource creation. Prefer API cleanup and restore mutable scenario configuration.
+- Keep tests repeatable and independent of execution order or pre-existing developer data.
+- Put reusable transport, integration, and scope-safe fixture code under `common/`. Keep scenario actions, mappings, assertions, data, and cleanup inside the Chinese scenario directory.
+- Use concise Chinese comments/docstrings where they explain business intent, ownership, correlation, polling, or cleanup. Keep technical identifiers aligned with source code.
+- Reuse approved dependencies. Do not add an unpinned integration client implicitly.
+
+For Kafka plus database workflows, create and subscribe a unique consumer group before the business request, record the starting offset, prove the correlated message was published, separately prove the same correlated result was consumed and persisted, then compare message and row fields. Read [references/integration-policy.md](references/integration-policy.md).
+
+## Expected project shape
 
 ```text
-e2e-project/
+mno-e2e/
   pyproject.toml
   AGENTS.md
   E2E_PLAN.md
-  scenarios.yaml
-  tests/
-    conftest.py                 # project-wide fixtures only
-  scenarios/
-    ORDER_CREATE_001/
-      test_order_create.py
-      README.md
-      swimlane.md
-      docs/                      # materialized templates and detailed docs
-      data/                      # scenario-owned request/expected data
-      scripts/                   # scenario-owned setup/verification helpers
+  config/
+    common.yaml
+    environments/
+      example.yaml
+      icv-test.yaml
   common/
-    clients/                     # reusable transport and signing clients
-    integrations/                # generic MySQL/Kafka/EMQ/Redis adapters
-    fixtures/                    # reusable, scope-safe fixtures
+    clients/
+    integrations/
+    fixtures/
+  scenarios/
+    <中文业务名称>/
+      场景定义.yaml
+      场景说明.md
+      业务流程图.md
+      自动化测试流程图.md
+      版本变更记录.md
+      test_<中文业务名称>.py
   scripts/
     check_scenarios.py
+    check_source_versions.py
 ```
 
-Keep the endpoint/case manifest owned by the business repository or consume the exact versioned artifact published by it. Never silently test an unpinned "latest" build.
+Create additional scenario-owned business artifacts only when needed and give them clear Chinese business names. Never generate a global scenario list.
+
+`scripts/check_scenarios.py` discovers `scenarios/*/场景定义.yaml` directly and checks definition/test/marker/artifact consistency. `scripts/check_source_versions.py` performs per-scenario repository state and impact checks; neither script owns a second source of truth.
 
 ## Completion
 
-The workflow is complete only when the approved scenario inventory has no unexplained missing or unimplemented scenarios, every integration enabled by an approved scenario has a verified evidence checkpoint and cleanup result, every scenario has an up-to-date swimlane and scenario-owned artifacts, the targeted and full pytest commands have real results, cleanup is verified, and failures are actionable. If the environment, configuration contract, or business description is insufficient, stop at the plan and state the missing input instead of inventing domain behavior.
+The work is complete when:
 
-Read [references/e2e-workflow.md](references/e2e-workflow.md) for the scenario-plan schema and review gates, [references/fixture-policy.md](references/fixture-policy.md) for environment isolation and header/signing conventions, [references/integration-policy.md](references/integration-policy.md) when a scenario uses a cross-service or middleware observable, and [references/scenario-artifact-policy.md](references/scenario-artifact-policy.md) for per-scenario files, swimlanes, and Chinese comments.
+- every scenario directory has a self-contained definition, test, two distinct diagrams, and version-change record;
+- every relevant repository has per-scenario source versions and anchors;
+- source changes produce a per-scenario impact decision;
+- `pytest --collect-only` succeeds without environment secrets or endpoints;
+- real execution cannot pass preflight until required environment values are supplied;
+- each required Kafka and database checkpoint is independently correlated and cleanup is verified;
+- reconciliation finds no invalid directory names, duplicate stable IDs/markers, missing artifacts, or scenario directories without definitions.
+
+Read [references/e2e-workflow.md](references/e2e-workflow.md) for the self-contained scenario schema and gates, [references/scenario-artifact-policy.md](references/scenario-artifact-policy.md) for naming and the two diagrams, and [references/version-sync-policy.md](references/version-sync-policy.md) whenever source versions are checked or updated.

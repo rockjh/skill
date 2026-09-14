@@ -1,153 +1,118 @@
 # Python E2E Workflow Contract
 
-The plan is the reviewable contract for the independent E2E project. Keep it machine-readable as `scenarios.yaml` and human-readable as `E2E_PLAN.md`.
+The unit of planning and maintenance is one scenario directory. There is no global machine-readable scenario inventory. `E2E_PLAN.md` contains only project-level strategy, environment/configuration conventions, commands, batch notes, and explicit project-wide constraints.
+
+## Scenario definition
+
+Each `scenarios/<中文业务名称>/场景定义.yaml` is the authoritative contract for that scenario. Use source-confirmed names and omit optional sections that do not apply.
 
 ```yaml
-version: 1
-system:
-  project: <business-project-defined-name>
-  build: <business-project>:<commit-or-tag>
-  environment: <business-project-defined-environment>
-  environment_profile:
-    name: <project-defined-profile>
-    source: <approved-config-source>
-  isolation:
-    run_id_source: <project-defined-source>
-    tenant_or_namespace: <project-defined-isolation>
-  service_catalog: <business-project-defined-artifact-or-source>
-  enabled_integrations:
-    - mysql
-  integration_config:
-    mysql:
-      enabled: true
-      required: true
-      adapter_scope: shared
-      configuration_source: <business-project-defined-source>
-    kafka:
-      enabled: false
-      required: false
-      adapter_scope: shared
-      configuration_source: <business-project-defined-source>
-scenarios:
-  - id: ORDER_CREATE_001
-    status: planned
-    name: customer creates an order and downstream services publish its result
-    artifact_dir: scenarios/ORDER_CREATE_001
-    swimlane: scenarios/ORDER_CREATE_001/swimlane.md
-    actor: <business-project-defined-actor>
-    preconditions:
-      - actor and required permissions exist
-      - the project-defined test tenant or namespace is isolated
-    services:
-      - <entry-service>
-      - <downstream-service>
-    interfaces:
-      - service: <entry-service>
-        kind: <http-or-grpc>
-        name: <public-entrypoint>
-      - service: <downstream-service>
-        kind: <event-or-job>
-        name: <project-defined-boundary>
-    integration_dependencies:
-      - kind: mysql
-        enabled: true
-        required: true
-        configuration_source: <business-project-defined-source>
-      - kind: kafka
-        enabled: false
-        required: false
-        skip_reason: <recorded-only-when-not-enabled>
-        configuration_source: <business-project-defined-source>
-    configuration:
-      source: <business-project-defined-source>
-      scopes:
-        session: <project-defined-immutable-settings>
-        run: <project-defined-run-settings>
-        scenario: <project-defined-mutable-or-owned-settings>
-      isolation:
-        tenant_or_namespace: <scenario-owned-or-project-approved-value>
-        resource_prefix: <run-and-scenario-prefix>
-    request:
-      headers:
-        source: <approved-config-or-scenario-file>
-        precedence: common < environment < scenario < request
-        scenario_overrides: <scenario-owned-header-map-or-reference>
-        request_overrides: <request-specific-header-map-or-reference>
-        per_request: true
-      signing:
-        enabled: false
-        toggle_key: seres.sign
-        algorithm: SHA256
-        canonicalization: <path-query-timestamp-raw-body-secret-suffix>
-        body_mode: raw
-        key_source:
-          secret_key: SECRET_KEY
-          access_key: ACCESS_KEY
-        header_names:
-          signature: sign
-          timestamp: timestamp
-          access_key: accesskey
-        template: scenarios/ORDER_CREATE_001/docs/request-signing.md
-    steps:
-      - submit a uniquely identified order through the public entrypoint
-      - wait for the project-defined downstream completion signal
-    checkpoints:
-      - id: request_accepted
-        owner_service: <entry-service>
-        observable: http_or_grpc_application_result
-        correlation: <business-key-or-trace-id>
-      - id: persisted_order
-        owner_service: <downstream-service>
-        observable: mysql_row_or_project-approved-store
-        correlation: <business-key-or-trace-id>
-      - id: published_event
-        owner_service: <downstream-service>
-        observable: kafka_message_or_other_project-approved-observer
-        enabled: false
-        correlation: <business-key-or-trace-id>
-    expected_outcomes:
-      - each required application code is correct
-      - downstream persistence and enabled integration evidence match the order
-    cleanup: <project-defined-idempotent-cleanup>
-    api_case_ids: []
+id: MNO_REALNAME_DUAL_OPERATOR_RENEWAL
+name: 实名后开通双运营商套餐并验证跨月续订
+execution_status: pending_environment
+
+actor: 已实名车主
+preconditions:
+  - 车辆与车主关系有效
+  - 双运营商套餐可售
+
+services:
+  - mno-traffic
+  - mno-operator
+
+interfaces:
+  - service: mno-traffic
+    kind: http
+    name: SoftwareSaleSubscriptionController
+
+integration_dependencies:
+  - kind: kafka
+    required: true
+  - kind: mysql
+    required: true
+
+steps:
+  - 开通双运营商套餐
+  - 推进并验证跨月续订
+
+checkpoints:
+  - id: subscription_accepted
+    owner_service: mno-traffic
+    observable: http_application_result
+    correlation: order_id
+  - id: fulfillment_published
+    owner_service: mno-traffic
+    observable: kafka_message
+    correlation: atomic_order_id
+  - id: fulfillment_persisted
+    owner_service: mno-operator
+    observable: mysql_row
+    correlation: atomic_order_id
+
+expected_outcomes:
+  - 两个运营商套餐均成功续订
+
+cleanup:
+  - 通过业务 API 删除测试数据
+  - 关闭场景独立 Kafka consumer
+  - 恢复场景修改过的配置
+
+source_versions:
+  - repository: mno-traffic
+    path: ../mno-traffic
+    generated_from_commit: 500832c542f12fced10a92bedd8225e64f635abd
+    last_reviewed_commit: 500832c542f12fced10a92bedd8225e64f635abd
+    branch: develop
+    dirty: false
+    source_anchors:
+      - SoftwareSaleSubscriptionController
+      - RealNameController
+      - OperatorThresholdFulfillmentService
+      - SalablePlanFulfillmentReceiver
+  - repository: mno-operator
+    path: ../mno-operator
+    generated_from_commit: 3023bfb40db540376b6a9dbd2be73b5e5a8d006a
+    last_reviewed_commit: 3023bfb40db540376b6a9dbd2be73b5e5a8d006a
+    branch: develop
+    dirty: false
+    source_anchors:
+      - <source-confirmed-mno-operator-anchor>
 ```
 
-The field names above describe planning metadata, not runtime configuration
-variables. Replace placeholders with the business project's service IDs,
-configuration source, integration conventions, and observable contracts. Do not
-copy example values into a test project without verifying them during discovery.
-`enabled_integrations` remains the compatibility list derived from
-`integration_config`; scenario-level `integration_dependencies` is the opt-in
-and may narrow the requirement but may not broaden a global disable. The
-effective component value is the logical AND of the global flag and an existing
-scenario opt-in flag; no dependency entry means the scenario does not use that
-component.
-For the supplied Seres contract, `request.signing.enabled` is resolved from
-`seres.sign`. When it is false, the generated request must omit all
-signature-derived headers and fields. When true, require `body_mode: raw` for
-body-bearing requests and use the exact SHA-256 canonicalization in the
-materialized scenario template.
+For a relevant dirty working tree, also record each relevant staged, unstaged, or untracked file and its SHA-256. `generated_from_commit` is the committed source basis for the current test; `dirty: true` plus file hashes records the additional uncommitted basis.
 
-Review gates:
+Allowed execution states include:
 
-1. No test code before the scenario inventory is approved.
-2. A golden sample is executed before batch generation.
-3. Each batch records its command and result.
-4. A scenario is complete only when it is implemented, executed, and reconciled with the plan.
-5. Every cross-service boundary has a named observable checkpoint; every integration enabled by an approved scenario has a verified configuration source, correlation rule, and cleanup result.
-6. Unknown project configuration or missing observability is recorded as a blocker or explicit exclusion, never replaced with a guessed default or an HTTP-only assertion.
-7. Every scenario has a directory under `artifact_dir` containing its test,
-   data/scripts when needed, README, and Mermaid swimlane; shared code is
-   limited to generic reusable modules.
-8. Header precedence and signing enabled/disabled behavior are reconciled with
-   the request contract; the plan signing mirror matches `seres.sign`, reserved
-   signature headers are written last, body mode is raw when required, and
-   disabled components have no instantiated adapter or claimed checkpoint.
-9. The generated reconciliation command reports plan IDs without tests, tests
-   without plan IDs, conflicting integration flags, enabled integrations without
-   checkpoints, non-materialized template paths, missing cleanup evidence, and
-   scenarios without a swimlane or artifact directory.
-10. Generated Python has Chinese comments/docstrings for non-trivial logic,
-    fixtures, configuration, correlation, and cleanup.
+- `ready`: required runtime configuration passed preflight.
+- `pending_environment`: code is complete/collectable, but runtime endpoints, credentials, test identifiers, or integration access are missing.
+- `contract_blocked`: an interface, message/schema contract, or business rule cannot be established from source.
 
-If the user describes a business rule that cannot be observed through the available APIs, identify the missing observable or test fixture instead of inventing an assertion.
+Do not use `pending_environment` to defer code generation. Do not use `contract_blocked` for missing runtime values.
+
+## Generation gates
+
+1. Source discovery identifies the public entrypoint, downstream boundaries, correlation keys, assertions, cleanup, and source anchors.
+2. The scenario definition and both diagrams are written before or with the generated test.
+3. Missing environment values do not block complete code generation or collection.
+4. `pytest --collect-only` passes before claiming the scenario is generated.
+5. Real execution runs non-destructive preflight before any business request or seed write.
+6. When runtime configuration exists, focused execution verifies the business response, required downstream evidence, cleanup, and restoration.
+7. Incremental updates pass the per-scenario source impact gate in `version-sync-policy.md`.
+
+## Reconciliation
+
+`scripts/check_scenarios.py` scans `scenarios/*/场景定义.yaml`; it must not read or generate a registry. At minimum it checks:
+
+- the directory and business artifact names follow the Chinese naming boundary;
+- the stable ID exists only in the definition and exactly one pytest marker;
+- the test and both diagrams exist;
+- dependency declarations do not contain endpoints, credentials, or `enabled` duplicates;
+- source repositories include both commit fields, dirty state, and source anchors;
+- dirty relevant files include SHA-256 values;
+- every discovered definition maps to its sibling test and there are no duplicate IDs.
+
+`scripts/check_source_versions.py` scans the same definitions and reports each scenario independently as `unchanged`, `no_relevant_change`, `affected`, `full_rediscovery_required`, or `dirty_review_required`. It does not update files unless the user requested an update.
+
+## Unknowns and exclusions
+
+Keep scenario-specific unknowns and exclusion reasons in that scenario's definition or explanation. If a requested business rule cannot be observed, identify the missing contract, permission, or test hook. Never replace a required Kafka/database outcome with an HTTP-only assertion merely to make execution pass.

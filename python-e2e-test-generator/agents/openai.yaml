@@ -1,4 +1,4 @@
 interface:
   display_name: "Python E2E Test Generator"
-short_description: "Generate isolated scenario-first pytest E2E tests"
-default_prompt: "Use $python-e2e-test-generator to design and verify isolated Python pytest E2E scenarios with custom headers, the configurable seres.sign SHA-256 signing template, scenario-owned swimlanes/docs/data/scripts, and configurable shared Kafka, MySQL, EMQ/EMQX, Redis, or XXL-JOB integrations."
+  short_description: "Generate source-tracked pytest business E2E scenarios"
+  default_prompt: "Use $python-e2e-test-generator to generate or incrementally update self-contained Chinese business scenarios with per-scenario source-version impact checks and collectable pytest code."

@@ -1,169 +1,66 @@
 # Cross-Service Integration Policy
 
-Read this reference when a planned scenario crosses a service boundary or needs
-evidence from Kafka, MySQL, EMQ/EMQX, Redis, XXL-JOB, or another infrastructure
-component. The component list is optional. A business project decides which
-components exist, which client libraries are approved, and which configuration
-keys and observables are valid.
+Read this reference when a scenario crosses a service boundary or uses Kafka, MySQL, EMQ/EMQX, Redis, XXL-JOB, or another observable component.
 
-## Adapter boundary
+## Boundaries
 
 Keep three concerns separate:
 
-1. **Transport clients** call the public service interfaces used by the
-   business journey.
-2. **Component adapters** connect to project-approved observers such as a SQL
-   reader, message consumer, cache reader, MQTT subscriber, or job monitor.
-3. **Scenario tests** express business intent, checkpoints, correlation, and
-   cleanup. They must not hide the complete journey inside a generic helper.
+1. transport clients call public business interfaces;
+2. generic component adapters observe source-confirmed topics, rows, keys, or jobs;
+3. scenario tests express business actions, mappings, correlation, assertions, and cleanup.
 
-Create or enable an adapter only for an approved scenario that needs it. MySQL,
-Kafka, EMQ/EMQX, Redis, and similar public components should have one generic,
-configuration-driven adapter per component in the shared integration area; the
-scenario supplies project-specific table/topic/key/payload mapping. Reuse a
-client or library already used by the E2E project or business project where
-possible; do not silently add a dependency or create a universal middleware
-abstraction that hides business intent.
+Reusable adapters live under `common/integrations/` and accept environment configuration plus scenario mappings. Do not embed topic names, tables, business rules, or secrets in a generic adapter. Reuse an approved pinned dependency; do not add a client implicitly.
 
-## Configuration and lifecycle
+Shared integration capability is configured once in `config/common.yaml`. Connection details live in the selected `config/environments/<profile>.yaml`. A scenario only declares that it needs a component and whether the dependency is required or optional. Effective use requires both a shared `enabled: true` capability and a scenario dependency declaration.
 
-- Discover component endpoints, credentials, TLS, serialization, schemas,
-  topic/table/key conventions, retention, and access restrictions from the
-  business project's environment contract, deployment files, `conftest.py`,
-  or configuration provider.
-- Treat the names in this document as evidence categories, not required
-  environment variable names or defaults. Record the actual source and fixture
-  scope in the scenario plan.
-- Keep immutable connectivity and health checks at session scope. Keep a run
-  correlation ID and shared reporting context at run scope. Keep consumers,
-  subscriptions, keys, rows, job arguments, and mutable settings at scenario
-  scope unless the project proves they are safe to share.
-- Register cleanup immediately after creating or claiming an owned resource.
-  Cleanup must run after assertion failures and should be idempotent.
-- Use a dedicated test tenant, namespace, schema, topic prefix, cache prefix,
-  or equivalent isolation mechanism when the project provides one. Never use a
-  broad delete, truncate, topic purge, or cache flush against shared data.
-- An adapter may publish an external event, seed a record, or trigger a job only
-  when the scenario explicitly models that actor and the business project
-  approves the input interface. Mark the input as scenario-owned and clean it
-  up or expire it according to the project convention.
+No integration connection, client construction, or health check occurs during pytest collection. Required runtime access is validated during preflight immediately before business side effects. A missing required component produces `pending_environment` and a preflight failure, not `skip` and not an HTTP-only fallback. A source-unknown contract produces `contract_blocked`.
 
-## Enable/disable contract
+## Kafka publication evidence
 
-- Declare every public component in the project configuration with `enabled`
-  and `required` semantics, plus its configuration source and adapter scope.
-- Treat `system.integration_config.<kind>.enabled` as the global capability and
-  `scenario.integration_dependencies[].enabled` as the scenario opt-in. The
-  effective value is their logical AND when the scenario dependency exists; no
-  dependency entry means the scenario does not opt in. A scenario cannot
-  broaden a global disable. Keep the legacy `enabled_integrations` list derived
-  from the global map and fail reconciliation when it disagrees with that map.
-- A missing or malformed `enabled` value is a configuration error; do not infer
-  enabled or disabled from client-library availability or a guessed default.
-- `enabled: false` means no client construction, connection, health check,
-  fixture setup, polling, write, or evidence claim for that component. The
-  generated report records it as disabled rather than as a passing checkpoint.
-- `enabled: true` requires a non-destructive preflight before business data is
-  created. Missing credentials, schema access, or isolation values are a
-  blocked precondition for required scenarios and an explicit skip for optional
-  scenarios only.
-- Keep adapter APIs generic and typed around project-provided mappings. Do not
-  put scenario business rules, hard-coded topics/tables/keys, or secrets in a
-  shared adapter.
+For a scenario that must prove a Kafka publication:
 
-## Preflight and optional components
+1. create a unique scenario consumer group before the business action;
+2. subscribe to the exact source-confirmed topic and wait until assignment is ready;
+3. record partition starting offsets after assignment;
+4. invoke the public business API;
+5. consume only from the bounded starting-offset/time window;
+6. filter by the source-confirmed order ID, atomic order ID, trace ID, or equivalent key;
+7. assert key headers, schema/version, and business payload fields;
+8. close the consumer in teardown even after failures.
 
-Before a scenario creates business data, run a non-destructive preflight for
-every service and enabled component it names. Check the project-approved
-endpoint, credentials, protocol/schema access, read permissions, and any
-required namespace or topic/table/key convention. Keep preflight separate from
-business assertions so an unavailable observer cannot look like a business
-failure.
+Subscribing after the business request creates a race and is not acceptable evidence. An unrelated message, a broad topic match, or merely knowing that producer code exists does not prove publication.
 
-Each dependency is either:
+## Database processing evidence
 
-- **required:** missing or unauthorized access is a failed precondition and the
-  scenario is blocked; do not run a weaker assertion instead;
-- **optional:** the dependent scenario may be skipped only when the plan names
-  the condition and the report records the reason.
+Use read-only correlated queries where possible. Poll with a bounded deadline and assert the row state, ownership, meaningful columns, and relationships. When Kafka drives the write, use the same correlation key used for the message assertion.
 
-Do not silently convert an optional component into a global fixture. Enable its
-adapter only for scenarios that need it, and do not install a client library
-unless the E2E project approves and pins it.
+Kafka and database evidence prove different facts:
 
-## Evidence rules by component
+- Kafka proves the expected message was published.
+- The database proves downstream processing completed and persisted its result.
 
-### Kafka
+Assert both independently when the scenario requires both, then compare source-confirmed fields across the message and row. Do not let either checkpoint stand in for the other.
 
-- Observe the exact project-defined topic and message contract, including key,
-  headers, schema/version, and payload fields that matter to the business
-  outcome.
-- Correlate messages with a scenario-owned business key, trace ID, or run ID.
-  Consume from a bounded time/offset window and filter by that correlation;
-  do not accept an unrelated message as evidence.
-- Use a scenario-specific consumer identity or the project's test consumer
-  convention. Close consumers and remove only scenario-owned test artifacts if
-  the project supports cleanup.
+Direct database setup or cleanup is allowed only when the business API cannot perform it and a dedicated test boundary is approved. Never truncate, broadly delete, or mutate production/shared data.
 
-### MySQL
+## Other observers
 
-- Prefer read-only queries for verification. Assert the row state, ownership,
-  relevant columns, and transactionally meaningful relationships rather than
-  merely checking that a row exists.
-- Read using the project's consistency rules and poll when an asynchronous
-  writer is involved. Document the exact tables and keys observed.
-- Write or delete directly only when API cleanup or setup is impossible and a
-  dedicated test schema/permission has been approved. Never mutate production
-  data as part of E2E generation.
+- **EMQ/EMQX:** subscribe before triggering, use a unique client identity, exact topic/filter, bounded wait, source-confirmed QoS/properties, and deterministic disconnect.
+- **Redis:** assert the exact namespace, value/encoding, TTL/version, or stream semantics; clean only scenario-owned keys and never flush a shared database.
+- **XXL-JOB:** use the approved trigger, correlate arguments and execution records, assert both job outcome and downstream business state, and restore any owned configuration.
 
-### EMQ/EMQX (MQTT)
+Each observer reports the relevant endpoint identifier, correlation key, bounded deadline, and last observed state with secrets redacted.
 
-- Subscribe to the exact project-defined topic and assert payload, QoS,
-  retained/session behavior, and relevant properties when they are part of the
-  contract.
-- Use a unique client ID and scenario-owned topic filter where possible. Start
-  the subscription before triggering the business action, use a bounded wait,
-  then disconnect and remove owned subscriptions.
-- Do not use a wildcard subscription as the only proof of a scenario result.
+## Automated test order
 
-### Redis
+When Kafka and MySQL are both required, preserve this orchestration in code and `自动化测试流程图.md`:
 
-- Assert the project-defined key namespace, value/encoding, TTL, version, or
-  stream/list semantics that represent the business outcome.
-- Use a run/scenario key prefix or another project-approved namespace. Clean up
-  only owned keys and never flush a shared database.
-- Account for eventual consistency and expiry with deadline-based polling;
-  distinguish a missing key from an expired key when diagnostics matter.
+```text
+load environment -> preflight -> create/subscribe consumer -> record offsets
+-> invoke API -> assert HTTP/application result -> assert correlated Kafka message
+-> poll/assert correlated database row -> compare message and row
+-> API cleanup -> close consumer -> restore scenario configuration
+```
 
-### XXL-JOB
-
-- Trigger a job only through the project-approved API, scheduler fixture, or
-  test hook. Do not alter global scheduler settings unless the scenario owns
-  and restores them.
-- Correlate the job argument, execution record/log, and downstream effect with
-  the scenario ID or business key. Assert both execution outcome and the
-  business state it is expected to produce.
-- Poll job status and downstream evidence with a deadline. Capture the last
-  status/log reference on failure and clean up scenario-created job data or
-  test hooks.
-
-## Missing observability
-
-If a requested business rule cannot be proven through the public interfaces or
-an approved component observer, mark the scenario as blocked in the plan and
-name the missing fixture, read permission, event contract, or test hook. Do not
-replace a required side-effect assertion with an HTTP `2xx` assertion merely to
-make the scenario executable.
-
-## Failure diagnostics
-
-Every integration checkpoint should retain redacted request/response context,
-correlation values, query/topic/key identifiers, polling deadline, and the last
-observed state. Secrets and message payload fields classified as sensitive by
-the business project must be redacted before they reach pytest output or test
-reports.
-
-Generated adapter modules and fixtures must contain Chinese module/class/function
-docstrings and comments for connection scope, enabled-state branching,
-correlation, polling, redaction, and cleanup. Identifiers may remain in the
-project's conventional language.
+Register cleanup handlers as soon as each resource is acquired so later assertion failures cannot bypass cleanup.

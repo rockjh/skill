@@ -1,93 +1,74 @@
 # Scenario Artifact Policy
 
-Use a scenario-first layout so a reviewer can understand and run one business
-journey without searching unrelated modules. The directory named by the
-scenario's `artifact_dir` is the ownership boundary for non-public artifacts.
+Each Chinese-named directory under `scenarios/` owns one complete business journey. A reviewer should be able to understand, collect, run, and maintain it without consulting a global scenario list.
 
 ## Required layout
 
 ```text
-scenarios/<SCENARIO_ID>/
-  test_<business_flow>.py       # pytest entrypoint, business intent visible
-  README.md                     # purpose, preconditions, config source, run command
-  swimlane.md                   # required Mermaid diagram
-  docs/                         # materialized templates and detailed scenario docs
-  data/                         # request/fixture/expected data owned by this scenario
-  scripts/                      # setup/verification helpers owned by this scenario
+scenarios/<中文业务名称>/
+  场景定义.yaml
+  场景说明.md
+  业务流程图.md
+  自动化测试流程图.md
+  版本变更记录.md
+  test_<中文业务名称>.py
 ```
 
-`data/` and `scripts/` are created only when needed, but scenario-specific
-payloads, seed data, SQL, messages, snapshots, and one-off utilities must stay
-inside this directory. Do not put them in a global `fixtures/` or `scripts/`
-directory. The only root-level scripts allowed are project-wide reconciliation,
-CI, or packaging tools; they must not contain scenario-specific data or logic.
-A scenario-local `conftest.py` is allowed for scenario-owned fixtures;
-project-wide fixtures belong in the shared fixture area.
+The directory, Markdown artifact names, and pytest business-name suffix are Chinese. Technical directories and configuration remain English. The stable ID appears only in `场景定义.yaml` and a pytest marker, for example:
 
-Any skill reference used by a generated scenario must be copied into its
-`docs/` directory (or an explicitly shared `common/docs/` directory after a
-second scenario reuses the same contract). Generated plans must point to that
-materialized project path, never to a path that exists only inside the skill
-repository.
+```python
+import pytest
 
-## Shared versus scenario code
 
-- Shared modules contain only reusable transport clients, header/signing
-  middleware, generic MySQL/Kafka/EMQ/Redis adapters, and scope-safe fixtures.
-  They must accept project configuration and mappings instead of embedding a
-  business scenario.
-- Scenario modules contain actor actions, business assertions, correlation
-  values, polling predicates, scenario data, cleanup, and explanatory docs.
-  Keep the scenario ID in pytest markers, test names, logs, and reports.
-- Do not extract a helper merely to shorten one scenario. Extract only when the
-  behavior is truly public/reused and document its ownership and lifecycle.
-
-When signing is enabled, ordinary request-header overrides are applied before
-the signer. The signer owns and writes its reserved headers last; disabled
-signing removes those names from the final request.
-
-## Swimlane requirement
-
-Every scenario includes `swimlane.md` with a Mermaid `sequenceDiagram` (or an
-equivalent project-approved swimlane format). The diagram must show:
-
-1. actor/test runner and every service boundary;
-2. request headers and an `alt` branch for signing enabled/disabled when signing
-   is part of the contract;
-3. enabled component observers (MySQL, Kafka, EMQ/EMQX, Redis, jobs, etc.);
-4. correlation ID/business key propagation, bounded polling, checkpoints, and
-   cleanup ownership.
-
-Do not draw a disabled component as an active participant or checkpoint; a
-short note may record that it was intentionally disabled.
-
-Minimal shape:
-
-```mermaid
-sequenceDiagram
-  participant A as Actor/Test
-  participant S as Entry Service
-  participant C as Shared Component Adapter
-  A->>S: Request + scenario headers
-  alt signing.enabled == true
-    A->>S: Add project-approved signature headers
-  else signing.enabled == false
-    Note over A,S: Do not send signature-derived headers
-  end
-  S-->>A: Application result + correlation key
-  S->>C: Downstream effect
-  A->>C: Poll bounded window and assert correlated evidence
-  A->>S: Idempotent cleanup
+@pytest.mark.scenario_id("MNO_REALNAME_DUAL_OPERATOR_RENEWAL")
+def test_实名后开通双运营商套餐并验证跨月续订(...):
+    ...
 ```
 
-The diagram is documentation, not a substitute for executable checkpoints.
-Update it whenever services, headers, enabled components, or cleanup change.
+Do not copy the stable ID into the directory, filename suffix, test function name, headings, logs, or a global manifest. Human-facing scenario artifacts use the business name.
 
-## Chinese comments and documentation
+Scenario-owned payloads, expected data, SQL mappings, message mappings, snapshots, and one-off helpers stay inside the scenario directory and use clear Chinese business names. Shared modules contain only reusable transport clients, generic integration adapters, signing, and scope-safe fixtures; they accept configuration and mappings rather than embedding business rules.
 
-Generated Python uses Chinese comments/docstrings for module purpose, fixture
-scope, configuration sources, header precedence, signing branches, business
-steps, correlation, polling deadlines, redaction, and cleanup. Comments should
-explain why a boundary or ownership rule exists; do not pad trivial assignments.
-`README.md` and failure diagnostics should likewise explain the scenario in
-Chinese unless the business project explicitly requires another language.
+## Scenario explanation
+
+`场景说明.md` records the purpose, actor, preconditions, business rules, observable outcomes, environment prerequisites, run command, correlation keys, and cleanup. It may describe `pending_environment` inputs, but must not substitute placeholders for source-confirmed contracts.
+
+## Business flow diagram
+
+`业务流程图.md` contains only real business actors, systems/services, business messages/actions, and state transitions. It must not include pytest, fixtures, test runners, Kafka consumers used only for observation, database observers, polling mechanics, or test cleanup implementation.
+
+## Automated test flow diagram
+
+`自动化测试流程图.md` documents the executable orchestration and must show, when applicable:
+
+1. load the selected environment and run preflight;
+2. create a unique Kafka consumer group and subscribe before the business request;
+3. record the starting offset, then invoke the public business API;
+4. validate HTTP and application-level response fields;
+5. consume by order ID or atomic order ID to prove the message was published;
+6. poll the database with the same correlation key to prove processing and persistence;
+7. compare correlated Kafka and database fields;
+8. run API cleanup, close the consumer, and restore scenario configuration.
+
+Kafka publication evidence and database processing/persistence evidence are separate checkpoints. One cannot substitute for the other.
+
+The two diagrams may use Mermaid, but they must model distinct audiences and never be duplicates with renamed headings. Update both whenever an affected source change alters their respective flow.
+
+## Version change record
+
+`版本变更记录.md` is append-oriented and records, per review:
+
+- review time and repository;
+- previous and current commit;
+- branch and dirty state;
+- changed and inspected files, including relevant dirty-file SHA-256 values;
+- affected source anchors and caller/contract traversal;
+- impact decision and rationale;
+- actual changes to the definition, pytest, diagrams, data, or cleanup;
+- `last_reviewed_commit` and `generated_from_commit` after the decision.
+
+A no-impact review still records the evidence and `last_reviewed_commit` update. Do not rewrite history merely to make the file appear current.
+
+## Generated Python
+
+Use Chinese comments/docstrings where they clarify business intent, fixture ownership, correlation, bounded polling, restoration, or cleanup. Avoid comments on trivial assignments. Keep source identifiers, protocol fields, configuration keys, and reusable technical modules in their source-defined language.
