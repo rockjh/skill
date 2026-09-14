@@ -41,20 +41,28 @@ Example `execution-evidence.json`:
 }
 ```
 
-The project-local Bruno scripts or CI adapter may translate the installed Bruno report into this shape. The exact Bruno CLI output format is version-dependent, so keep this normalized contract stable and review the adapter with the collection.
+The project-local runner translates the installed Bruno report into this shape.
+The exact Bruno CLI output format is version-dependent, so keep this normalized
+contract stable and review the adapter with the collection.
 
-Run:
+Use the platform entry point:
+
+```bat
+qa\execution\run.bat
+qa\execution\run.bat --module "车辆管理"
+```
 
 ```bash
-python qa/scripts/normalize_bruno_report.py bruno-report.json --output execution-evidence.json
-python qa/scripts/runtime_preflight.py --base-url "${BASE_URL}" --auth-config qa/contracts/request-auth.yaml --output preflight.json
-
-Add `--public-path`/`--admin-path` when the service exposes those probes. They
-are optional capabilities; use `--require-public-route` or
-`--require-admin-baseline` only when the project declares them mandatory.
-python qa/scripts/check_api_coverage.py qa/contracts qa/bruno --openapi qa/contracts/openapi.json --require-scenarios --require-auth --auth-config qa/contracts/request-auth.yaml --preflight-results preflight.json --results execution-evidence.json --json > execution-evidence.coverage.json
-python qa/scripts/validate_flow_execution.py qa/contracts/modules/<module-directory>/flows.yaml --contracts-root qa/contracts --endpoints qa/contracts/modules/<module-directory>/endpoints.yaml --results execution-evidence.json
+./qa/execution/run.sh
+./qa/execution/run.sh --module "车辆管理"
 ```
+
+Both launchers call `run_bruno.py`, which validates `execution/config.yaml`,
+loads `execution/environments/<active_environment>.bru` through `--env-file`,
+runs static coverage and runtime preflight, invokes Bruno, normalizes the
+temporary raw report, and reconciles execution evidence. The internal
+preflight requires at least one representative route; without a successful
+probe `execution_ready` remains false.
 
 The coverage checker accepts either the normalized object above or a raw Bruno
 JSON report. When given a raw report it derives `passed` from every
@@ -64,17 +72,21 @@ an inline assertion failed. For an isolated module report, pass that module's
 contracts directory to the checker and run OpenAPI reconciliation separately
 from the global contracts root.
 
-Evidence is environment- and business-SHA-specific. Do not commit raw Bruno reports when they can contain authorization headers or response tokens; keep only a normalized, redacted report with the SHA, environment name, executed/passed case IDs, and flow captures metadata. A module report must not be presented as global evidence: run the coverage check once per module or emit a normalized report containing all modules.
+Evidence is environment- and business-SHA-specific. Raw Bruno reports remain
+in a temporary directory and omit all Headers and bodies. Keep only normalized,
+redacted evidence with the SHA, environment name, executed/passed case IDs,
+and flow capture names. A module run reports only that module, must not be
+presented as global evidence, and cannot update `version-lock.yaml`.
 
-Every generated request includes the Bruno `script:pre-request` block selected
-by `request-auth.yaml`. The default `seres-sign` mode reads `BASE_URL`,
-`SECRET_KEY`, and `ACCESS_KEY` from the selected Bruno environment, adds
-`timestamp`, `accesskey`, and the SHA-256 `sign` header, and fails before
-sending when any required variable is missing. Its URL/body/query inputs,
-timestamp parameter, signing Header names, and extra environment-backed
-Headers may be configured in the template. Bearer, API-key, and custom Header
-token modes use their configured environment names. Keep all values in the
-environment; never place them in manifests or `.bru` files.
+Every generated request uses `{{BASE_URL}}`; authentication and common Headers
+are injected once by `collection.bru` from the validated runtime payload. The
+default `auth.mode: none` adds no authentication Header. `seres-sign` reads its
+two configured credential variables from the selected Bruno environment and
+uses fixed SHA-256 behavior plus fixed `sign`, `timestamp`, and `accesskey`
+Header names. Bearer, API-key, and cookie modes read their configured variable.
+OAuth2 bootstrap publishes a token consumed as bearer. Keep all sensitive
+values in the environment; never place them in config, manifests, reports, or
+request files.
 
 Before committing the normalized report, run:
 

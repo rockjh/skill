@@ -21,6 +21,17 @@ configuration, or other API-impacting file is dirty; the check returns a dirty
 status and refuses completion until the change is committed/stashed or the
 tests are reviewed against that exact worktree state.
 
+Initialize a repository that has no lock yet with a draft baseline:
+
+    python qa/scripts/check_version_compatibility.py \
+      /path/to/business-repository \
+      qa/contracts \
+      --init
+
+Initialization records the current commit or filesystem digest with
+`baseline_status: draft`; it is not execution evidence and cannot produce a
+verified lock.
+
 Use:
 
     python qa/scripts/check_version_compatibility.py \

@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
+
+sys.dont_write_bytecode = True
 
 
 def load_data(path: Path) -> Any:

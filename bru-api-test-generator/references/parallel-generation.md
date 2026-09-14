@@ -12,10 +12,15 @@ Use parallel workers only after the coordinator has completed the global invento
 
 | Owner | Writable scope |
 | --- | --- |
-| Coordinator | `README.md`, `module-map.yaml`, `index.yaml`, `version-lock.yaml`, `impact-rules.yaml`, `flows/cross-module.yaml`, shared environments, global scripts, and business-repository metadata |
-| Module worker | `contracts/modules/<module-directory>/{endpoints,logic,cases,flows,exclusions}.yaml`, `contracts/modules/<module-directory>/CASES.md`, and `bruno/<module-directory>/` |
+| Coordinator | `README.md`, `module-map.yaml`, `index.yaml`, `version-lock.yaml`, `impact-rules.yaml`, `flows/cross-module.yaml`, `execution/config.yaml`, `execution/environments/`, `bruno/`, global scripts, and business-repository metadata |
+| Module worker | `contracts/modules/<module-directory>/{logic,cases}.yaml` within its assigned module |
 
-Workers must not edit another module, business source code, shared credentials, or coordinator-owned files. A worker may read shared files and must return its case IDs, logic IDs, execution evidence, changed paths, and unresolved blockers to the coordinator.
+Workers must not edit endpoint inventories, `.bru` files, another module,
+business source code, shared credentials, or coordinator-owned files. A worker
+may read shared files and must return its case IDs, logic IDs, changed paths,
+and unresolved blockers to the coordinator. The coordinator alone materializes
+requests so sequential and parallel generation use identical naming, common
+Header exclusions, and collection-level runtime behavior.
 
 ## Scheduling
 
@@ -31,8 +36,7 @@ Each worker reports:
 
 - module ID and owned paths;
 - generated endpoint, logic, case, and flow IDs;
-- Bruno files created or changed;
-- execution evidence and command output;
+- cases that require Bruno materialization;
 - missing operations for explicitly flow-required modules or exclusions with reasons;
 - blockers and required coordinator actions.
 

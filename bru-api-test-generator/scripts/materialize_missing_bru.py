@@ -4,350 +4,109 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import re
+import sys
 import textwrap
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
+sys.dont_write_bytecode = True
+
 from manifest_io import first_list, load_data
-from parse_openapi import render_manifest, update_module_document
+from execution_config import (
+    COLLECTION_MARKER,
+    COLLECTION_TEMPLATE,
+    HEADER_NAME_RE,
+    load_execution_config,
+)
+from parse_openapi import display_directory, render_manifest, update_module_document
 
 
-DEFAULT_AUTH_CONFIG = {
-    "mode": "seres-sign",
-    "seres-sign": True,
-    "base_url_env": "BASE_URL",
-    "modes": {
-        "seres-sign": {
-            "enabled": True,
-            "algorithm": "SHA256",
-            "secret_key_env": "SECRET_KEY",
-            "access_key_env": "ACCESS_KEY",
-            "signature": {
-                "parameters": {
-                    "url": "request.path",
-                    "body": "request.body",
-                    "query": "request.query",
-                    "timestamp": "timestamp",
-                    "secret_key_env": "SECRET_KEY",
-                    "access_key_env": "ACCESS_KEY",
-                },
-                "append_secret": True,
-            },
-            "headers": {
-                "sign": "sign",
-                "timestamp": "timestamp",
-                "accesskey": "accesskey",
-            },
-        }
-    },
-}
-
-
-MODE_ALIASES = {
-    "seres.sign": "seres-sign",
-    "seres_sign": "seres-sign",
-    "seres-sign": "seres-sign",
-    "oauth2": "oauth2",
-    "oauth2-client-credentials": "oauth2",
-    "oauth2-authorization-code": "oauth2",
-    "session": "cookie",
-    "cookie-session": "cookie",
-}
-AUTH_MARKER = "bru-api-test-generator: auth-start"
-AUTH_END_MARKER = "bru-api-test-generator: auth-end"
-
-
-def canonical_mode(value: Any) -> str:
-    name = str(value or "").strip().lower()
-    return MODE_ALIASES.get(name, name)
-
-
-def mode_settings(config: dict[str, Any], mode: str) -> dict[str, Any]:
-    modes = config.get("modes") if isinstance(config.get("modes"), dict) else {}
-    for name, value in modes.items():
-        if canonical_mode(name) == mode and isinstance(value, dict):
-            return value
-    return {}
-
-
-def configured_env_name(value: Any, default: str, label: str) -> str:
-    """Return a usable Bruno environment variable name or reject config."""
-
-    candidate = default if value is None else str(value).strip()
-    if not candidate or candidate.lower() in {"none", "null"}:
-        raise ValueError(f"{label} must name an environment variable")
-    return candidate
-
-
-def auth_mode(config: dict[str, Any]) -> str:
-    explicit = config.get("mode")
-    if isinstance(explicit, str) and explicit.strip():
-        selected = canonical_mode(explicit)
-        if config.get(explicit) is False or config.get(selected) is False:
-            return "none"
-        modes = config.get("modes") if isinstance(config.get("modes"), dict) else {}
-        settings = mode_settings(config, selected)
-        if isinstance(settings, dict) and settings.get("enabled") is False:
-            return "none"
-        enabled = {
-            canonical_mode(name)
-            for name, value in modes.items()
-            if isinstance(value, dict) and value.get("enabled") is True
-        }
-        enabled.update(
-            canonical_mode(name)
-            for name, value in config.items()
-            if name not in {"mode", "modes", "version", "base_url_env"} and value is True
-        )
-        if enabled - {selected}:
-            raise ValueError("request-auth.yaml enables more than one authentication mode: " + ", ".join(sorted(enabled)))
-        return selected
-    modes = config.get("modes") if isinstance(config.get("modes"), dict) else {}
-    enabled = [
-        canonical_mode(name)
-        for name, value in modes.items()
-        if isinstance(value, dict) and value.get("enabled") is True
-    ]
-    enabled.extend(
-        canonical_mode(name)
-        for name, value in config.items()
-        if name not in {"modes", "version", "base_url_env"} and value is True
-    )
-    enabled = list(dict.fromkeys(enabled))
-    if len(enabled) > 1:
-        raise ValueError("request-auth.yaml enables more than one authentication mode: " + ", ".join(enabled))
-    selected = enabled[0] if enabled else "none"
-    if mode_settings(config, selected).get("enabled") is False:
-        return "none"
-    return selected
-
-
-def auth_script(config: dict[str, Any]) -> str:
-    mode = auth_mode(config)
-    base_env = configured_env_name(config.get("base_url_env"), "BASE_URL", "base_url_env")
-    settings = mode_settings(config, mode)
-    if mode in {"none", "disabled"}:
-        return ""
-    if mode in {"bearer", "bearer-token", "token", "oauth2"}:
-        token_env = configured_env_name(settings.get("token_env"), "ACCESS_TOKEN", "token_env")
-        header = str(settings.get("header", "Authorization"))
-        prefix = str(settings.get("prefix", "Bearer"))
-        value = f'`${{prefix}} ${{token}}`' if prefix else "token"
-        return f'''script:pre-request {{
-  // {AUTH_MARKER} {mode}
-      // 从环境中读取访问令牌，避免在用例中写入敏感值。
-  const token = bru.getEnvVar("{token_env}");
-  if (!token) throw new Error("{token_env} must be configured in the Bruno environment");
-  const prefix = {json.dumps(prefix, ensure_ascii=False)};
-  req.setHeader("{header}", {value});
-  // {AUTH_END_MARKER}
-}}'''
-    if mode == "cookie":
-        cookie_env = configured_env_name(
-            settings.get("cookie_env", settings.get("token_env")),
-            "SESSION_COOKIE",
-            "cookie_env",
-        )
-        header = str(settings.get("header", "Cookie"))
-        return f'''script:pre-request {{
-  // {AUTH_MARKER} cookie
-  // 从环境中读取会话 Cookie，避免在用例中写入敏感值。
-  const cookie = bru.getEnvVar("{cookie_env}");
-  if (!cookie) throw new Error("{cookie_env} must be configured in the Bruno environment");
-  req.setHeader("{header}", cookie);
-  // {AUTH_END_MARKER}
-}}'''
-    if mode in {"api-key", "apikey"}:
-        token_env = configured_env_name(settings.get("token_env"), "API_KEY", "token_env")
-        header = str(settings.get("header", "X-API-Key"))
-        return f'''script:pre-request {{
-  // {AUTH_MARKER} api-key
-  // 从环境中读取 API Key，避免在用例中写入敏感值。
-  const token = bru.getEnvVar("{token_env}");
-  if (!token) throw new Error("{token_env} must be configured in the Bruno environment");
-  req.setHeader("{header}", token);
-  // {AUTH_END_MARKER}
-}}'''
-    if mode in {"headers", "custom", "custom-headers"}:
-        headers = settings.get("headers") if isinstance(settings.get("headers"), dict) else {}
-        if not headers:
-            raise ValueError("custom request authentication mode requires modes.custom.headers")
-        lines = ["script:pre-request {", f"  // {AUTH_MARKER} custom"]
-        lines.append("  // 从隔离环境读取并设置本用例所需的自定义请求头。")
-        for index, (header, header_config) in enumerate(headers.items()):
-            if isinstance(header_config, dict):
-                env_name = configured_env_name(header_config.get("env"), "", f"custom header {header} env")
-                prefix = str(header_config.get("prefix", ""))
-            else:
-                env_name = configured_env_name(header_config, "", f"custom header {header} env")
-                prefix = ""
-            variable = f"token_{index}"
-            value = f'`{prefix} ${{{variable}}}`' if prefix else variable
-            lines.extend([
-                f'  const {variable} = bru.getEnvVar("{env_name}");',
-                f'  if (!{variable}) throw new Error("{env_name} must be configured in the Bruno environment");',
-                f'  req.setHeader("{header}", {value});',
-            ])
-        lines.extend([f"  // {AUTH_END_MARKER}", "}"])
-        return "\n".join(lines)
-    if mode != "seres-sign":
-        raise ValueError(f"unsupported request authentication mode: {mode}")
-    algorithm = str(settings.get("algorithm", "SHA256")).upper()
-    if algorithm != "SHA256":
-        raise ValueError("seres-sign currently supports only algorithm: SHA256")
-    signature = settings.get("signature") if isinstance(settings.get("signature"), dict) else {}
-    parameter_config = signature.get("parameters") if isinstance(signature.get("parameters"), dict) else {}
-    signature_headers = settings.get("headers") if isinstance(settings.get("headers"), dict) else {}
-    secret_env = configured_env_name(
-        parameter_config.get("secret_key_env", signature.get("secret_key_env", settings.get("secret_key_env"))),
-        "SECRET_KEY",
-        "secret_key_env",
-    )
-    access_env = configured_env_name(
-        parameter_config.get("access_key_env", signature.get("access_key_env", settings.get("access_key_env"))),
-        "ACCESS_KEY",
-        "access_key_env",
-    )
-    url_value = parameter_config.get("url", signature.get("url", "request.path"))
-    body_value = parameter_config.get("body", signature.get("body", "request.body"))
-    query_value = parameter_config.get("query", signature.get("query", "request.query"))
-    url_source = str(url_value)
-    body_source = str(body_value)
-    query_source = str(query_value)
-    timestamp_parameter = str(parameter_config.get("timestamp", signature.get("timestamp_parameter", "timestamp")))
-    append_secret_value = signature.get("append_secret", True)
-    append_secret = append_secret_value is not False and str(append_secret_value).lower() not in {"", "none", "false"}
-    sign_header = str(signature_headers.get("sign", "sign"))
-    timestamp_header = str(signature_headers.get("timestamp", "timestamp"))
-    access_header = str(signature_headers.get("accesskey", "accesskey"))
-    extra_headers = settings.get("extra_headers") if isinstance(settings.get("extra_headers"), dict) else {}
-    extra_lines: list[str] = []
-    for index, (header, header_config) in enumerate(extra_headers.items()):
-        if isinstance(header_config, dict):
-            env_name = configured_env_name(header_config.get("env"), "", f"extra header {header} env")
-            prefix = str(header_config.get("prefix", ""))
-        else:
-            env_name = configured_env_name(header_config, "", f"extra header {header} env")
-            prefix = ""
-        variable = f"extra_header_{index}"
-        value = f'`{prefix} ${{{variable}}}`' if prefix else variable
-        extra_lines.extend([
-            f'  const {variable} = bru.getEnvVar("{env_name}");',
-            f'  if (!{variable}) throw new Error("{env_name} must be configured in the Bruno environment");',
-            f'  req.setHeader("{header}", {value});',
-        ])
-    query_enabled = query_value is not False and query_source.lower() not in {"", "none", "false"}
-    body_enabled = body_value is not False and body_source.lower() not in {"", "none", "false"}
-    url_expression = "requestPath" if url_source in {"request.path", "path"} else "resolvedUrl"
-    query_block = """  queryString.split("&").filter(Boolean).forEach(pair => {
-    const separator = pair.indexOf("=");
-    const rawKey = separator >= 0 ? pair.slice(0, separator) : pair;
-    const rawValue = separator >= 0 ? pair.slice(separator + 1) : "";
-    const key = decodeURIComponent(rawKey.replace(/\\+/g, " "));
-    const value = decodeURIComponent(rawValue.replace(/\\+/g, " "));
-    if (Object.prototype.hasOwnProperty.call(params, key)) {
-      params[key] = Array.isArray(params[key]) ? params[key].concat(value) : [params[key], value];
-    } else {
-      params[key] = value;
-    }
-  });""" if query_enabled else ""
-    body_line = (
-        'const body = typeof rawBody === "string" ? rawBody : (rawBody ? JSON.stringify(rawBody) : "");'
-        if body_enabled
-        else 'const body = "";'
-    )
-    secret_suffix = "&${secretKey}" if append_secret else ""
-    return f'''script:pre-request {{
-  // {AUTH_MARKER} seres-sign
-  // 从隔离环境读取地址和签名凭据。
-  const CryptoJS = require("crypto-js");
-  const secretKey = bru.getEnvVar("{secret_env}");
-  const accessKey = bru.getEnvVar("{access_env}");
-  const baseUrl = bru.getEnvVar("{base_env}");
-  if (!secretKey || !accessKey || !baseUrl) {{
-    throw new Error("{base_env}, {secret_env}, and {access_env} must be configured in the Bruno environment");
-  }}
-
-  const resolvedUrl = req.getUrl().replace(/^\\{{\\{{(?:{base_env}|{base_env.lower()})\\}}\\}}/, baseUrl);
-  const queryIndex = resolvedUrl.indexOf("?");
-  const requestUrl = queryIndex >= 0 ? resolvedUrl.slice(0, queryIndex) : resolvedUrl;
-  const queryString = queryIndex >= 0 ? resolvedUrl.slice(queryIndex + 1) : "";
-  const schemeIndex = requestUrl.indexOf("://");
-  const pathIndex = schemeIndex >= 0 ? requestUrl.indexOf("/", schemeIndex + 3) : requestUrl.indexOf("/");
-  const requestPath = pathIndex >= 0 ? requestUrl.slice(pathIndex) : "/";
-  const url = {url_expression};
-  const params = {{}};
-{query_block}
-  params["{timestamp_parameter}"] = Date.now().toString();
-  Object.entries(params).forEach(([key, value]) => {{
-    if (value === null || value === undefined || value === "") delete params[key];
-    else if (Array.isArray(value)) params[key] = `[${{value.sort().join(",")}}]`;
-  }});
-  const signParams = Object.keys(params).sort().map(key => `${{key}}=${{params[key]}}`).join("&");
-  const rawBody = req.getBody();
-  {body_line}
-  // 按参数名排序后生成 SHA-256 签名。
-  const signStr = body ? `${{url}}&${{body}}&${{signParams}}{secret_suffix}` : `${{url}}&${{signParams}}{secret_suffix}`;
-  const sign = CryptoJS.SHA256(signStr).toString();
-  // 将签名、时间戳、访问密钥和扩展 Header 写入当前请求。
-  req.setHeader("{sign_header}", sign);
-  req.setHeader("{timestamp_header}", params["{timestamp_parameter}"]);
-  req.setHeader("{access_header}", accessKey);
-{chr(10).join(extra_lines)}
-  // {AUTH_END_MARKER}
-}}'''
+LEGACY_AUTH_MARKER = "bru-api-test-generator: auth-start"
+LEGACY_AUTH_END_MARKER = "bru-api-test-generator: auth-end"
+OMIT_MARKER = "bru-api-test-generator: omit-common-headers"
+OMIT_END_MARKER = "bru-api-test-generator: omit-common-headers-end"
 
 
 def json_value(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ": "))
 
 
-SCENARIO_LABELS = {
-    "success": "成功",
-    "authentication": "认证",
-    "authorization": "权限",
-    "validation": "参数校验",
-    "business_error": "业务异常",
-    "query": "查询",
-    "safety": "安全",
-    "file": "文件",
-}
+CHINESE_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+BUSINESS_FILE_RE = re.compile(r"^\d{2,}-.+\.bru$", re.IGNORECASE)
 
 
 def safe_display_stem(value: str) -> str:
-    stem = re.sub(r"[\\/\x00-\x1f<>:\"|?*]+", "-", str(value).strip())
-    stem = re.sub(r"\s+", "-", stem).strip(" .-")
-    return stem
+    return re.sub(r"[\\/\x00-\x1f<>:\"|?*]", "", str(value)).strip(" .")
 
 
-def display_case_file(case: dict[str, Any], endpoint: dict[str, Any], module_name: str) -> Path:
-    """Use Chinese business labels when present, while keeping names unique."""
+def normalized_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9\u3400-\u4dbf\u4e00-\u9fff]+", "", value.casefold())
 
-    case_id = str(case.get("id", "case"))
-    candidates = (
-        case.get("display_name"),
-        case.get("name"),
-        case.get("title"),
-        endpoint.get("summary"),
-        endpoint.get("swagger_tag"),
-        module_name,
+
+def valid_business_file(
+    path: Path,
+    case_id: str = "",
+    title: str | None = None,
+    sequence: int | None = None,
+) -> bool:
+    if not BUSINESS_FILE_RE.fullmatch(path.name):
+        return False
+    number, description = path.stem.split("-", 1)
+    return bool(
+        description.strip()
+        and CHINESE_RE.search(description)
+        and (not case_id or normalized_name(description) != normalized_name(case_id))
+        and (title is None or description == safe_display_stem(title))
+        and (sequence is None or int(number) == sequence)
     )
-    label = next(
-        (str(value).strip() for value in candidates if isinstance(value, str) and any(ord(char) > 127 for char in value)),
-        "",
+
+
+def bru_meta_name(content: str) -> str | None:
+    block = re.search(r"(?ms)^\s*meta\s*\{(.*?)^\s*\}", content)
+    if block is None:
+        block = re.search(r"(?s)\bmeta\s*\{(.*?)\}", content)
+    if block is None:
+        return None
+    match = re.search(r"(?:^|\s)name:\s*([^\r\n}]+)", block.group(1))
+    return match.group(1).strip() if match else None
+
+
+def is_http_request_content(content: str) -> bool:
+    meta = re.search(r"(?ms)^\s*meta\s*\{(.*?)^\s*\}", content)
+    return bool(
+        meta
+        and re.search(r"(?m)^\s*type:\s*http\s*$", meta.group(1), re.IGNORECASE)
+        and re.search(r"(?mi)^\s*(?:get|post|put|patch|delete|head|options|trace)\s*\{", content)
     )
-    if not label:
-        return Path(f"{case_id}.bru")
-    scenario = str(case.get("scenario") or case.get("category") or "").strip().lower()
-    suffix = SCENARIO_LABELS.get(scenario)
-    if suffix and suffix not in label:
-        label = f"{label}-{suffix}"
-    stem = safe_display_stem(label) or "case"
-    digest = hashlib.sha256(case_id.encode("utf-8")).hexdigest()[:8]
-    return Path(f"{stem}-{digest}.bru")
+
+
+def case_sequence(case: dict[str, Any], position: int) -> int:
+    value = case.get("sequence", case.get("seq", position))
+    try:
+        sequence = int(value)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"case {case.get('id')} has invalid sequence: {value}") from exc
+    if sequence < 1:
+        raise SystemExit(f"case {case.get('id')} sequence must be positive: {value}")
+    return sequence
+
+
+def display_case_file(
+    case: dict[str, Any],
+    position: int = 1,
+) -> Path:
+    """Build a deterministic filename from the case's Chinese title."""
+
+    label = str(case.get("title", "")).strip()
+    if not label or not CHINESE_RE.search(label):
+        raise SystemExit(f"case {case.get('id')} must declare a Chinese case.title")
+    stem = safe_display_stem(label)
+    if not stem:
+        raise SystemExit(f"case {case.get('id')} has no usable business filename")
+    return Path(f"{case_sequence(case, position):02d}-{stem}.bru")
 
 
 def request_url(endpoint: dict[str, Any], request: dict[str, Any], base_env: str = "BASE_URL") -> str:
@@ -355,7 +114,19 @@ def request_url(endpoint: dict[str, Any], request: dict[str, Any], base_env: str
     path = re.sub(r"(?<!\{)\{([^{}]+)\}(?!\})", lambda match: "{{" + match.group(1) + "}}", path)
     query = request.get("query")
     if isinstance(query, dict) and query:
-        pairs = [f"{key}={{{{{key}}}}}" for key in query]
+        pairs = []
+        for key, value in query.items():
+            if isinstance(value, (dict, list)):
+                raise ValueError(f"query field {key} must be flattened or declare a supported serialization")
+            if isinstance(value, bool):
+                rendered = str(value).lower()
+            elif value is None:
+                rendered = ""
+            else:
+                rendered = str(value)
+            if not re.fullmatch(r"\{\{[^}]+\}\}", rendered):
+                rendered = urllib.parse.quote(rendered, safe="")
+            pairs.append(f"{urllib.parse.quote(str(key), safe='')}={rendered}")
         path += "?" + "&".join(pairs)
     return "{{" + base_env + "}}" + path
 
@@ -368,6 +139,8 @@ def body_kind(request: dict[str, Any], body: Any) -> str:
     if value in {"json", "application/json", "application/*+json"} or value.endswith("+json") or not value:
         return "json"
     if "multipart/form-data" in value or value in {"multipart", "multipart-form"}:
+        if body == {}:
+            return "none"
         return "multipart-form"
     if "x-www-form-urlencoded" in value or value in {"form", "form-urlencoded"}:
         return "form-urlencoded"
@@ -461,20 +234,90 @@ def append_assertion(lines: list[str], assertion: dict[str, Any]) -> None:
         return
     if "equals" in assertion:
         lines.append(f"  {expression}: eq {json_value(assertion['equals'])}")
-    elif "eq" in assertion:
+    if "eq" in assertion:
         lines.append(f"  {expression}: eq {json_value(assertion['eq'])}")
-    elif assertion.get("exists") is True:
+    if assertion.get("exists") is True:
         lines.append(f"  {expression}: exists")
-    elif "contains" in assertion:
+    if "contains" in assertion:
         lines.append(f"  {expression}: contains {json_value(assertion['contains'])}")
-    elif "matches" in assertion:
+    if "matches" in assertion:
         lines.append(f"  {expression}: matches {json_value(assertion['matches'])}")
+    if "type" in assertion:
+        operator = {
+            "string": "isString",
+            "number": "isNumber",
+            "integer": "isNumber",
+            "boolean": "isBoolean",
+            "array": "isArray",
+            "object": "isObject",
+        }.get(str(assertion["type"]).lower())
+        if operator:
+            lines.append(f"  {expression}: {operator}")
+    if "length" in assertion:
+        lines.append(f"  {expression}: length {assertion['length']}")
+    if "minimum" in assertion:
+        lines.append(f"  {expression}: gte {json_value(assertion['minimum'])}")
+    if "maximum" in assertion:
+        lines.append(f"  {expression}: lte {json_value(assertion['maximum'])}")
+    if assertion.get("nullable") is False:
+        lines.append(f"  {expression}: isNotNull")
+    if assertion.get("is_null") is True:
+        lines.append(f"  {expression}: isNull")
+    if "equals_variable" in assertion:
+        lines.append(f"  {expression}: eq {{{{{assertion['equals_variable']}}}}}")
 
 
-def render_case(case: dict[str, Any], endpoint: dict[str, Any], config: dict[str, Any]) -> str:
+def post_response_script(case: dict[str, Any], assertions: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    captures = case.get("captures", [])
+    if isinstance(captures, dict):
+        captures = [{"name": name, "path": path} for name, path in captures.items()]
+    for capture in captures if isinstance(captures, list) else []:
+        if not isinstance(capture, dict) or not capture.get("name"):
+            continue
+        expression = assertion_expression({"path": capture.get("path", "$")})
+        if expression:
+            lines.append(f"  bru.setVar({json.dumps(str(capture['name']))}, {expression});")
+    for assertion in assertions:
+        expression = assertion_expression(assertion)
+        capture_name = assertion.get("capture_as") or assertion.get("capture")
+        if expression and capture_name:
+            lines.append(f"  bru.setVar({json.dumps(str(capture_name))}, {expression});")
+        items = assertion.get("items")
+        item_type = items.get("type") if isinstance(items, dict) else assertion.get("item_type")
+        js_type = {
+            "string": "string",
+            "number": "number",
+            "integer": "number",
+            "boolean": "boolean",
+            "object": "object",
+        }.get(str(item_type).lower())
+        if expression and js_type:
+            label = json.dumps(f"{assertion.get('path', '$')} array item type")
+            lines.extend([
+                f"  test({label}, function () {{",
+                f"    expect({expression}).to.be.an('array');",
+                f"    {expression}.forEach(item => expect(typeof item).to.equal('{js_type}'));",
+                "  });",
+            ])
+        if expression and str(assertion.get("type", "")).lower() == "integer":
+            label = json.dumps(f"{assertion.get('path', '$')} integer type")
+            lines.extend([
+                f"  test({label}, function () {{",
+                f"    expect(Number.isInteger({expression})).to.equal(true);",
+                "  });",
+            ])
+    return "\n".join(["script:post-response {", *lines, "}"]) if lines else ""
+
+
+def render_case(
+    case: dict[str, Any],
+    endpoint: dict[str, Any],
+    sequence: int | None = None,
+) -> str:
     request = case.get("request") if isinstance(case.get("request"), dict) else {}
     method = str(endpoint.get("method", "GET")).lower()
-    base_env = str(config.get("base_url_env", "BASE_URL"))
+    base_env = "BASE_URL"
     title = str(case.get("title") or case.get("display_name") or case.get("name") or endpoint.get("summary") or case.get("id"))
     description = str(
         case.get("description")
@@ -488,7 +331,7 @@ def render_case(case: dict[str, Any], endpoint: dict[str, Any], config: dict[str
             request = dict(request)
             request["content_type"] = inferred_content_type
     kind = body_kind(request, body)
-    sequence = case.get("sequence", case.get("seq", 1))
+    sequence = sequence if sequence is not None else case.get("sequence", case.get("seq", 1))
     lines = [
         "meta {",
         f"  name: {case.get('id')}",
@@ -502,9 +345,9 @@ def render_case(case: dict[str, Any], endpoint: dict[str, Any], config: dict[str
         "  auth: none",
         "}",
     ]
-    script = auth_script(config)
-    if script:
-        lines.extend(["", script])
+    omit_script = request_omit_script(case)
+    if omit_script:
+        lines.extend(["", omit_script])
     headers = request.get("headers")
     headers = dict(headers) if isinstance(headers, dict) else {}
     content_type = request.get("content_type")
@@ -515,9 +358,11 @@ def render_case(case: dict[str, Any], endpoint: dict[str, Any], config: dict[str
         lines.extend(f"  {key}: {value}" for key, value in headers.items())
         lines.append("}")
     if kind != "none":
-        lines.extend(["", f"body:{kind} {{", render_body(body, kind), "}"])
+        rendered_body = textwrap.indent(render_body(body, kind), "  ")
+        lines.extend(["", f"body:{kind} {{", rendered_body, "}"])
         if kind == "graphql" and isinstance(body, dict) and body.get("variables") is not None:
-            lines.extend(["", "body:graphql:vars {", json.dumps(body["variables"], ensure_ascii=False, indent=2), "}"])
+            variables = textwrap.indent(json.dumps(body["variables"], ensure_ascii=False, indent=2), "  ")
+            lines.extend(["", "body:graphql:vars {", variables, "}"])
     lines.extend(["", "assert {"])
     expected = case.get("expected") if isinstance(case.get("expected"), dict) else {}
     if expected.get("http_status") is not None:
@@ -532,6 +377,9 @@ def render_case(case: dict[str, Any], endpoint: dict[str, Any], config: dict[str
             continue
         append_assertion(lines, assertion)
     lines.append("}")
+    post_response = post_response_script(case, [item for item in assertions if isinstance(item, dict)])
+    if post_response:
+        lines.extend(["", post_response])
     lines.extend([
         "",
         "docs {",
@@ -540,58 +388,90 @@ def render_case(case: dict[str, Any], endpoint: dict[str, Any], config: dict[str
         f"  简短描述：{description}",
         "",
         f"  - 服务地址从 Bruno 环境变量 `{base_env}` 读取。",
-        "  - 请求发送前执行配置的认证或签名逻辑。" if script else "  - 当前用例不启用认证前置逻辑。",
+        "  - 认证和公共 Header 由集合级配置在运行时统一处理。",
         "  - 响应校验覆盖状态码、业务结果和具体字段。",
         "}",
     ])
     return "\n".join(lines) + "\n"
 
 
-def ensure_auth_script(content: str, config: dict[str, Any]) -> str:
-    script = auth_script(config)
+def request_omit_headers(case: dict[str, Any]) -> list[str]:
+    request = case.get("request") if isinstance(case.get("request"), dict) else {}
+    configured = request.get("omit_common_headers", [])
+    if configured is None:
+        return []
+    if not isinstance(configured, list) or any(
+        not isinstance(name, str) or not HEADER_NAME_RE.fullmatch(name.strip())
+        for name in configured
+    ):
+        raise ValueError(f"case {case.get('id')} request.omit_common_headers must be a list of Header names")
+    return list(dict.fromkeys(name.strip() for name in configured))
+
+
+def request_omit_script(case: dict[str, Any]) -> str:
+    headers = request_omit_headers(case)
+    if not headers:
+        return ""
+    return "\n".join([
+        "script:pre-request {",
+        f"  // {OMIT_MARKER}",
+        f"  req.deleteHeaders({json.dumps(headers, ensure_ascii=False)});",
+        f"  // {OMIT_END_MARKER}",
+        "}",
+    ])
+
+
+def _remove_managed_block(content: str, start_marker: str, end_marker: str) -> str:
+    if start_marker not in content:
+        return content
+    nested_pattern = re.compile(
+        rf"(?ms)^[ \t]*\{{[ \t]*\n\s*// {re.escape(start_marker)}[^\n]*\n.*?"
+        rf"^[ \t]*// {re.escape(end_marker)}[ \t]*\n[ \t]*\}}[ \t]*(?:\n|$)"
+    )
+    updated = nested_pattern.sub("", content, count=1)
+    block_pattern = re.compile(
+        rf"(?ms)^(?P<indent>[ \t]*)// {re.escape(start_marker)}[^\n]*\n.*?"
+        rf"^(?P=indent)// {re.escape(end_marker)}[ \t]*$(?:\n)?"
+    )
+    updated, count = block_pattern.subn("", updated, count=1)
+    if count == 0 and start_marker in updated:
+        raise ValueError(f"existing generated block has no {end_marker} marker")
+    empty_script = re.compile(r"(?ms)^[ \t]*script:pre-request[ \t]*\{[ \t\r\n]*\}[ \t]*(?:\n|$)")
+    return empty_script.sub("", updated, count=1)
+
+
+def strip_legacy_auth(content: str) -> str:
+    return _remove_managed_block(content, LEGACY_AUTH_MARKER, LEGACY_AUTH_END_MARKER)
+
+
+def ensure_request_script(content: str, case: dict[str, Any]) -> str:
+    updated = strip_legacy_auth(content)
+    updated = _remove_managed_block(updated, OMIT_MARKER, OMIT_END_MARKER)
+    script = request_omit_script(case)
     if not script:
-        if AUTH_MARKER not in content:
-            return content
-        nested_pattern = re.compile(
-            rf"(?ms)^[ \t]*\{{[ \t]*\n\s*// {re.escape(AUTH_MARKER)}[^\n]*\n.*?"
-            rf"^[ \t]*// {re.escape(AUTH_END_MARKER)}[ \t]*\n[ \t]*\}}[ \t]*(?:\n|$)"
-        )
-        updated = nested_pattern.sub("", content, count=1)
-        standalone_pattern = re.compile(
-            rf"(?ms)^[ \t]*script:pre-request[ \t]*\{{[ \t]*\n\s*// {re.escape(AUTH_MARKER)}[^\n]*\n.*?"
-            rf"^[ \t]*// {re.escape(AUTH_END_MARKER)}[ \t]*\n[ \t]*\}}[ \t]*(?:\n|$)"
-        )
-        return standalone_pattern.sub("", updated, count=1)
-    generated_opening = script.find("{")
-    generated_closing = script.rfind("}")
-    if generated_opening < 0 or generated_closing <= generated_opening:
-        raise ValueError("generated authentication script is malformed")
-    body = textwrap.dedent(script[generated_opening + 1:generated_closing]).strip("\n")
-    if AUTH_MARKER in content:
-        pattern = re.compile(
-            rf"(?ms)^(?P<indent>[ \t]*)// {re.escape(AUTH_MARKER)}[^\n]*\n.*?"
-            rf"^(?P=indent)// {re.escape(AUTH_END_MARKER)}[ \t]*$"
-        )
-        match = pattern.search(content)
-        if match is None:
-            raise ValueError("existing generated authentication block has no auth-end marker")
-        replacement = textwrap.indent(body, match.group("indent"))
-        return pattern.sub(lambda _: replacement, content, count=1)
-    existing_position = content.find("script:pre-request")
+        return updated
+    body = "\n".join(script.splitlines()[1:-1])
+    existing_position = updated.find("script:pre-request")
     if existing_position >= 0:
-        opening = content.find("{", existing_position)
+        opening = updated.find("{", existing_position)
         if opening < 0:
-            raise ValueError("cannot merge authentication into the existing Bruno pre-request script")
-        indented = "\n".join(f"  {line}" if line else "" for line in body.splitlines())
-        insertion = f"\n  {{\n{indented}\n  }}"
-        return content[:opening + 1] + insertion + content[opening + 1:]
-    lines = content.splitlines()
+            raise ValueError("cannot merge common Header exclusion into the existing Bruno pre-request script")
+        return updated[:opening + 1] + "\n" + body + updated[opening + 1:]
+    lines = updated.splitlines()
     insert_at = next(
         (index for index, line in enumerate(lines) if line.startswith(("headers ", "body:", "assert "))),
         len(lines),
     )
     lines[insert_at:insert_at] = [script, ""]
     return "\n".join(lines).rstrip() + "\n"
+
+
+def contract_signature(content: str) -> str:
+    blocks = re.findall(
+        r"(?mis)^\s*(?:meta|get|post|put|patch|delete|head|options|trace|headers|body:[^\s{]+|assert)\s*\{.*?^\s*\}",
+        content,
+    )
+    return "\n".join(re.sub(r"\s+", " ", block).strip() for block in blocks)
 
 
 def sync_index_counts(contracts_root: Path) -> None:
@@ -622,15 +502,29 @@ def materialize(
     contracts_root: Path,
     bruno_root: Path,
     dry_run: bool = False,
-    auth_config_path: Path | None = None,
+    execution_config_path: Path | None = None,
+    module_filter: str | None = None,
+    sync_index: bool = True,
+    check: bool = False,
 ) -> list[Path]:
     modules_root = contracts_root / "modules"
     if not modules_root.is_dir():
         raise SystemExit(f"modules directory does not exist: {modules_root}")
-    config_path = auth_config_path or (contracts_root / "request-auth.yaml")
-    config = load_data(config_path) if config_path.is_file() else DEFAULT_AUTH_CONFIG
-    if not isinstance(config, dict):
-        raise SystemExit(f"request authentication config must be an object: {config_path}")
+    config_path = execution_config_path or (contracts_root.parent / "execution" / "config.yaml")
+    try:
+        load_execution_config(config_path)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    collection_path = bruno_root / "collection.bru"
+    if not collection_path.exists():
+        if not dry_run:
+            collection_path.parent.mkdir(parents=True, exist_ok=True)
+            collection_path.write_text(COLLECTION_TEMPLATE, encoding="utf-8")
+        created = [collection_path]
+    else:
+        created = []
+        if COLLECTION_MARKER not in collection_path.read_text(encoding="utf-8", errors="strict"):
+            raise SystemExit(f"collection runtime script is missing from {collection_path}")
     module_map_path = contracts_root / "module-map.yaml"
     module_map = load_data(module_map_path) if module_map_path.is_file() else {}
     module_metadata = {
@@ -638,38 +532,131 @@ def materialize(
         for item in module_map.get("modules", [])
         if isinstance(item, dict) and item.get("id")
     } if isinstance(module_map, dict) and isinstance(module_map.get("modules"), list) else {}
-    created: list[Path] = []
     for module_dir in sorted(path for path in modules_root.iterdir() if path.is_dir()):
         endpoints_doc = load_data(module_dir / "endpoints.yaml")
         endpoints = first_list(endpoints_doc, "endpoints")
         endpoint_by_id = {str(item.get("id")): item for item in endpoints}
+        module_id = str(endpoints_doc.get("module", module_dir.name)) if isinstance(endpoints_doc, dict) else module_dir.name
+        module_tag = str(endpoints_doc.get("swagger_tag", "")).strip() if isinstance(endpoints_doc, dict) else ""
+        if module_tag and module_dir.name != display_directory(module_tag, module_id):
+            raise SystemExit(
+                f"module {module_id} directory {module_dir.name!r} does not match OpenAPI Tag {module_tag!r}"
+            )
+        if module_filter and module_filter not in {module_id, module_dir.name}:
+            continue
         cases_path = module_dir / "cases.yaml"
         if not cases_path.is_file():
             continue
-        cases = first_list(load_data(cases_path), "cases")
-        for case in cases:
+        cases_document = load_data(cases_path)
+        cases = first_list(cases_document, "cases")
+        module_bru = bruno_root / module_dir.name
+        existing_by_id: dict[str, Path] = {}
+        if module_bru.is_dir():
+            for path in sorted(module_bru.rglob("*.bru")):
+                try:
+                    content = path.read_text(encoding="utf-8", errors="strict")
+                except (OSError, UnicodeDecodeError) as exc:
+                    raise SystemExit(f"cannot read Bruno file {path}: {exc}") from exc
+                if not is_http_request_content(content):
+                    continue
+                existing_id = bru_meta_name(content)
+                if not existing_id:
+                    raise SystemExit(f"business Bruno request has no meta.name: {path}")
+                if not valid_business_file(path, existing_id):
+                    raise SystemExit(
+                        f"case {existing_id} has invalid business Bruno filename {path.name!r}; "
+                        "expected NN-Chinese-case-title.bru and not the stable case ID"
+                    )
+                if existing_id in existing_by_id:
+                    raise SystemExit(
+                        f"case {existing_id} is mapped by multiple Bruno files: "
+                        f"{existing_by_id[existing_id]} and {path}"
+                    )
+                existing_by_id[existing_id] = path
+
+        planned: list[tuple[dict[str, Any], dict[str, Any], Path]] = []
+        targets: dict[Path, str] = {}
+        mappings_changed = False
+        for position, case in enumerate(cases, 1):
             case_id = str(case.get("id", ""))
             endpoint = endpoint_by_id.get(str(case.get("endpoint_id")))
             if not case_id or endpoint is None:
                 continue
             configured = case.get("bru") or case.get("bru_file") or case.get("file_name")
-            relative = (
-                Path(configured)
-                if isinstance(configured, str) and configured
-                else display_case_file(case, endpoint, module_dir.name)
-            )
-            module_bru = bruno_root / module_dir.name
+            if isinstance(configured, str) and configured:
+                relative = Path(configured)
+                explicit_sequence = case.get("sequence", case.get("seq"))
+                if relative.parent != Path(".") or not valid_business_file(
+                    relative,
+                    case_id,
+                    str(case.get("title", "")),
+                    case_sequence(case, position) if explicit_sequence is not None else None,
+                ):
+                    raise SystemExit(
+                        f"case {case_id} has invalid business Bruno filename {configured!r}; "
+                        "expected its stable sequence and sanitized Chinese case.title"
+                    )
+                if "environments" in {part.lower() for part in relative.parts[:-1]}:
+                    raise SystemExit(f"case {case_id} cannot use an environments path: {configured}")
+            elif case_id in existing_by_id:
+                relative = existing_by_id[case_id].relative_to(module_bru)
+                if relative.parent != Path(".") or not valid_business_file(relative, case_id, str(case.get("title", ""))):
+                    raise SystemExit(
+                        f"case {case_id} existing Bruno filename {relative.name!r} does not match "
+                        "its sanitized Chinese case.title"
+                    )
+            else:
+                relative = display_case_file(case, position)
             target = (module_bru / relative).resolve()
             try:
                 target.relative_to(module_bru.resolve())
             except ValueError as exc:
                 raise SystemExit(f"case {case_id} points outside Tag module {module_dir.name}: {relative}") from exc
+            if target in targets:
+                raise SystemExit(
+                    f"Bruno filename collision: cases {targets[target]} and {case_id} both map to {relative}"
+                )
+            targets[target] = case_id
+            planned.append((case, endpoint, target))
+            desired_mapping = relative.as_posix()
+            if case.get("bru") != desired_mapping or "bru_file" in case or "file_name" in case:
+                if "bru_file" in case or "file_name" in case:
+                    print(f"WARNING: case {case_id} uses legacy bru_file/file_name; migrated to bru", file=sys.stderr)
+                case["bru"] = desired_mapping
+                case.pop("bru_file", None)
+                case.pop("file_name", None)
+                mappings_changed = True
+
+        if mappings_changed:
+            created.append(cases_path)
+            if not dry_run:
+                updated_cases_document = dict(cases_document) if isinstance(cases_document, dict) else {}
+                updated_cases_document["cases"] = cases
+                cases_path.write_text(render_manifest(updated_cases_document, cases_path), encoding="utf-8")
+
+        for case, endpoint, target in planned:
+            case_id = str(case["id"])
             if target.exists():
                 try:
                     existing = target.read_text(encoding="utf-8", errors="strict")
                 except (OSError, UnicodeDecodeError) as exc:
                     raise SystemExit(f"cannot read Bruno file {target}: {exc}") from exc
-                updated = ensure_auth_script(existing, config)
+                actual_id = bru_meta_name(existing)
+                if actual_id != case_id:
+                    raise SystemExit(
+                        f"Bruno filename collision: case {case_id} maps to {target}, "
+                        f"whose meta.name is {actual_id or '<missing>'}"
+                    )
+                if check:
+                    expected_sequence = int(target.stem.split("-", 1)[0])
+                    expected = render_case(case, endpoint, expected_sequence)
+                    if (
+                        contract_signature(existing) != contract_signature(expected)
+                        or ensure_request_script(existing, case) != existing
+                    ):
+                        created.append(target)
+                    continue
+                updated = ensure_request_script(existing, case)
                 if updated == existing:
                     continue
                 created.append(target)
@@ -679,15 +666,17 @@ def materialize(
             created.append(target)
             if not dry_run:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(render_case(case, endpoint, config), encoding="utf-8")
-        module_bru = bruno_root / module_dir.name
+                target_sequence = int(target.stem.split("-", 1)[0])
+                target.write_text(render_case(case, endpoint, target_sequence), encoding="utf-8")
         if module_bru.is_dir():
             for existing_path in sorted(module_bru.rglob("*.bru")):
                 try:
                     existing = existing_path.read_text(encoding="utf-8", errors="strict")
                 except (OSError, UnicodeDecodeError) as exc:
                     raise SystemExit(f"cannot read Bruno file {existing_path}: {exc}") from exc
-                updated = ensure_auth_script(existing, config)
+                if not is_http_request_content(existing):
+                    continue
+                updated = strip_legacy_auth(existing)
                 if updated != existing:
                     created.append(existing_path)
                     if not dry_run:
@@ -699,7 +688,6 @@ def materialize(
             else ""
         )
         tag = str(endpoints_doc.get("swagger_tag", "")) if isinstance(endpoints_doc, dict) else ""
-        module_id = str(endpoints_doc.get("module", module_dir.name)) if isinstance(endpoints_doc, dict) else module_dir.name
         module = dict(module_metadata.get(module_id, {}))
         module.setdefault("id", module_id)
         module.setdefault("name", str(endpoints_doc.get("name", tag or module_dir.name)) if isinstance(endpoints_doc, dict) else module_dir.name)
@@ -710,20 +698,21 @@ def materialize(
             created.append(documentation_path)
             if not dry_run:
                 documentation_path.write_text(updated_documentation, encoding="utf-8")
-    # Apply the selected pre-request mode to collection files that are not
-    # owned by a generated module, such as coordinator or cross-module cases.
-    if bruno_root.is_dir():
+    # Remove legacy generated authentication from coordinator/cross-module requests.
+    if bruno_root.is_dir() and not module_filter:
         for existing_path in sorted(bruno_root.rglob("*.bru")):
             try:
                 existing = existing_path.read_text(encoding="utf-8", errors="strict")
             except (OSError, UnicodeDecodeError) as exc:
                 raise SystemExit(f"cannot read Bruno file {existing_path}: {exc}") from exc
-            updated = ensure_auth_script(existing, config)
+            if not is_http_request_content(existing):
+                continue
+            updated = strip_legacy_auth(existing)
             if updated != existing:
                 created.append(existing_path)
                 if not dry_run:
                     existing_path.write_text(updated, encoding="utf-8")
-    if not dry_run:
+    if not dry_run and sync_index and not module_filter:
         sync_index_counts(contracts_root)
     return list(dict.fromkeys(created))
 
@@ -731,16 +720,35 @@ def materialize(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("contracts_root", type=Path)
-    parser.add_argument("bruno_root", type=Path)
+    parser.add_argument("bruno_root", type=Path, nargs="?")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--auth-config", type=Path, help="request-auth.yaml selecting the active pre-request mode")
+    parser.add_argument("--execution-config", type=Path, help="qa/execution/config.yaml (the only shared runtime config)")
+    parser.add_argument("--module", help="materialize only one module id or directory; never updates index.yaml")
+    parser.add_argument("--sync-index", action="store_true", help="refresh index counts without materializing requests")
+    parser.add_argument("--check", action="store_true", help="report request/assertion drift without overwriting existing files")
     args = parser.parse_args()
-    created = materialize(args.contracts_root, args.bruno_root, args.dry_run, args.auth_config)
+    if args.sync_index:
+        if args.module:
+            parser.error("--sync-index cannot be combined with --module")
+        sync_index_counts(args.contracts_root)
+        print("synchronized index counts")
+        return 0
+    if args.bruno_root is None:
+        parser.error("bruno_root is required unless --sync-index is used")
+    created = materialize(
+        args.contracts_root,
+        args.bruno_root,
+        args.dry_run or args.check,
+        args.execution_config,
+        args.module,
+        not args.module,
+        args.check,
+    )
     action = "would materialize" if args.dry_run else "materialized"
     print(f"{action} {len(created)} Bruno/documentation artifact(s)")
     for path in created:
         print(path)
-    return 0
+    return 1 if args.check and created else 0
 
 
 if __name__ == "__main__":

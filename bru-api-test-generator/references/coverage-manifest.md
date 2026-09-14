@@ -15,8 +15,8 @@ Keep version-lock.yaml at the contracts root. It records the business Git commit
 
 The generated global index should also record `generation_status` (`draft`,
 `runnable`, `verified`, or `blocked`), the offline contract SHA, inventory
-counts, and blocked-module count. `draft` is an expected intermediate state,
-not completion evidence.
+counts, blocked-module count, and `execution_config_file`. `draft` is an
+expected intermediate state, not completion evidence.
 
 ## module-map.yaml
 
@@ -32,12 +32,12 @@ are review metadata only and never choose ownership:
         directory: 用户管理
         business_scope: 用户账号的创建、查询、修改、删除和状态维护
         swagger_tags:
-          - sys-user-controller
+          - 用户管理
       - id: system-role
         name: 角色管理
         directory: 角色管理
         swagger_tags:
-          - sys-role-controller
+          - 角色管理
 
 If an operation declares more than one Tag, add an explicit `primary_tags`
 mapping keyed by endpoint ID, `operationId`, or `METHOD /path`. An operation
@@ -68,62 +68,34 @@ Each module also owns `parameters.yaml`, `definitions.yaml`, and
 endpoints; shared OpenAPI components are copied into each owning module rather
 than read from a global mutable manifest.
 
-## request-auth.yaml
+## execution/config.yaml
 
-Select exactly one request pre-request mode. The generated default enables the
-`seres-sign` mode; `seres.sign: true` is accepted as an alias. All `*_env`
-values are environment variable names, not secrets. The signature inputs and
-output Header names are configurable while preserving the default SHA-256
-contract:
+This is the only shared runtime configuration. It selects the external Bruno
+environment, authentication mode, and path-scoped common Headers. It has no
+format-version field. The parser rejects unknown fields and incompatible
+authentication settings.
 
-    version: 1
-    mode: seres-sign
-    seres-sign: true
-    # seres.sign: true
-    base_url_env: BASE_URL
-    modes:
-      seres-sign:
-        enabled: true
-        algorithm: SHA256
-        secret_key_env: SECRET_KEY
-        access_key_env: ACCESS_KEY
-        signature:
-          parameters:
-            url: request.path
-            body: request.body
-            query: request.query
-            timestamp: timestamp
-            secret_key_env: SECRET_KEY
-            access_key_env: ACCESS_KEY
-          append_secret: true
-        headers:
-          sign: sign
-          timestamp: timestamp
-          accesskey: accesskey
-        extra_headers:
-          # X-Tenant-Id: TENANT_ID
-      bearer:
-        enabled: false
-        token_env: ACCESS_TOKEN
-        header: Authorization
-      api-key:
-        enabled: false
-        token_env: API_KEY
-        header: X-API-Key
-      custom:
-        enabled: false
-        headers:
-          X-Service-Token: SERVICE_TOKEN
+The five authentication modes are `none`, `seres-sign`, `bearer`, `api-key`,
+and `cookie`. Values ending in `_env` name Bruno environment variables; they
+never contain credentials. OAuth2 token acquisition stays in an external
+bootstrap and the resulting token is consumed through `bearer`. SERES signing
+uses fixed SHA-256 inputs and fixed `sign`, `timestamp`, and `accesskey` Header
+names.
 
-`BASE_URL`, credential variables, and token variables are read from the Bruno
-environment. Never put their values in a manifest or `.bru` file.
+Common Headers accept exactly one of `env` or `value`, plus optional path
+patterns. An empty environment-backed value is not sent. Request-local Headers
+have priority. A negative case can remove configured Headers after collection
+injection with:
 
-For `seres-sign`, `signature.parameters.url` accepts `request.path` (the
-default) or `request.url`; `body` and `query` can be set to `false` to omit
-those inputs.
-The currently implemented digest is `SHA256`; an unsupported algorithm is
-rejected instead of silently producing a different signature. Custom Header
-values may be plain environment names or `{env: NAME, prefix: Bearer}` objects.
+```yaml
+request:
+  omit_common_headers:
+    - operatorInfo
+```
+
+See [execution-config.md](execution-config.md) for the schema and generated
+template. `BASE_URL`, credential variables, and token variables are read only
+from `execution/environments/<active_environment>.bru`.
 
 ## Request and response payloads
 
@@ -138,6 +110,10 @@ Assertions can target `$.data.id` JSON paths, `target: text`/`body_text` for
 raw text/XML/binary body content, `target: header` with a response header name, or
 `target: cookie` with a cookie name. `expected.business_code_path` overrides
 the default `$.code` location when an application uses a different envelope.
+Use `type`, `length`, `minimum`, `maximum`, `nullable`, and `items.type` for
+structural constraints. Use assertion `capture_as` or case-level `captures`
+to publish a response value with `bru.setVar`, then `equals_variable` to compare
+it in a dependent request.
 
 ## Module cases.yaml
 
@@ -150,6 +126,7 @@ Cases link back to an endpoint and optionally to source logic. Assertions must i
         title: 创建用户成功
         description: 验证合法用户资料能够创建成功并返回新用户信息。
         endpoint_id: USER_CREATE
+        risk: isolated-write
         scenarios:
           success: {applicable: true}
           authentication: {applicable: true}
@@ -157,7 +134,7 @@ Cases link back to an endpoint and optionally to source logic. Assertions must i
           authorization: {applicable: false, reason: "endpoint has no role or tenant guard"}
         logic_ids:
           - USER_CREATE_NORMAL_LOGIC
-        bru: create-success.bru
+        bru: 01-创建用户成功.bru
         expected:
           http_status: 200
           business_code: 0
@@ -171,9 +148,10 @@ Cases link back to an endpoint and optionally to source logic. Assertions must i
         title: 用户名重复时创建失败
         description: 验证重复用户名被业务规则拒绝并返回明确提示。
         endpoint_id: USER_CREATE
+        risk: isolated-write
         logic_ids:
           - USER_CREATE_DUPLICATE_LOGIC
-        bru: create-duplicate.bru
+        bru: 02-用户名重复时创建失败.bru
         expected:
           http_status: 200
           business_code: 601
@@ -185,10 +163,11 @@ Do not create two case records with the same
 `endpoint_id + scenario + request + assertions` fingerprint. A different case
 ID does not make an identical request/assertion pair independent coverage.
 
-`bru`/`file_name` may explicitly choose a filename. When omitted, the draft
-materializer uses a Chinese `display_name`, `name`, `title`, endpoint `summary`,
-or module directory when one is available, and adds a deterministic short hash
-to avoid collisions. English IDs remain in `meta.name` and manifests.
+Every registered request uses `<two-or-more-digit sequence>-<sanitized Chinese
+case.title>.bru`. Explicit `bru`, legacy `bru_file`, and legacy `file_name`
+must match the same deterministic name. Tag, summary, stable ID, and hash
+fallbacks are forbidden; collisions block generation. English IDs remain only
+in `meta.name`, manifests, and execution evidence.
 
 ## contracts/README.md and module CASES.md
 
@@ -198,10 +177,12 @@ contract artifacts, endpoint inventory, and a link to the module's `CASES.md`.
 Keep this overview aligned with `module-map.yaml` and `index.yaml`.
 
 Each module owns one `CASES.md`. It describes the module's business scope,
-owned manifests, endpoints, and every automated case. Each case is keyed by
-its stable case ID and contains a title, one short business description, and a
-Mermaid swimlane. Use Chinese wording when the source Tag, endpoint summary,
-validation message, or source comment is Chinese:
+owned manifests, endpoints, and every automated case. Keep one shared module
+sequence diagram. Each case is keyed by its stable case ID and contains a title
+and one short business description; only flow-required or cross-module cases
+also need a case-level Mermaid diagram.
+
+Example flow-required case block:
 
 ````markdown
 <!-- CASE_START: USER_CREATE_OK -->
@@ -225,8 +206,8 @@ sequenceDiagram
 Run `materialize_missing_bru.py` after changing `cases.yaml`; it updates the
 generated case section without replacing manual module notes. The coverage
 checker rejects a missing contracts README, missing module document, unknown
-or duplicate documented case ID, or a case block without its title, brief
-description, and sequence diagram.
+or duplicate documented case ID, a case block without its title and brief
+description, or a required flow diagram that is absent.
 
 If decisions are shared by multiple cases, put the matrix on the endpoint
 instead of repeating it on every case:

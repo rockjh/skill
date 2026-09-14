@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,9 @@ import unittest
 
 
 ROOT = Path(__file__).parents[1]
+os.environ.setdefault("PYTHONUTF8", "1")
+os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+sys.dont_write_bytecode = True
 
 
 def load_script(name: str):
@@ -19,8 +23,45 @@ def load_script(name: str):
     if spec is None or spec.loader is None:
         raise AssertionError(f"cannot load {path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    sys.path.insert(0, str(ROOT / "scripts"))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(str(ROOT / "scripts"))
     return module
+
+
+def static_preflight_inputs(root: Path) -> tuple[Path, Path]:
+    openapi = root / "openapi.json"
+    static_results = root / "static-coverage.json"
+    openapi.write_text('{"openapi":"3.0.0","paths":{}}', encoding="utf-8")
+    digest = hashlib.sha256(openapi.read_bytes()).hexdigest()
+    static_results.write_text(json.dumps({"static_ready": True, "openapi_sha256": digest}), encoding="utf-8")
+    return openapi, static_results
+
+
+def execution_fixture(
+    root: Path,
+    auth: dict | None = None,
+    custom_headers: dict | None = None,
+    environment: dict[str, str] | None = None,
+) -> tuple[Path, Path]:
+    execution = root / "execution"
+    environments = execution / "environments"
+    environments.mkdir(parents=True, exist_ok=True)
+    config = execution / "config.yaml"
+    config.write_text(json.dumps({
+        "active_environment": "local",
+        "auth": auth or {"mode": "none"},
+        "custom_headers": custom_headers or {},
+    }, ensure_ascii=False), encoding="utf-8")
+    env_file = environments / "local.bru"
+    values = {"BASE_URL": "http://127.0.0.1:18080", **(environment or {})}
+    env_file.write_text(
+        "vars {\n" + "".join(f"  {name}: {value}\n" for name, value in values.items()) + "}\n",
+        encoding="utf-8",
+    )
+    return config, env_file
 
 
 class RegressionTests(unittest.TestCase):
@@ -120,15 +161,53 @@ class RegressionTests(unittest.TestCase):
         )
         self.assertTrue(any("module-map.yaml is required" in error for error in errors))
 
-    def test_require_auth_rejects_missing_or_invalid_config(self):
+    def test_execution_config_is_strict_and_has_no_version_field(self):
+        config = load_script("execution_config")
+        valid = config.validate_execution_config({
+            "active_environment": "local",
+            "auth": {"mode": "bearer", "token_env": "ACCESS_TOKEN"},
+            "custom_headers": {
+                "operatorInfo": {"env": "OPERATOR_INFO", "paths": ["/v*/admin/**"]},
+                "X-Gray-Traffic": {"value": "true"},
+            },
+        })
+        self.assertEqual(valid["auth"]["mode"], "bearer")
+        for invalid in (
+            {"version": 1, "active_environment": "local", "auth": {"mode": "none"}},
+            {"active_environment": "local.bru", "auth": {"mode": "none"}},
+            {"active_environment": "local:bad", "auth": {"mode": "none"}},
+            {"active_environment": "local", "auth": {"mode": "oauth2"}},
+            {"active_environment": "local", "auth": {"mode": "bearer"}},
+            {"active_environment": "local", "auth": {"mode": "none"}, "custom_headers": {"X-Test": {"env": "A", "value": "b"}}},
+            {"active_environment": "local", "auth": {"mode": "none"}, "custom_headers": {1: {"value": "x"}}},
+        ):
+            with self.assertRaises(ValueError):
+                config.validate_execution_config(invalid)
+
+    def test_collection_runtime_replaces_per_request_authentication(self):
+        config = load_script("execution_config")
         coverage = load_script("check_api_coverage")
-        self.assertTrue(any("unsupported authentication mode" in error for error in coverage.validate_auth_config_document({"mode": "unknown"})))
-        self.assertTrue(any("requires modes.custom.headers" in error for error in coverage.validate_auth_config_document({"mode": "custom", "modes": {"custom": {"enabled": True}}})))
-        self.assertEqual(coverage.auth_markers({"seres.sign": False}), ())
-        self.assertTrue(any("custom header X-Token env" in error for error in coverage.validate_auth_config_document({
-            "mode": "custom",
-            "modes": {"custom": {"enabled": True, "headers": {"X-Token": {}}}},
-        })))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            module = root / "things"
+            module.mkdir()
+            (root / "collection.bru").write_text(config.COLLECTION_TEMPLATE, encoding="utf-8")
+            request = module / "01-查询事物成功.bru"
+            request.write_text(
+                "meta {\n  name: THING_OK\n  type: http\n}\n"
+                "get {\n  url: {{BASE_URL}}/things\n}\nassert {\n  res.status: eq 200\n}\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(coverage.collection_runtime_errors(root), [])
+            request.write_text(
+                request.read_text(encoding="utf-8")
+                + "// bru-api-test-generator: auth-start\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(any(
+                "legacy per-request authentication" in error
+                for error in coverage.collection_runtime_errors(root)
+            ))
 
     def test_local_openapi_ref_is_resolved_for_query_schema(self):
         parser = load_script("parse_openapi")
@@ -220,6 +299,7 @@ class RegressionTests(unittest.TestCase):
             output_dir = root / "contracts" / "modules"
             document = {
                 "openapi": "3.0.0",
+                "tags": [{"name": "things", "description": "Thing management"}],
                 "paths": {"/things": {"get": {
                     "operationId": "listThings",
                     "tags": ["things"],
@@ -230,12 +310,35 @@ class RegressionTests(unittest.TestCase):
             map_path.write_text(json.dumps({
                 "modules": [{"id": "things", "name": "things", "swagger_tags": ["things"]}],
             }), encoding="utf-8")
+            legacy_environment = root / "bruno" / "environments"
+            legacy_environment.mkdir(parents=True)
+            (legacy_environment / "local.bru").write_text(
+                "vars {\n  BASE_URL: http://127.0.0.1:18080\n  OPERATOR_INFO:\n}\n",
+                encoding="utf-8",
+            )
             parser.write_partitioned(parser.extract(spec_path, document), map_path, output_dir)
+            endpoints = parser.load_document(output_dir / "things" / "endpoints.yaml")
+            self.assertEqual(endpoints["endpoints"][0]["tag_description"], "Thing management")
             self.assertTrue((root / "contracts" / "security-profile.yaml").is_file())
-            auth_text = (root / "contracts" / "request-auth.yaml").read_text(encoding="utf-8")
-            self.assertIn("seres.sign: true", auth_text)
-            self.assertIn("timestamp: timestamp", auth_text)
+            config_text = (root / "execution" / "config.yaml").read_text(encoding="utf-8")
+            self.assertIn("active_environment: local", config_text)
+            self.assertIn("mode: none", config_text)
+            self.assertNotIn("version:", config_text)
+            self.assertTrue((root / "execution" / "environments" / "local.bru").is_file())
+            self.assertFalse((root / "bruno" / "environments").exists())
+            self.assertTrue((root / "execution" / "run.bat").is_file())
+            self.assertTrue((root / "execution" / "run.sh").is_file())
+            self.assertIn("run_bruno.py\" %*", (root / "execution" / "run.bat").read_text(encoding="utf-8"))
+            self.assertIn('run_bruno.py" "$@"', (root / "execution" / "run.sh").read_text(encoding="utf-8"))
+            self.assertEqual(
+                sorted(path.name for path in (root / "execution" / "environments").glob("*.bru")),
+                ["local.bru"],
+            )
+            self.assertTrue((root / "bruno" / "collection.bru").is_file())
+            self.assertTrue((root / "bruno" / "bruno.json").is_file())
             index = parser.load_document(root / "contracts" / "index.yaml")
+            self.assertIn("execution_config_file", index)
+            self.assertNotIn("request_auth_file", index)
             self.assertEqual(index["generation_status"], "draft")
             self.assertEqual(index["inventory_endpoints"], 1)
             overview = (root / "contracts" / "README.md").read_text(encoding="utf-8")
@@ -270,7 +373,7 @@ class RegressionTests(unittest.TestCase):
                     "endpoint_id": "LISTTHINGS_GET_THINGS",
                     "scenario": "success",
                     "expected": {"http_status": 200},
-                    "assertions": [{"path": "$.data", "exists": True}],
+                    "assertions": [{"path": "$.data", "equals": {}}],
                 }],
             }
             (output_dir / "things" / "cases.yaml").write_text(
@@ -287,10 +390,6 @@ class RegressionTests(unittest.TestCase):
             self.assertIn(
                 "<!-- CASE_START: THING_LIST_OK -->",
                 (output_dir / "things" / "CASES.md").read_text(encoding="utf-8"),
-            )
-            (root / "contracts" / "request-auth.yaml").write_text(
-                json.dumps({"mode": "none"}),
-                encoding="utf-8",
             )
             materialized = subprocess.run(
                 [
@@ -318,7 +417,7 @@ class RegressionTests(unittest.TestCase):
                 text=True,
                 encoding="utf-8",
             )
-            self.assertEqual(checked.returncode, 0, checked.stdout)
+            self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
             self.assertTrue(json.loads(checked.stdout)["static_ok"])
 
     def test_partition_supports_explicit_path_prefix_fallback_for_untagged_operations(self):
@@ -340,6 +439,7 @@ class RegressionTests(unittest.TestCase):
         parser = load_script("parse_openapi")
         manifest = {
             "source": {"file": "openapi.json", "sha256": "abc"},
+            "tag_descriptions": {"用户管理": "用户账户管理"},
             "endpoints": [{
                 "id": "USER_LIST",
                 "method": "GET",
@@ -360,6 +460,33 @@ class RegressionTests(unittest.TestCase):
             self.assertTrue((root / "contracts" / "modules" / "用户管理" / "endpoints.yaml").is_file())
             self.assertIn("用户管理", (root / "contracts" / "README.md").read_text(encoding="utf-8"))
 
+    def test_tagged_module_rejects_an_unrelated_directory_name(self):
+        parser = load_script("parse_openapi")
+        manifest = {"endpoints": [{"tags": ["用户管理"]}]}
+        module_map = {
+            "modules": [{
+                "id": "user-management",
+                "name": "用户管理",
+                "directory": "自定义目录",
+                "swagger_tags": ["用户管理"],
+            }]
+        }
+        with self.assertRaisesRegex(ValueError, "directory must come from Swagger tag"):
+            parser.validate_module_map(manifest, module_map)
+
+    def test_tag_directory_collision_is_blocking(self):
+        parser = load_script("parse_openapi")
+        manifest = {
+            "source": {},
+            "tag_descriptions": {},
+            "endpoints": [
+                {"id": "ONE", "tags": ["模块/查询"]},
+                {"id": "TWO", "tags": ["模块:查询"]},
+            ],
+        }
+        with self.assertRaisesRegex(ValueError, "same safe module directory"):
+            parser.generate_module_map(manifest)
+
     def test_coverage_maps_display_directory_back_to_stable_module_id(self):
         coverage = load_script("check_api_coverage")
         with tempfile.TemporaryDirectory() as directory:
@@ -373,7 +500,7 @@ class RegressionTests(unittest.TestCase):
             )
             self.assertEqual(modules, [("tag-user", module_dir)])
 
-    def test_materializer_uses_chinese_summary_for_case_filename(self):
+    def test_materializer_uses_chinese_case_title_for_filename(self):
         scripts_path = str(ROOT / "scripts")
         sys.path.insert(0, scripts_path)
         try:
@@ -395,9 +522,10 @@ class RegressionTests(unittest.TestCase):
             (module / "cases.yaml").write_text(json.dumps({
                 "cases": [{
                     "id": "USER_CREATE_OK",
+                    "title": "创建用户",
                     "endpoint_id": "USER_CREATE",
                     "expected": {"http_status": 200},
-                    "assertions": [{"path": "$.data", "exists": True}],
+                    "assertions": [{"path": "$.data", "equals": {}}],
                 }]
             }), encoding="utf-8")
             (module / "CASES.md").write_text(
@@ -407,13 +535,17 @@ class RegressionTests(unittest.TestCase):
             (root / "contracts" / "module-map.yaml").write_text(json.dumps({
                 "modules": [{"id": "用户管理", "name": "用户管理", "business_scope": "账号生命周期管理"}],
             }), encoding="utf-8")
-            config = root / "auth.json"
-            config.write_text(json.dumps({"mode": "none"}), encoding="utf-8")
-            created = materializer.materialize(root / "contracts", root / "bruno", auth_config_path=config)
-            bru_files = [path for path in created if path.suffix == ".bru"]
+            config, _ = execution_fixture(root)
+            created = materializer.materialize(
+                root / "contracts", root / "bruno", execution_config_path=config
+            )
+            bru_files = [
+                path for path in created
+                if path.suffix == ".bru" and path.name != "collection.bru"
+            ]
             self.assertEqual(len(bru_files), 1)
             self.assertEqual(bru_files[0].parent.name, "用户管理")
-            self.assertTrue(bru_files[0].name.startswith("创建用户-"))
+            self.assertEqual(bru_files[0].name, "01-创建用户.bru")
             bru_text = bru_files[0].read_text(encoding="utf-8")
             self.assertIn("## 用例标题：创建用户", bru_text)
             self.assertIn("响应校验覆盖状态码、业务结果和具体字段。", bru_text)
@@ -425,6 +557,506 @@ class RegressionTests(unittest.TestCase):
             self.assertIn("sequenceDiagram", case_doc)
             self.assertIn("<!-- CASE_START: USER_CREATE_OK -->", case_doc)
             self.assertIn("这里是需要保留的人工业务说明。", case_doc)
+
+    def test_business_filename_uses_sequence_and_chinese_case_title(self):
+        materializer = load_script("materialize_missing_bru")
+        path = materializer.display_case_file(
+            {"id": "traffic_query_success", "title": "查询车辆/流量信息成功"},
+            1,
+        )
+        self.assertEqual(path.name, "01-查询车辆流量信息成功.bru")
+        rendered = materializer.render_case(
+            {"id": "traffic_query_success", "title": "查询车辆流量信息成功"},
+            {"method": "GET", "path": "/traffic"},
+        )
+        self.assertIn("name: traffic_query_success", rendered)
+        self.assertIn("url: {{BASE_URL}}/traffic", rendered)
+
+    def test_materializer_rejects_explicit_case_id_filename(self):
+        materializer = load_script("materialize_missing_bru")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            module = root / "contracts" / "modules" / "流量查询"
+            module.mkdir(parents=True)
+            (module / "endpoints.yaml").write_text(json.dumps({"endpoints": [{
+                "id": "TRAFFIC", "method": "GET", "path": "/traffic", "summary": "查询车辆流量",
+            }]}), encoding="utf-8")
+            (module / "cases.yaml").write_text(json.dumps({"cases": [{
+                "id": "traffic_query_success", "endpoint_id": "TRAFFIC",
+                "title": "查询车辆流量成功", "bru": "01-traffic_query_success.bru",
+            }]}), encoding="utf-8")
+            config, _ = execution_fixture(root)
+            with self.assertRaisesRegex(SystemExit, "invalid business Bruno filename"):
+                materializer.materialize(
+                    root / "contracts", root / "bruno", execution_config_path=config
+                )
+
+    def test_materializer_blocks_without_chinese_case_title(self):
+        materializer = load_script("materialize_missing_bru")
+        with self.assertRaisesRegex(SystemExit, "Chinese case.title"):
+            materializer.display_case_file(
+                {"id": "traffic_query_success", "title": "traffic_query_success"},
+                1,
+            )
+
+    def test_materializer_reports_filename_collision(self):
+        materializer = load_script("materialize_missing_bru")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            module = root / "contracts" / "modules" / "流量查询"
+            module.mkdir(parents=True)
+            (module / "endpoints.yaml").write_text(json.dumps({"endpoints": [{
+                "id": "TRAFFIC", "method": "GET", "path": "/traffic", "summary": "查询车辆流量",
+            }]}), encoding="utf-8")
+            cases = [
+                {"id": case_id, "endpoint_id": "TRAFFIC", "title": "查询车辆流量", "sequence": 1}
+                for case_id in ("traffic_one", "traffic_two")
+            ]
+            (module / "cases.yaml").write_text(json.dumps({"cases": cases}), encoding="utf-8")
+            config, _ = execution_fixture(root)
+            with self.assertRaisesRegex(SystemExit, "filename collision"):
+                materializer.materialize(
+                    root / "contracts", root / "bruno", execution_config_path=config
+                )
+
+    def test_repeated_materialization_preserves_filename_and_number(self):
+        materializer = load_script("materialize_missing_bru")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            module = root / "contracts" / "modules" / "流量查询"
+            module.mkdir(parents=True)
+            (module / "endpoints.yaml").write_text(json.dumps({"endpoints": [{
+                "id": "TRAFFIC", "method": "GET", "path": "/traffic", "summary": "查询车辆流量",
+            }]}), encoding="utf-8")
+            (module / "cases.yaml").write_text(json.dumps({"cases": [{
+                "id": "traffic_query_success", "endpoint_id": "TRAFFIC", "title": "查询车辆流量成功",
+            }]}), encoding="utf-8")
+            config, _ = execution_fixture(root)
+            materializer.materialize(
+                root / "contracts", root / "bruno", execution_config_path=config
+            )
+            first = sorted(
+                path for path in (root / "bruno").rglob("*.bru")
+                if path.name != "collection.bru"
+            )
+            cases_document = load_script("manifest_io").load_data(module / "cases.yaml")
+            self.assertEqual(cases_document["cases"][0]["bru"], "01-查询车辆流量成功.bru")
+            second_changes = materializer.materialize(
+                root / "contracts", root / "bruno", execution_config_path=config
+            )
+            self.assertEqual([path.name for path in first], ["01-查询车辆流量成功.bru"])
+            self.assertEqual(second_changes, [])
+            original = first[0].read_text(encoding="utf-8")
+            first[0].write_text(original.replace("/traffic", "/wrong"), encoding="utf-8")
+            drift = materializer.materialize(
+                root / "contracts",
+                root / "bruno",
+                dry_run=True,
+                execution_config_path=config,
+                module_filter="流量查询",
+                check=True,
+            )
+            self.assertIn(first[0].name, {path.name for path in drift})
+            self.assertIn("/wrong", first[0].read_text(encoding="utf-8"))
+
+    def test_existing_filename_number_survives_manifest_reordering(self):
+        materializer = load_script("materialize_missing_bru")
+        coverage = load_script("check_api_coverage")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            module = root / "contracts" / "modules" / "车辆查询"
+            module.mkdir(parents=True)
+            endpoint = {"id": "TRAFFIC", "method": "GET", "path": "/traffic"}
+            (module / "endpoints.yaml").write_text(json.dumps({"endpoints": [endpoint]}), encoding="utf-8")
+            cases = [
+                {
+                    "id": "traffic_first", "endpoint_id": "TRAFFIC", "title": "查询第一辆车成功",
+                    "expected": {"http_status": 200}, "assertions": [{"path": "$.data", "equals": 1}],
+                },
+                {
+                    "id": "traffic_second", "endpoint_id": "TRAFFIC", "title": "查询第二辆车成功",
+                    "expected": {"http_status": 200}, "assertions": [{"path": "$.data", "equals": 1}],
+                },
+            ]
+            cases_path = module / "cases.yaml"
+            cases_path.write_text(json.dumps({"cases": cases}), encoding="utf-8")
+            config, _ = execution_fixture(root)
+
+            materializer.materialize(
+                root / "contracts", root / "bruno", execution_config_path=config
+            )
+            persisted = load_script("manifest_io").load_data(cases_path)["cases"]
+            cases_path.write_text(json.dumps({"cases": list(reversed(persisted))}), encoding="utf-8")
+
+            changes = materializer.materialize(
+                root / "contracts", root / "bruno", execution_config_path=config
+            )
+            self.assertFalse(any(path.suffix == ".bru" for path in changes))
+            reordered = load_script("manifest_io").load_data(cases_path)["cases"]
+            self.assertEqual(reordered[0]["bru"], "02-查询第二辆车成功.bru")
+            self.assertEqual(reordered[1]["bru"], "01-查询第一辆车成功.bru")
+            _, _, _, errors = coverage.case_files(reordered, root / "bruno" / "车辆查询")
+            self.assertFalse(any("filename must match" in error for error in errors))
+
+    def test_coverage_enforces_chinese_case_title_and_exempts_collection_config(self):
+        coverage = load_script("check_api_coverage")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "environments").mkdir()
+            case = {
+                "id": "traffic_query_success",
+                "title": "查询车辆流量成功",
+                "bru": "01-查询车辆流量成功.bru",
+                "expected": {"http_status": 200},
+                "assertions": [{"path": "$.data", "equals": 1}],
+            }
+            (root / "01-查询车辆流量成功.bru").write_text(
+                "meta {\n  name: traffic_query_success\n  type: http\n}\nget {\n  url: {{BASE_URL}}/traffic\n}\nassert {\n  res.status: eq 200\n  res.body.data: eq 1\n}\n",
+                encoding="utf-8",
+            )
+            (root / "environments" / "local.bru").write_text("vars { BASE_URL: http://localhost }\n", encoding="utf-8")
+            (root / "collection.bru").write_text("meta { name: collection }\n", encoding="utf-8")
+            covered, _, _, errors = coverage.case_files([case], root)
+            self.assertEqual(covered, {"traffic_query_success"})
+            self.assertEqual(errors, [])
+
+            case["bru"] = "01-traffic_query_success.bru"
+            (root / "01-traffic_query_success.bru").write_text(
+                "meta {\n  name: traffic_query_success\n  type: http\n}\nget {\n  url: {{BASE_URL}}/traffic\n}\nassert {\n  res.status: eq 200\n}\n",
+                encoding="utf-8",
+            )
+            _, _, _, errors = coverage.case_files([case], root)
+            self.assertTrue(any("sanitized Chinese case.title" in error for error in errors))
+
+    def test_coverage_rejects_a_different_chinese_title(self):
+        coverage = load_script("check_api_coverage")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case = {
+                "id": "traffic_query_success",
+                "title": "查询车辆流量成功",
+                "bru": "01-删除车辆成功.bru",
+                "expected": {"http_status": 200},
+                "assertions": [{"path": "$.data", "equals": 1}],
+            }
+            (root / case["bru"]).write_text(
+                "meta {\n  name: traffic_query_success\n  type: http\n}\nget {\n  url: {{BASE_URL}}/traffic\n}\nassert {\n  res.status: eq 200\n  res.body.data: eq 1\n}\n",
+                encoding="utf-8",
+            )
+            _, _, _, errors = coverage.case_files([case], root)
+            self.assertTrue(any("sanitized Chinese case.title" in error for error in errors))
+
+    def test_seed_cases_are_contract_only_and_review_required(self):
+        parser = load_script("parse_openapi")
+        seeded = parser.seed_contract_cases({
+            "id": "UPLOAD_LIST",
+            "method": "POST",
+            "parameters": [
+                {"name": "status", "required": True, "schema": {"enum": ["ON", "OFF"]}},
+                {"name": "pageNum", "schema": {"type": "integer"}},
+            ],
+            "request_body": {"content": {"multipart/form-data": {"schema": {
+                "type": "object",
+                "required": ["file"],
+                "properties": {"file": {"type": "string", "format": "binary"}},
+            }}}},
+            "responses": {"201": {}, "400": {}},
+        })
+        self.assertEqual(
+            {case["scenario"] for case in seeded},
+            {"success", "validation", "query", "file"},
+        )
+        self.assertTrue(all(case["review_required"] is True for case in seeded))
+        self.assertTrue(all("business_error" != case["scenario"] for case in seeded))
+
+    def test_seed_cases_populate_success_body_and_omit_each_required_field(self):
+        parser = load_script("parse_openapi")
+        seeded = parser.seed_contract_cases({
+            "id": "THING_CREATE",
+            "method": "POST",
+            "request_body": {"content": {"application/json": {"schema": {
+                "type": "object",
+                "required": ["name", "count"],
+                "properties": {
+                    "name": {"type": "string", "example": "demo"},
+                    "count": {"type": "integer", "default": 2},
+                },
+            }}}},
+            "responses": {"200": {}, "400": {}},
+        })
+        by_id = {case["id"]: case for case in seeded}
+        self.assertEqual(by_id["THING_CREATE_SUCCESS"]["request"]["body"], {"name": "demo", "count": 2})
+        self.assertEqual(by_id["THING_CREATE_MISSING_BODY_NAME"]["request"]["body"], {"count": 2})
+        self.assertEqual(by_id["THING_CREATE_MISSING_BODY_COUNT"]["request"]["body"], {"name": "demo"})
+
+    def test_seed_cases_require_declared_response_statuses(self):
+        parser = load_script("parse_openapi")
+        endpoint = {
+            "id": "THING_CREATE",
+            "method": "POST",
+            "parameters": [
+                {"name": "status", "in": "query", "required": True, "schema": {"enum": ["ON", "OFF"]}},
+            ],
+            "request_body": {"content": {"application/json": {"schema": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {"name": {"type": "string"}},
+            }}}},
+        }
+
+        self.assertEqual(parser.seed_contract_cases(endpoint), [])
+
+        endpoint["responses"] = {"204": {}}
+        seeded = parser.seed_contract_cases(endpoint)
+        self.assertEqual({case["scenario"] for case in seeded}, {"success"})
+        self.assertTrue(all(case["expected"]["http_status"] == 204 for case in seeded))
+
+        endpoint["responses"] = {"422": {}}
+        seeded = parser.seed_contract_cases(endpoint)
+        self.assertEqual({case["scenario"] for case in seeded}, {"validation"})
+        self.assertTrue(all(case["expected"]["http_status"] == 422 for case in seeded))
+
+    def test_optional_common_header_does_not_block_preflight(self):
+        execution_config = load_script("execution_config")
+        preflight = load_script("runtime_preflight")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, env_file = execution_fixture(
+                root,
+                custom_headers={
+                    "operatorInfo": {"env": "OPERATOR_INFO", "paths": ["/admin/**"]},
+                },
+            )
+            loaded = execution_config.load_execution_config(config)
+            self.assertEqual(execution_config.required_environment_names(loaded), ["BASE_URL"])
+            openapi, static_results = static_preflight_inputs(root)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts/runtime_preflight.py"),
+                    "--execution-config", str(config),
+                    "--env-file", str(env_file),
+                    "--bruno-cli", "node",
+                    "--openapi", str(openapi),
+                    "--static-results", str(static_results),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+            report = json.loads(result.stdout)
+            self.assertTrue(report["static_ready"])
+            self.assertTrue(report["context_ready"])
+            self.assertFalse(report["execution_ready"])
+            self.assertEqual(report["status"], "draft")
+
+    def test_coverage_detects_method_url_query_and_body_drift(self):
+        coverage = load_script("check_api_coverage")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case = {
+                "id": "thing_update",
+                "endpoint_id": "THING_UPDATE",
+                "bru": "01-更新事物成功.bru",
+                "request": {"query": {"tenant": "t"}, "body_type": "application/json", "body": {"name": "n"}},
+                "expected": {"http_status": 200},
+                "assertions": [{"path": "$.data.name", "equals": "n"}],
+            }
+            (root / case["bru"]).write_text(
+                "meta {\n  name: thing_update\n  type: http\n}\nget {\n  url: {{BASE_URL}}/wrong\n  body: none\n}\nassert {\n  res.status: eq 200\n  res.body.data.name: eq \"n\"\n}\n",
+                encoding="utf-8",
+            )
+            _, _, _, errors = coverage.case_files(
+                [case], root, {"THING_UPDATE": {"id": "THING_UPDATE", "method": "POST", "path": "/things"}}
+            )
+            self.assertTrue(any("method" in error for error in errors))
+            self.assertTrue(any("URL path" in error for error in errors))
+            self.assertTrue(any("Bruno query" in error for error in errors))
+            self.assertTrue(any("body type" in error for error in errors))
+            self.assertTrue(any("request field name" in error for error in errors))
+
+    def test_coverage_allows_required_body_field_to_be_omitted_by_negative_case(self):
+        coverage = load_script("check_api_coverage")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case = {
+                "id": "thing_missing_name",
+                "endpoint_id": "THING_CREATE",
+                "bru": "01-缺少必填字段名称.bru",
+                "request": {"body_type": "application/json", "body": {}},
+                "expected": {"http_status": 400},
+                "assertions": [{"path": "$.message", "equals": "名称不能为空"}],
+            }
+            (root / case["bru"]).write_text(
+                "meta {\n  name: thing_missing_name\n  type: http\n}\npost {\n  url: {{BASE_URL}}/things\n  body: json\n}\nbody:json {\n{}\n}\nassert {\n  res.status: eq 400\n  res.body.message: eq \"名称不能为空\"\n}\n",
+                encoding="utf-8",
+            )
+            endpoint = {
+                "id": "THING_CREATE",
+                "method": "POST",
+                "path": "/things",
+                "request_body": {
+                    "content": {"application/json": {"schema": {"required": ["name"]}}}
+                },
+            }
+            _, _, _, errors = coverage.case_files([case], root, {"THING_CREATE": endpoint})
+            self.assertFalse(any("request field name" in error for error in errors), errors)
+
+    def test_coverage_detects_body_value_drift(self):
+        coverage = load_script("check_api_coverage")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case = {
+                "id": "thing_create",
+                "title": "创建事物成功",
+                "endpoint_id": "THING_CREATE",
+                "bru": "01-创建事物成功.bru",
+                "request": {"body_type": "application/json", "body": {"name": "alice"}},
+                "expected": {"http_status": 200},
+                "assertions": [{"path": "$.data.name", "equals": "alice"}],
+            }
+            (root / case["bru"]).write_text(
+                "meta {\n  name: thing_create\n  type: http\n}\npost {\n  url: {{BASE_URL}}/things\n  body: json\n}\nbody:json {\n{\"name\":\"bob\"}\n}\nassert {\n  res.status: eq 200\n  res.body.data.name: eq \"alice\"\n}\n",
+                encoding="utf-8",
+            )
+            endpoint = {"id": "THING_CREATE", "method": "POST", "path": "/things"}
+            _, _, _, errors = coverage.case_files([case], root, {"THING_CREATE": endpoint})
+            self.assertTrue(any("body content" in error for error in errors))
+
+    def test_materializer_renders_combined_assertions_array_items_and_capture(self):
+        materializer = load_script("materialize_missing_bru")
+        rendered = materializer.render_case(
+            {
+                "id": "THING_LIST",
+                "assertions": [{
+                    "path": "$.data",
+                    "type": "array",
+                    "length": 2,
+                    "items": {"type": "string"},
+                    "capture_as": "things",
+                }],
+            },
+            {"method": "GET", "path": "/things"},
+            sequence=2,
+        )
+        self.assertIn("seq: 2", rendered)
+        self.assertIn("res.body.data: isArray", rendered)
+        self.assertIn("res.body.data: length 2", rendered)
+        self.assertIn('bru.setVar("things", res.body.data)', rendered)
+        self.assertIn("res.body.data.forEach", rendered)
+
+    def test_coverage_requires_every_declared_assertion_constraint(self):
+        coverage = load_script("check_api_coverage")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case = {
+                "id": "thing_list",
+                "title": "查询事物成功",
+                "bru": "01-查询事物成功.bru",
+                "expected": {"http_status": 200},
+                "assertions": [{"path": "$.data", "type": "array", "length": 2}],
+            }
+            (root / case["bru"]).write_text(
+                "meta {\n  name: thing_list\n  type: http\n}\nget {\n  url: {{BASE_URL}}/things\n}\nassert {\n  res.status: eq 200\n  res.body.data: isArray\n}\n",
+                encoding="utf-8",
+            )
+            _, _, _, errors = coverage.case_files([case], root)
+            self.assertTrue(any("missing length" in error for error in errors))
+
+    def test_version_lock_can_initialize_a_draft_baseline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            contracts = root / "contracts"
+            repo.mkdir()
+            contracts.mkdir()
+            (repo / "main.go").write_text("package main\n", encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/check_version_compatibility.py"), str(repo), str(contracts), "--init", "--json"],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            lock = load_script("manifest_io").load_data(contracts / "version-lock.yaml")
+            self.assertEqual(lock["status"], "draft")
+            self.assertEqual(lock["business"]["baseline_status"], "draft")
+
+    def test_module_materialization_does_not_touch_other_modules_or_index(self):
+        materializer = load_script("materialize_missing_bru")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            contracts = root / "contracts"
+            for name, title in (("模块一", "查询模块一成功"), ("模块二", "查询模块二成功")):
+                module = contracts / "modules" / name
+                module.mkdir(parents=True)
+                (module / "endpoints.yaml").write_text(json.dumps({"module": name, "endpoints": [{
+                    "id": name, "method": "GET", "path": f"/{name}",
+                }]}), encoding="utf-8")
+                (module / "cases.yaml").write_text(json.dumps({"cases": [{
+                    "id": f"{name}_OK", "title": title, "endpoint_id": name,
+                    "expected": {"http_status": 200}, "assertions": [{"path": "$.data", "equals": {}}],
+                }]}), encoding="utf-8")
+            index = contracts / "index.yaml"
+            index.write_text(json.dumps({"generated_cases": 0, "modules": []}), encoding="utf-8")
+            config, _ = execution_fixture(root)
+            before = index.read_text(encoding="utf-8")
+            materializer.materialize(
+                contracts,
+                root / "bruno",
+                execution_config_path=config,
+                module_filter="模块一",
+            )
+            self.assertTrue((root / "bruno" / "模块一" / "01-查询模块一成功.bru").is_file())
+            self.assertFalse((root / "bruno" / "模块二").exists())
+            self.assertEqual(index.read_text(encoding="utf-8"), before)
+
+    def test_full_and_module_scoped_materialization_are_identical(self):
+        materializer = load_script("materialize_missing_bru")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            contracts = root / "contracts"
+            modules = (("module-one", "模块一"), ("module-two", "模块二"))
+            for module_id, tag in modules:
+                module = contracts / "modules" / tag
+                module.mkdir(parents=True)
+                endpoint_id = f"{module_id}-list"
+                (module / "endpoints.yaml").write_text(json.dumps({
+                    "module": module_id,
+                    "swagger_tag": tag,
+                    "endpoints": [{"id": endpoint_id, "method": "GET", "path": f"/{module_id}"}],
+                }), encoding="utf-8")
+                (module / "cases.yaml").write_text(json.dumps({"cases": [{
+                    "id": f"{module_id}_success",
+                    "title": f"查询{tag}成功",
+                    "endpoint_id": endpoint_id,
+                    "expected": {"http_status": 200},
+                    "assertions": [{"path": "$.data", "equals": []}],
+                }]}), encoding="utf-8")
+            config, _ = execution_fixture(root)
+            full = root / "full"
+            scoped = root / "scoped"
+            materializer.materialize(contracts, full, execution_config_path=config)
+            for module_id, _ in modules:
+                materializer.materialize(
+                    contracts,
+                    scoped,
+                    execution_config_path=config,
+                    module_filter=module_id,
+                )
+            full_files = {path.relative_to(full): path.read_bytes() for path in full.rglob("*.bru")}
+            scoped_files = {path.relative_to(scoped): path.read_bytes() for path in scoped.rglob("*.bru")}
+            self.assertEqual(scoped_files, full_files)
+
+    def test_openapi_identity_ignores_deployment_metadata(self):
+        fetcher = load_script("fetch_local_openapi")
+        first = {"openapi": "3.0.0", "servers": [{"url": "http://one"}], "paths": {"/x": {}}, "provenance": {"pid": 1}}
+        second = {"openapi": "3.0.0", "servers": [{"url": "http://two"}], "paths": {"/x": {}}, "provenance": {"pid": 2}}
+        self.assertEqual(fetcher.contract_identity(first), fetcher.contract_identity(second))
+        second["paths"]["/y"] = {}
+        self.assertNotEqual(fetcher.contract_identity(first), fetcher.contract_identity(second))
 
     def test_case_documentation_validator_rejects_missing_swimlane(self):
         coverage = load_script("check_api_coverage")
@@ -443,90 +1075,61 @@ class RegressionTests(unittest.TestCase):
             errors = coverage.validate_module_documentation(path, [{"id": "USER_CREATE_OK"}])
             self.assertTrue(any("sequenceDiagram" in error for error in errors))
 
-    def test_seres_sign_alias_and_signature_headers_are_configurable(self):
-        scripts_path = str(ROOT / "scripts")
-        sys.path.insert(0, scripts_path)
-        try:
-            materializer = load_script("materialize_missing_bru")
-        finally:
-            sys.path.remove(scripts_path)
-        config = {
-            "mode": "seres.sign",
-            "seres.sign": True,
-            "base_url_env": "SERVICE_URL",
-            "modes": {
-                "seres.sign": {
-                    "enabled": True,
-                    "algorithm": "SHA256",
-                    "signature": {
-                        "parameters": {
-                            "url": "request.path",
-                            "body": "request.body",
-                            "query": "request.query",
-                            "timestamp": "ts",
-                            "secret_key_env": "SIGN_SECRET",
-                            "access_key_env": "SIGN_ACCESS",
-                        },
-                    },
-                    "headers": {"sign": "X-Sign", "timestamp": "X-Time", "accesskey": "X-Access"},
-                }
+    def test_seres_sign_algorithm_and_header_names_are_fixed(self):
+        execution_config = load_script("execution_config")
+        config = execution_config.validate_execution_config({
+            "active_environment": "local",
+            "auth": {
+                "mode": "seres-sign",
+                "secret_key_env": "SIGN_SECRET",
+                "access_key_env": "SIGN_ACCESS",
             },
-        }
-        self.assertEqual(materializer.auth_mode(config), "seres-sign")
-        script = materializer.auth_script(config)
-        self.assertIn('bru.getEnvVar("SIGN_SECRET")', script)
-        self.assertIn('params["ts"]', script)
-        self.assertIn('req.setHeader("X-Sign"', script)
-        self.assertIn('req.setHeader("X-Time"', script)
-        self.assertIn('req.setHeader("X-Access"', script)
-        self.assertIn("&${secretKey}", script)
+        })
+        script = execution_config.COLLECTION_TEMPLATE
+        self.assertEqual(
+            execution_config.required_environment_names(config),
+            ["BASE_URL", "SIGN_ACCESS", "SIGN_SECRET"],
+        )
+        self.assertIn('CryptoJS.SHA256(signText)', script)
+        self.assertIn('setCommonHeader("sign"', script)
+        self.assertIn('setCommonHeader("timestamp"', script)
+        self.assertIn('setCommonHeader("accesskey"', script)
+        with self.assertRaises(ValueError):
+            execution_config.validate_execution_config({
+                "active_environment": "local",
+                "auth": {
+                    "mode": "seres-sign",
+                    "secret_key_env": "SIGN_SECRET",
+                    "access_key_env": "SIGN_ACCESS",
+                    "algorithm": "SHA512",
+                },
+            })
 
     def test_custom_header_objects_and_preflight_variables_are_supported(self):
-        scripts_path = str(ROOT / "scripts")
-        sys.path.insert(0, scripts_path)
-        try:
-            materializer = load_script("materialize_missing_bru")
-            preflight = load_script("runtime_preflight")
-            coverage = load_script("check_api_coverage")
-        finally:
-            sys.path.remove(scripts_path)
-        config = {
-            "mode": "custom",
-            "modes": {
-                "custom": {
-                    "enabled": True,
-                    "headers": {"X-Service-Token": {"env": "SERVICE_TOKEN", "prefix": "Bearer"}},
-                }
+        execution_config = load_script("execution_config")
+        config = execution_config.validate_execution_config({
+            "active_environment": "local",
+            "auth": {"mode": "bearer", "token_env": "SERVICE_TOKEN"},
+            "custom_headers": {
+                "operatorInfo": {"env": "OPERATOR_INFO", "paths": ["/v*/admin/**"]},
+                "X-Gray-Traffic": {"value": "true", "paths": ["/v*/internal/**"]},
             },
-        }
-        self.assertIn("Bearer ${token_0}", materializer.auth_script(config))
-        with self.assertRaises(ValueError):
-            preflight.configured_auth_envs(Path("/dev/null"))
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "request-auth.yaml"
-            path.write_text(json.dumps(config), encoding="utf-8")
-            self.assertEqual(preflight.configured_auth_envs(path), ["BASE_URL", "SERVICE_TOKEN"])
-            sign_path = Path(directory) / "seres-auth.yaml"
-            sign_path.write_text(json.dumps({
-                "mode": "seres.sign",
-                "modes": {"seres.sign": {
-                    "enabled": True,
-                    "signature": {"parameters": {"secret_key_env": "SIGN_SECRET", "access_key_env": "SIGN_ACCESS"}},
-                    "extra_headers": {"X-Tenant": {"env": "TENANT_ID"}},
-                }},
-            }), encoding="utf-8")
-            self.assertEqual(
-                preflight.configured_auth_envs(sign_path),
-                ["BASE_URL", "SIGN_SECRET", "SIGN_ACCESS", "TENANT_ID"],
-            )
-        markers = coverage.auth_markers({
-            "mode": "seres.sign",
-            "modes": {"seres.sign": {"enabled": True, "signature": {"parameters": {"timestamp": "ts"}}, "headers": {"sign": "X-Sign", "timestamp": "X-Time", "accesskey": "X-Access"}}},
         })
-        self.assertIn("ts", markers)
-        self.assertIn("X-Sign", markers)
+        self.assertEqual(
+            execution_config.required_environment_names(config),
+            ["BASE_URL", "SERVICE_TOKEN"],
+        )
+        payload = json.loads(execution_config.runtime_payload(config))
+        self.assertEqual(payload["custom_headers"]["operatorInfo"]["env"], "OPERATOR_INFO")
+        self.assertEqual(payload["custom_headers"]["X-Gray-Traffic"]["value"], "true")
+        script = execution_config.COLLECTION_TEMPLATE
+        self.assertIn("globMatches(pattern, requestPath)", script)
+        self.assertIn("bru.getEnvVar(settings.env)", script)
+        self.assertIn("if (value === undefined || value === null || value === \"\") return", script)
+        self.assertIn("const current = req.getHeader(name)", script)
+        self.assertIn("if (current === undefined || current === null)", script)
 
-    def test_path_parameters_and_existing_pre_request_script_are_preserved(self):
+    def test_path_parameters_and_common_header_exclusions_are_preserved(self):
         scripts_path = str(ROOT / "scripts")
         sys.path.insert(0, scripts_path)
         try:
@@ -537,27 +1140,25 @@ class RegressionTests(unittest.TestCase):
             materializer.request_url({"path": "/users/{id}"}, {}, "SERVICE_URL"),
             "{{SERVICE_URL}}/users/{{id}}",
         )
+        self.assertEqual(
+            materializer.request_url(
+                {"path": "/users"},
+                {"query": {"status": "ON", "page": 0, "tenant": "{{TENANT_ID}}"}},
+                "SERVICE_URL",
+            ),
+            "{{SERVICE_URL}}/users?status=ON&page=0&tenant={{TENANT_ID}}",
+        )
         original = "script:pre-request {\n  console.log('业务前置');\n}\nassert {\n}\n"
-        merged = materializer.ensure_auth_script(original, materializer.DEFAULT_AUTH_CONFIG)
+        excluded_case = {
+            "id": "USER_WITHOUT_OPERATOR",
+            "request": {"omit_common_headers": ["operatorInfo", "X-Trace"]},
+        }
+        merged = materializer.ensure_request_script(original, excluded_case)
         self.assertEqual(merged.count("script:pre-request"), 1)
         self.assertIn("console.log('业务前置')", merged)
-        self.assertIn(materializer.AUTH_MARKER, merged)
-        self.assertIn('bru.getEnvVar("SECRET_KEY")', merged)
-        bearer = materializer.auth_script({
-            "mode": "bearer",
-            "modes": {"bearer": {"enabled": True, "token_env": "OLD_TOKEN"}},
-        })
-        switched = materializer.ensure_auth_script(bearer, materializer.DEFAULT_AUTH_CONFIG)
-        self.assertNotIn("OLD_TOKEN", switched)
-        self.assertIn(f"{materializer.AUTH_MARKER} seres-sign", switched)
-        self.assertEqual(switched.count(materializer.AUTH_MARKER), 1)
-        changed_config = json.loads(json.dumps(materializer.DEFAULT_AUTH_CONFIG))
-        changed_config["modes"]["seres-sign"]["signature"]["parameters"]["secret_key_env"] = "ROTATED_SECRET"
-        rotated = materializer.ensure_auth_script(merged, changed_config)
-        self.assertIn('bru.getEnvVar("ROTATED_SECRET")', rotated)
-        self.assertNotIn('bru.getEnvVar("SECRET_KEY")', rotated)
-        disabled = materializer.ensure_auth_script(rotated, {"mode": "none"})
-        self.assertNotIn(materializer.AUTH_MARKER, disabled)
+        self.assertIn('req.deleteHeaders(["operatorInfo", "X-Trace"])', merged)
+        disabled = materializer.ensure_request_script(merged, {"id": "USER_NORMAL"})
+        self.assertNotIn(materializer.OMIT_MARKER, disabled)
         self.assertIn("console.log('业务前置')", disabled)
 
     def test_materializer_supports_non_json_bodies_and_response_targets(self):
@@ -577,7 +1178,9 @@ class RegressionTests(unittest.TestCase):
                 {"target": "text", "contains": "accepted"},
             ],
         }
-        rendered = materializer.render_case(case, {"id": "UPLOAD", "method": "POST", "path": "/upload"}, {"mode": "none", "base_url_env": "SERVICE_URL"})
+        rendered = materializer.render_case(
+            case, {"id": "UPLOAD", "method": "POST", "path": "/upload"}
+        )
         self.assertIn("body: text", rendered)
         self.assertIn("body:text {", rendered)
         self.assertIn("hello world", rendered)
@@ -587,10 +1190,20 @@ class RegressionTests(unittest.TestCase):
         inferred = materializer.render_case(
             {"id": "XML_CASE", "request": {"body": "<x/>"}, "assertions": []},
             {"id": "XML", "method": "POST", "path": "/xml", "request_body": {"content": {"application/xml": {}}}},
-            {"mode": "none"},
         )
         self.assertIn("body: xml", inferred)
         self.assertIn("body:xml {", inferred)
+        empty_multipart = materializer.render_case(
+            {"id": "EMPTY_UPLOAD", "request": {"body": {}}, "assertions": []},
+            {
+                "id": "UPLOAD",
+                "method": "POST",
+                "path": "/upload",
+                "request_body": {"content": {"multipart/form-data": {}}},
+            },
+        )
+        self.assertIn("body: none", empty_multipart)
+        self.assertNotIn("body:multipart-form", empty_multipart)
 
     def test_materializer_preserves_raw_json_body(self):
         materializer = load_script("materialize_missing_bru")
@@ -602,9 +1215,8 @@ class RegressionTests(unittest.TestCase):
                 "assertions": [{"path": "$.data", "exists": True}],
             },
             {"id": "THING", "method": "POST", "path": "/things"},
-            {"mode": "none"},
         )
-        self.assertIn('body:json {\n{"name":"alice"}\n}', rendered)
+        self.assertIn('body:json {\n  {"name":"alice"}\n}', rendered)
         self.assertNotIn('body:json {\n"{\\"name\\":', rendered)
 
     def test_materializer_refreshes_generated_index_counts(self):
@@ -627,20 +1239,44 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(index["modules"][0]["case_count"], 1)
             self.assertEqual(index["modules"][0]["endpoint_count"], 1)
 
-    def test_runtime_preflight_rejects_missing_and_unknown_auth_config(self):
+    def test_sync_index_cli_does_not_require_bruno_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            contracts = Path(directory)
+            (contracts / "modules").mkdir()
+            (contracts / "index.yaml").write_text('{"modules": []}', encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts/materialize_missing_bru.py"),
+                    str(contracts),
+                    "--sync-index",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_runtime_preflight_rejects_missing_and_unknown_execution_config(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             unknown = root / "unknown.yaml"
-            unknown.write_text("mode: unknown\n", encoding="utf-8")
-            environment = dict(os.environ, BASE_URL="http://127.0.0.1:18080")
+            unknown.write_text(
+                "active_environment: local\nauth:\n  mode: unknown\n",
+                encoding="utf-8",
+            )
             for config in (unknown, root / "missing.yaml"):
                 result = subprocess.run(
-                    [sys.executable, str(ROOT / "scripts/runtime_preflight.py"), "--auth-config", str(config)],
+                    [
+                        sys.executable,
+                        str(ROOT / "scripts/runtime_preflight.py"),
+                        "--execution-config", str(config),
+                    ],
                     check=False,
                     capture_output=True,
                     text=True,
                     encoding="utf-8",
-                    env=environment,
                 )
                 self.assertEqual(result.returncode, 2)
                 self.assertIn('"status": "blocked"', result.stdout)
@@ -688,16 +1324,22 @@ class RegressionTests(unittest.TestCase):
         errors = coverage.flow_execution_errors([flow], {"executed": ["THING_OK"], "passed": ["THING_OK"]})
         self.assertIn("flow THING_FLOW has no execution evidence", errors)
 
-    def test_oauth_and_cookie_auth_are_environment_backed(self):
-        materializer = load_script("materialize_missing_bru")
-        preflight = load_script("runtime_preflight")
-        oauth = {"mode": "oauth2", "modes": {"oauth2": {"enabled": True, "token_env": "OAUTH_TOKEN", "prefix": "Token"}}}
-        self.assertIn('bru.getEnvVar("OAUTH_TOKEN")', materializer.auth_script(oauth))
-        self.assertIn('req.setHeader("Authorization", `${prefix} ${token}`)', materializer.auth_script(oauth))
-        with tempfile.TemporaryDirectory() as directory:
-            config = Path(directory) / "auth.json"
-            config.write_text(json.dumps({"mode": "cookie", "modes": {"cookie": {"enabled": True, "cookie_env": "SESSION"}}}), encoding="utf-8")
-            self.assertEqual(preflight.configured_auth_envs(config), ["BASE_URL", "SESSION"])
+    def test_bearer_api_key_and_cookie_auth_are_environment_backed(self):
+        execution_config = load_script("execution_config")
+        modes = (
+            ({"mode": "bearer", "token_env": "ACCESS_TOKEN"}, "ACCESS_TOKEN"),
+            ({"mode": "api-key", "key_env": "API_KEY"}, "API_KEY"),
+            ({"mode": "cookie", "cookie_env": "SESSION"}, "SESSION"),
+        )
+        for auth, expected in modes:
+            config = execution_config.validate_execution_config({
+                "active_environment": "local",
+                "auth": auth,
+            })
+            self.assertEqual(
+                execution_config.required_environment_names(config),
+                ["BASE_URL", expected],
+            )
 
     def test_cross_language_source_scanner_is_not_java_only(self):
         scanner = load_script("analyze_source_logic")
@@ -709,6 +1351,15 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(result["source"]["languages"], ["python"])
         self.assertTrue(any(item["kind"] == "normal_entrypoint" for item in result["candidates"]))
         self.assertTrue(any(item["kind"] == "observable_branch" for item in result["candidates"]))
+
+    def test_source_scanner_deduplicates_identical_candidates_in_one_file(self):
+        scanner = load_script("analyze_source_logic")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "routes.py").write_text("if invalid: raise ValueError()\nif invalid: raise ValueError()\n", encoding="utf-8")
+            result = scanner.scan([root], ["routes.py"])
+        branches = [item for item in result["candidates"] if item["kind"] == "observable_branch"]
+        self.assertEqual(len(branches), 1)
 
     def test_source_scanner_and_version_gate_cover_additional_http_languages(self):
         scanner = load_script("analyze_source_logic")
@@ -728,19 +1379,23 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(checker.classify(["src/routes.ts"], {}), "api-impact")
         self.assertEqual(checker.classify(["Program.cs"], {}), "api-impact")
 
-    def test_preflight_uses_configured_base_url_environment(self):
+    def test_preflight_uses_base_url_from_active_bruno_environment(self):
         with tempfile.TemporaryDirectory() as directory:
-            config = Path(directory) / "request-auth.yaml"
-            config.write_text(json.dumps({"mode": "none", "base_url_env": "SERVICE_URL"}), encoding="utf-8")
+            root = Path(directory)
+            config, env_file = execution_fixture(
+                root,
+                environment={"BASE_URL": "http://127.0.0.1:18080/api"},
+            )
             environment = dict(os.environ)
             environment.pop("BASE_URL", None)
-            environment["SERVICE_URL"] = "http://127.0.0.1:18080/api"
             result = subprocess.run(
                 [
                     sys.executable,
                     str(ROOT / "scripts/runtime_preflight.py"),
-                    "--auth-config",
+                    "--execution-config",
                     str(config),
+                    "--env-file",
+                    str(env_file),
                 ],
                 check=False,
                 capture_output=True,
@@ -752,20 +1407,19 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(report["base_url"], "http://127.0.0.1:18080/api")
             self.assertFalse(any("base URL is missing" in error for error in report["errors"]))
 
-    def test_preflight_cli_base_url_overrides_base_url_environment_requirement(self):
+    def test_preflight_does_not_read_base_url_from_process_environment(self):
         with tempfile.TemporaryDirectory() as directory:
-            config = Path(directory) / "request-auth.yaml"
-            config.write_text(json.dumps({"mode": "none"}), encoding="utf-8")
-            environment = dict(os.environ)
-            environment.pop("BASE_URL", None)
+            root = Path(directory)
+            config, env_file = execution_fixture(root, environment={"BASE_URL": ""})
+            environment = dict(os.environ, BASE_URL="http://127.0.0.1:18080")
             result = subprocess.run(
                 [
                     sys.executable,
                     str(ROOT / "scripts/runtime_preflight.py"),
-                    "--base-url",
-                    "http://127.0.0.1:18080",
-                    "--auth-config",
+                    "--execution-config",
                     str(config),
+                    "--env-file",
+                    str(env_file),
                 ],
                 check=False,
                 capture_output=True,
@@ -774,25 +1428,63 @@ class RegressionTests(unittest.TestCase):
                 env=environment,
             )
             report = json.loads(result.stdout)
-            self.assertNotIn("required environment variable is missing: BASE_URL", report["errors"])
+            self.assertTrue(any("base URL is missing" in error for error in report["errors"]))
 
-    def test_preflight_route_probes_are_optional_by_default(self):
+    def test_preflight_requires_a_representative_route_for_execution_readiness(self):
         with tempfile.TemporaryDirectory() as directory:
-            config = Path(directory) / "request-auth.yaml"
-            config.write_text(json.dumps({"mode": "none"}), encoding="utf-8")
-            environment = dict(os.environ)
-            environment["BASE_URL"] = "http://127.0.0.1:18080"
+            root = Path(directory)
+            config, env_file = execution_fixture(root)
+            openapi, static_results = static_preflight_inputs(root)
             result = subprocess.run(
-                [sys.executable, str(ROOT / "scripts/runtime_preflight.py"), "--auth-config", str(config)],
+                [
+                    sys.executable,
+                    str(ROOT / "scripts/runtime_preflight.py"),
+                    "--execution-config",
+                    str(config),
+                    "--env-file",
+                    str(env_file),
+                    "--bruno-cli",
+                    "node",
+                    "--openapi",
+                    str(openapi),
+                    "--static-results",
+                    str(static_results),
+                ],
                 check=False,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
-                env=environment,
             )
-            self.assertEqual(result.returncode, 0)
-            self.assertNotIn("public route is not configured", result.stdout)
-            self.assertNotIn("admin auth baseline is not configured", result.stdout)
+            report = json.loads(result.stdout)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertTrue(report["static_ready"])
+            self.assertTrue(report["context_ready"])
+            self.assertFalse(report["execution_ready"])
+            self.assertIn("representative route is not configured", result.stdout)
+
+    def test_preflight_does_not_claim_static_ready_without_static_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, env_file = execution_fixture(root)
+            openapi = root / "openapi.json"
+            openapi.write_text('{"openapi":"3.0.0","paths":{}}', encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts/runtime_preflight.py"),
+                    "--execution-config", str(config),
+                    "--env-file", str(env_file),
+                    "--openapi", str(openapi),
+                    "--bruno-cli", "node",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+            report = json.loads(result.stdout)
+            self.assertFalse(report["static_ready"])
+            self.assertIn("static coverage results are missing", result.stdout)
 
     def test_strict_scenarios_require_a_dedicated_success_case(self):
         coverage = load_script("check_api_coverage")
@@ -820,7 +1512,7 @@ class RegressionTests(unittest.TestCase):
                 "scenario": "validation",
                 "expected": {"http_status": 400},
                 "assertions": [{"path": "$.message", "exists": True}],
-                "bru": "validation.bru",
+                "bru": "01-参数校验失败.bru",
             }
             (module / "endpoints.yaml").write_text(json.dumps({"endpoints": [endpoint]}), encoding="utf-8")
             (module / "cases.yaml").write_text(json.dumps({"cases": [case]}), encoding="utf-8")
@@ -829,7 +1521,7 @@ class RegressionTests(unittest.TestCase):
                 parser.render_module_document({"id": "things", "name": "事物查询"}, [endpoint], [case]),
                 encoding="utf-8",
             )
-            (bru / "validation.bru").write_text(
+            (bru / "01-参数校验失败.bru").write_text(
                 "meta { name: THING_LIST_VALIDATION }\nget { url: {{BASE_URL}}/things }\n"
                 "assert {\n  res.status: eq 400\n  res.body.message: exists\n}\n",
                 encoding="utf-8",
@@ -855,10 +1547,11 @@ class RegressionTests(unittest.TestCase):
                 "module": "things",
                 "cases": [{
                     "id": "THING_LIST_OK",
+                    "title": "查询事物列表成功",
                     "endpoint_id": "THING_LIST",
                     "expected": {"http_status": 200, "business_code": 0},
-                    "assertions": [{"path": "$.data", "exists": True}],
-                    "bru": "list.bru",
+                    "assertions": [{"path": "$.data", "equals": {}}],
+                    "bru": "01-查询事物列表成功.bru",
                 }],
             }
             (module / "endpoints.yaml").write_text(json.dumps(endpoint), encoding="utf-8")
@@ -881,8 +1574,8 @@ class RegressionTests(unittest.TestCase):
                 "<!-- AUTO_CASES_END -->\n",
                 encoding="utf-8",
             )
-            (bru / "list.bru").write_text(
-                "meta { name: THING_LIST_OK }\nget { url: http://localhost/things }\nassert {\n  res.status: eq 200\n  res.body.code: eq 0\n  res.body.data: exists\n}\n",
+            (bru / "01-查询事物列表成功.bru").write_text(
+                "meta {\n  name: THING_LIST_OK\n  type: http\n}\nget {\n  url: {{BASE_URL}}/things\n}\nassert {\n  res.status: eq 200\n  res.body.code: eq 0\n  res.body.data: eq {}\n}\n",
                 encoding="utf-8",
             )
             result = subprocess.run(
@@ -892,7 +1585,7 @@ class RegressionTests(unittest.TestCase):
                 text=True,
                 encoding="utf-8",
             )
-            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.returncode, 0, result.stdout)
             report = json.loads(result.stdout)
             self.assertTrue(report["static_ok"])
             self.assertFalse(report["completion_ok"])

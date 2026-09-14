@@ -9,11 +9,15 @@ that have no source access; adapters can add deeper framework-specific logic.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any
+
+sys.dont_write_bytecode = True
 
 
 LANGUAGE_BY_SUFFIX = {
@@ -56,12 +60,15 @@ def candidate_id(kind: str, path: Path, line_no: int, evidence: str) -> str:
     return f"{kind.upper()}_{hashlib.sha1(key.encode('utf-8')).hexdigest()[:12]}"
 
 
-def scan(roots: list[Path]) -> dict[str, Any]:
+def scan(roots: list[Path], include_patterns: list[str] | None = None) -> dict[str, Any]:
     candidates: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
     languages: set[str] = set()
     for root in roots:
         for path in sorted(root.rglob("*")):
             if not path.is_file() or path.suffix.lower() not in LANGUAGE_BY_SUFFIX:
+                continue
+            if include_patterns and not any(fnmatch.fnmatchcase(path.as_posix(), pattern) or fnmatch.fnmatchcase(path.name, pattern) for pattern in include_patterns):
                 continue
             if any(part in {".git", "target", "build", "node_modules", "vendor", ".venv", "venv"} for part in path.parts):
                 continue
@@ -79,6 +86,10 @@ def scan(roots: list[Path]) -> dict[str, Any]:
                     kind = "observable_branch"
                 else:
                     continue
+                key = (kind, path.resolve().as_posix(), evidence)
+                if key in seen:
+                    continue
+                seen.add(key)
                 candidates.append(
                     {
                         "id": candidate_id(kind, path, line_no, evidence),
@@ -101,11 +112,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source_roots", type=Path, nargs="+")
     parser.add_argument("-o", "--output", type=Path, required=True)
+    parser.add_argument("--include", action="append", help="source-file glob owned by the selected module or endpoint; may be repeated")
     args = parser.parse_args()
     missing = [str(root) for root in args.source_roots if not root.is_dir()]
     if missing:
         parser.error(f"source root(s) do not exist: {', '.join(missing)}")
-    result = scan(args.source_roots)
+    result = scan(args.source_roots, args.include)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"wrote {len(result['candidates'])} cross-language logic candidates to {args.output}")

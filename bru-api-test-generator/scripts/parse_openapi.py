@@ -13,6 +13,9 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 
+sys.dont_write_bytecode = True
+
+from execution_config import initialize_execution_layout
 
 HTTP_METHODS = {
     "get",
@@ -24,70 +27,6 @@ HTTP_METHODS = {
     "options",
     "trace",
 }
-
-
-DEFAULT_REQUEST_AUTH_TEMPLATE = """# Bruno 请求认证配置模板。
-# 以 _env 结尾的值是 Bruno 环境变量名，不能填写真实密钥。
-# 只能启用一种模式；`seres.sign` 是 `seres-sign` 的兼容别名。
-version: 1
-mode: seres-sign
-seres-sign: true
-# seres.sign: true
-base_url_env: BASE_URL
-modes:
-  seres-sign:
-    enabled: true
-    algorithm: SHA256
-    secret_key_env: SECRET_KEY
-    access_key_env: ACCESS_KEY
-    signature:
-      parameters:
-        # request.path 仅签名路径；request.url 签名解析后的完整 URL。
-        url: request.path
-        body: request.body
-        query: request.query
-        timestamp: timestamp
-        secret_key_env: SECRET_KEY
-        access_key_env: ACCESS_KEY
-      append_secret: true
-    headers:
-      sign: sign
-      timestamp: timestamp
-      accesskey: accesskey
-    extra_headers:
-      # 自定义 Header 的值也从环境变量读取。
-      # X-Tenant-Id: TENANT_ID
-      # X-Service-Token:
-      #   env: SERVICE_TOKEN
-      #   prefix: Bearer
-  bearer:
-    enabled: false
-    token_env: ACCESS_TOKEN
-    header: Authorization
-    prefix: Bearer
-  oauth2:
-    enabled: false
-    token_env: ACCESS_TOKEN
-    header: Authorization
-    prefix: Bearer
-    # token_url 由项目 bootstrap 负责，Bruno 只读取已刷新令牌。
-    # token_url: https://example.invalid/oauth/token
-  cookie:
-    enabled: false
-    cookie_env: SESSION_COOKIE
-    header: Cookie
-  api-key:
-    enabled: false
-    token_env: API_KEY
-    header: X-API-Key
-  custom:
-    enabled: false
-    headers:
-      # X-Service-Token: SERVICE_TOKEN
-      # X-Tenant-Token:
-      #   env: TENANT_TOKEN
-      #   prefix: Bearer
-"""
 
 
 CASE_DOCS_START = "<!-- AUTO_CASES_START -->"
@@ -339,6 +278,13 @@ def validate_module_map(manifest: dict[str, Any], module_map: dict[str, Any]) ->
             if "name" in module and module.get("name") != tag:
                 raise ValueError(f"module {module_id} name must preserve the original Swagger tag text {tag!r}")
         directory = module_directory(module, module_id)
+        if isinstance(tags, list) and len(tags) == 1:
+            expected_directory = display_directory(tags[0].strip(), module_id)
+            if directory != expected_directory:
+                raise ValueError(
+                    f"module {module_id} directory must come from Swagger tag {tags[0].strip()!r}: "
+                    f"expected {expected_directory!r}"
+                )
         if directory in directories:
             raise ValueError(f"module map repeats directory {directory}")
         directories.add(directory)
@@ -354,6 +300,7 @@ def validate_module_map(manifest: dict[str, Any], module_map: dict[str, Any]) ->
 def partition_manifest(manifest: dict[str, Any], module_map: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     modules = module_map.get("modules") if isinstance(module_map, dict) else None
     tag_to_module = validate_module_map(manifest, module_map)
+    tag_descriptions = manifest.get("tag_descriptions", {})
     grouped = {str(module.get("id")): [] for module in modules if isinstance(module, dict) and module.get("id")}
 
     for endpoint in manifest["endpoints"]:
@@ -386,6 +333,8 @@ def partition_manifest(manifest: dict[str, Any], module_map: dict[str, Any]) -> 
             raise ValueError(f"operation {endpoint['method']} {endpoint['path']} tag {primary!r} is not assigned")
         endpoint["primary_tag"] = primary
         endpoint["swagger_tag"] = primary
+        if isinstance(tag_descriptions, dict) and str(tag_descriptions.get(primary, "")).strip():
+            endpoint["tag_description"] = str(tag_descriptions[primary]).strip()
         endpoint["module"] = module_id
         grouped[module_id].append(endpoint)
     return grouped
@@ -481,14 +430,18 @@ def generate_module_map(manifest: dict[str, Any]) -> dict[str, Any]:
         if module_id in used:
             module_id = f"{base}-{hashlib.sha256(tag.encode('utf-8')).hexdigest()[:8]}"
         used.add(module_id)
+        descriptions = manifest.get("tag_descriptions", {})
+        description = str(descriptions.get(tag, "")).strip() if isinstance(descriptions, dict) else ""
         directory = display_directory(tag, module_id)
         if directory in used_directories:
-            directory = f"{directory}-{hashlib.sha256(tag.encode('utf-8')).hexdigest()[:8]}"
+            raise ValueError(
+                f"OpenAPI Tags produce the same safe module directory {directory!r}; "
+                "rename the conflicting Tag names"
+            )
         used_directories.add(directory)
         item = {"id": module_id, "name": tag, "directory": directory, "swagger_tags": [tag]}
-        descriptions = manifest.get("tag_descriptions", {})
-        if isinstance(descriptions, dict) and descriptions.get(tag):
-            item["business_scope"] = str(descriptions[tag]).strip()
+        if description:
+            item["business_scope"] = description
         modules.append(item)
     if any(not endpoint.get("tags") for endpoint in manifest["endpoints"]):
         modules.append(
@@ -559,7 +512,36 @@ def case_description(case: dict[str, Any], endpoint: dict[str, Any], title: str)
 
 def render_case_documentation(cases: list[dict[str, Any]], endpoints: list[dict[str, Any]]) -> str:
     endpoint_by_id = {str(item.get("id")): item for item in endpoints if item.get("id")}
-    lines = ["## 自动化用例", "", CASE_DOCS_START]
+    lines = [
+        "## 自动化用例",
+        "",
+        "| 用例 ID | 场景 | 接口 | 预期状态 |",
+        "| --- | --- | --- | --- |",
+    ]
+    for case in cases:
+        endpoint = endpoint_by_id.get(str(case.get("endpoint_id")), {})
+        if case.get("id") and endpoint:
+            expected = case.get("expected") if isinstance(case.get("expected"), dict) else {}
+            lines.append(
+                f"| `{case['id']}` | {case_title(case, endpoint)} | "
+                f"`{markdown_text(endpoint.get('method', 'HTTP'))} {markdown_text(endpoint.get('path', '/'))}` | "
+                f"{markdown_text(expected.get('http_status', '待确认'))} |"
+            )
+    lines.extend([
+        "",
+        "```mermaid",
+        "sequenceDiagram",
+        "    participant C as 自动化用例",
+        "    participant B as Bruno",
+        "    participant S as 业务服务",
+        "    C->>B: 准备请求",
+        "    B->>S: 调用模块接口",
+        "    S-->>B: 返回响应",
+        "    B-->>C: 校验契约与业务结果",
+        "```",
+        "",
+        CASE_DOCS_START,
+    ])
     if not cases:
         lines.extend(["", "当前尚未登记自动化用例。"])
     for case in cases:
@@ -571,8 +553,6 @@ def render_case_documentation(cases: list[dict[str, Any]], endpoints: list[dict[
         description = case_description(case, endpoint, title)
         method = markdown_text(endpoint.get("method", "HTTP"))
         route = markdown_text(endpoint.get("path", "/"))
-        expected = case.get("expected") if isinstance(case.get("expected"), dict) else {}
-        status = markdown_text(expected.get("http_status", "预期状态"))
         lines.extend([
             "",
             f"<!-- CASE_START: {case_id} -->",
@@ -582,19 +562,22 @@ def render_case_documentation(cases: list[dict[str, Any]], endpoints: list[dict[
             f"- 接口：`{method} {route}`",
             "",
             f"简短描述：{description}",
-            "",
-            "```mermaid",
-            "sequenceDiagram",
-            "    participant C as 自动化用例",
-            "    participant B as Bruno",
-            "    participant S as 业务服务",
-            f"    C->>B: 准备“{title}”请求",
-            f"    B->>S: {method} {route}",
-            f"    S-->>B: 返回 HTTP {status}",
-            "    B-->>C: 校验状态码、业务结果和响应字段",
-            "```",
-            f"<!-- CASE_END: {case_id} -->",
         ])
+        if case.get("flow_required") is True or endpoint.get("flow_required") is True:
+            lines.extend([
+                "",
+                "```mermaid",
+                "sequenceDiagram",
+                "    participant C as 自动化用例",
+                "    participant B as Bruno",
+                "    participant S as 业务服务",
+                f"    C->>B: 准备“{title}”流程步骤",
+                f"    B->>S: {method} {route}",
+                "    S-->>B: 返回流程响应",
+                "    B-->>C: 捕获并校验流程变量",
+                "```",
+            ])
+        lines.append(f"<!-- CASE_END: {case_id} -->")
     lines.extend([CASE_DOCS_END, ""])
     return "\n".join(lines)
 
@@ -724,7 +707,139 @@ def render_contracts_readme(index: dict[str, Any], modules: dict[str, tuple[dict
     return "\n".join(lines).rstrip() + "\n"
 
 
-def write_partitioned(manifest: dict[str, Any], module_map_path: Path, output_dir: Path) -> None:
+def seed_contract_cases(endpoint: dict[str, Any]) -> list[dict[str, Any]]:
+    """Seed only scenarios mechanically implied by OpenAPI."""
+
+    endpoint_id = str(endpoint.get("id", "ENDPOINT"))
+    responses = endpoint.get("responses", {}) if isinstance(endpoint.get("responses"), dict) else {}
+    success_status = next((int(code) for code in responses if str(code).isdigit() and 200 <= int(code) < 300), None)
+    error_status = next((int(code) for code in responses if str(code) in {"400", "422"}), None)
+
+    def schema_value(schema: dict[str, Any], name: str = "value") -> Any:
+        if "example" in schema:
+            return copy.deepcopy(schema["example"])
+        if "default" in schema:
+            return copy.deepcopy(schema["default"])
+        enum = schema.get("enum")
+        if isinstance(enum, list) and enum:
+            return copy.deepcopy(enum[0])
+        kind = str(schema.get("type", "string")).lower()
+        if kind == "integer":
+            return 1
+        if kind == "number":
+            return 1.0
+        if kind == "boolean":
+            return True
+        if kind == "array":
+            return [schema_value(schema.get("items", {}) if isinstance(schema.get("items"), dict) else {}, name)]
+        if kind == "object" or isinstance(schema.get("properties"), dict):
+            properties = schema.get("properties", {})
+            required = schema.get("required", [])
+            names = required if isinstance(required, list) and required else list(properties)[:1]
+            return {
+                str(field): schema_value(properties.get(field, {}) if isinstance(properties.get(field), dict) else {}, str(field))
+                for field in names
+            }
+        if schema.get("format") == "binary":
+            return {"file": "{{UPLOAD_FILE}}"}
+        return f"review-{name}"
+
+    def set_parameter(request: dict[str, Any], parameter: dict[str, Any], value: Any) -> None:
+        location = str(parameter.get("in", "query"))
+        name = str(parameter.get("name", "parameter"))
+        if location == "query":
+            request.setdefault("query", {})[name] = value
+        elif location == "header":
+            request.setdefault("headers", {})[name] = value
+
+    parameters = [item for item in endpoint.get("parameters", []) if isinstance(item, dict)]
+    success_request: dict[str, Any] = {}
+    for parameter in parameters:
+        if parameter.get("required") is True or parameter.get("example") is not None:
+            schema = parameter.get("schema", {}) if isinstance(parameter.get("schema"), dict) else parameter
+            set_parameter(success_request, parameter, schema_value(schema, str(parameter.get("name", "parameter"))))
+
+    request_body = endpoint.get("request_body", {}) if isinstance(endpoint.get("request_body"), dict) else {}
+    content = request_body.get("content", {}) if isinstance(request_body.get("content"), dict) else {}
+    media_type = next(iter(content), None)
+    media = content.get(media_type, {}) if media_type else {}
+    body_schema = media.get("schema", {}) if isinstance(media, dict) and isinstance(media.get("schema"), dict) else {}
+    if not body_schema and isinstance(request_body.get("schema"), dict):
+        body_schema = request_body["schema"]
+    if body_schema:
+        success_request["body_type"] = media_type or "application/json"
+        success_request["body"] = schema_value(body_schema, "body")
+
+    def build(suffix: str, title: str, scenario: str, status: int, request: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": f"{endpoint_id}_{suffix}",
+            "title": title,
+            "endpoint_id": endpoint_id,
+            "scenario": scenario,
+            "review_required": True,
+            "risk": "read-only" if str(endpoint.get("method", "GET")).upper() in {"GET", "HEAD", "OPTIONS"} else "isolated-write",
+            "request": copy.deepcopy(request),
+            "expected": {"http_status": status},
+            "assertions": [{"path": "$", "exists": True}],
+        }
+
+    seeded = [build("SUCCESS", "请求成功", "success", success_status, success_request)] if success_status is not None else []
+    for parameter in parameters:
+        name = str(parameter.get("name", "参数"))
+        schema = parameter.get("schema", {}) if isinstance(parameter.get("schema"), dict) else {}
+        suffix = slugify_tag(name).replace("-", "_").upper()
+        if error_status is not None and parameter.get("required") is True and parameter.get("in") in {"query", "header"}:
+            request = copy.deepcopy(success_request)
+            request.get("query" if parameter.get("in") == "query" else "headers", {}).pop(name, None)
+            seeded.append(build(f"MISSING_{suffix}", f"缺少必填参数{name}", "validation", error_status, request))
+        if error_status is not None and (isinstance(schema.get("enum"), list) or isinstance(parameter.get("enum"), list)):
+            request = copy.deepcopy(success_request)
+            set_parameter(request, parameter, "__INVALID_ENUM__")
+            seeded.append(build(f"INVALID_{suffix}", f"参数{name}枚举值非法", "validation", error_status, request))
+        if success_status is not None and name.lower() in {"page", "pagenum", "pagesize", "pageindex", "limit", "offset"}:
+            request = copy.deepcopy(success_request)
+            set_parameter(request, parameter, 0)
+            seeded.append(build(f"BOUNDARY_{suffix}", f"分页参数{name}边界值", "query", success_status, request))
+    required_body_fields = body_schema.get("required", []) if isinstance(body_schema.get("required"), list) else []
+    for field in required_body_fields:
+        if error_status is None:
+            break
+        field_schema = body_schema.get("properties", {}).get(field, {}) if isinstance(body_schema.get("properties"), dict) else {}
+        if media_type == "multipart/form-data" and isinstance(field_schema, dict) and field_schema.get("format") == "binary":
+            continue
+        request = copy.deepcopy(success_request)
+        if isinstance(request.get("body"), dict):
+            request["body"].pop(str(field), None)
+        suffix = slugify_tag(str(field)).replace("-", "_").upper()
+        seeded.append(build(f"MISSING_BODY_{suffix}", f"缺少必填字段{field}", "validation", error_status, request))
+    properties = body_schema.get("properties", {}) if isinstance(body_schema.get("properties"), dict) else {}
+    required_binary_fields = {
+        str(name)
+        for name, schema in properties.items()
+        if str(name) in {str(field) for field in required_body_fields}
+        and isinstance(schema, dict)
+        and schema.get("format") == "binary"
+    }
+    if error_status is not None and media_type == "multipart/form-data" and required_binary_fields:
+        request = copy.deepcopy(success_request)
+        for name in required_binary_fields:
+            if isinstance(request.get("body"), dict):
+                request["body"].pop(name, None)
+        seeded.append(build("MISSING_UPLOAD_FILE", "缺少上传文件", "file", error_status, request))
+    return seeded
+
+
+def write_partitioned(
+    manifest: dict[str, Any],
+    module_map_path: Path,
+    output_dir: Path,
+    seed_cases: bool = False,
+) -> None:
+    qa_root = output_dir.parent.parent
+    try:
+        initialize_execution_layout(qa_root)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     module_map = load_document(module_map_path)
     grouped = partition_manifest(manifest, module_map)
     module_metadata = {
@@ -737,7 +852,7 @@ def write_partitioned(manifest: dict[str, Any], module_map_path: Path, output_di
         "version": 1,
         "source": manifest["source"],
         "module_map": str(module_map_path),
-        "request_auth_file": str((output_dir.parent / "request-auth.yaml")),
+        "execution_config_file": str((qa_root / "execution" / "config.yaml")),
         "generation_status": "draft",
         "inventory_endpoints": len(manifest["endpoints"]),
         "generated_cases": 0,
@@ -768,6 +883,7 @@ def write_partitioned(manifest: dict[str, Any], module_map_path: Path, output_di
             "module": module_id,
             "name": str(module.get("name", tag)),
             "swagger_tag": tag,
+            "tag_description": str(module.get("description") or module.get("business_scope") or ""),
             "source": manifest["source"],
             "endpoints": endpoints,
         }
@@ -817,6 +933,22 @@ def write_partitioned(manifest: dict[str, Any], module_map_path: Path, output_di
         cases_document = load_document(cases_path) if cases_path.is_file() else {}
         cases = cases_document.get("cases", []) if isinstance(cases_document, dict) else []
         cases = [item for item in cases if isinstance(item, dict)] if isinstance(cases, list) else []
+        if seed_cases:
+            existing_case_ids = {str(case.get("id")) for case in cases if case.get("id")}
+            for endpoint in endpoints:
+                for seeded in seed_contract_cases(endpoint):
+                    if seeded["id"] not in existing_case_ids:
+                        cases.append(seeded)
+                        existing_case_ids.add(seeded["id"])
+                endpoint["case_ids"] = list(dict.fromkeys([
+                    *endpoint.get("case_ids", []),
+                    *(case["id"] for case in cases if case.get("endpoint_id") == endpoint.get("id")),
+                ]))
+            cases_document = dict(cases_document) if isinstance(cases_document, dict) else {}
+            cases_document.update({"version": 1, "module": module_id, "swagger_tag": tag, "cases": cases})
+            cases_path.write_text(render_manifest(cases_document, cases_path), encoding="utf-8")
+            module_manifest["endpoints"] = endpoints
+            endpoints_path.write_text(render_manifest(module_manifest, endpoints_path), encoding="utf-8")
         index["generated_cases"] += len(cases)
         cases_md = module_dir / "CASES.md"
         existing_cases_md = cases_md.read_text(encoding="utf-8", errors="strict") if cases_md.is_file() else ""
@@ -870,9 +1002,6 @@ def write_partitioned(manifest: dict[str, Any], module_map_path: Path, output_di
     security_path = output_dir.parent / "security-profile.yaml"
     if not security_path.exists():
         security_path.write_text(render_manifest(security_profile, security_path), encoding="utf-8")
-    auth_path = output_dir.parent / "request-auth.yaml"
-    if not auth_path.exists():
-        auth_path.write_text(DEFAULT_REQUEST_AUTH_TEMPLATE, encoding="utf-8")
     (output_dir.parent / "index.yaml").write_text(
         render_manifest(index, output_dir.parent / "index.yaml"),
         encoding="utf-8",
@@ -900,6 +1029,7 @@ def main() -> int:
     parser.add_argument("--module-map", type=Path, help="module mapping YAML/JSON")
     parser.add_argument("--write-module-map", type=Path, help="write a one-module-per-Tag map for review")
     parser.add_argument("--output-dir", type=Path, help="write one endpoint manifest per module")
+    parser.add_argument("--seed-cases", action="store_true", help="seed review-required cases implied directly by OpenAPI")
     args = parser.parse_args()
 
     if not args.spec.is_file():
@@ -922,7 +1052,7 @@ def main() -> int:
     if args.module_map:
         if not args.module_map.is_file():
             parser.error(f"module map does not exist: {args.module_map}")
-        write_partitioned(manifest, args.module_map, args.output_dir)
+        write_partitioned(manifest, args.module_map, args.output_dir, args.seed_cases)
         module_count = len(load_document(args.module_map).get("modules", []))
         print(f"wrote {len(manifest['endpoints'])} endpoints across {module_count} modules")
         return 0

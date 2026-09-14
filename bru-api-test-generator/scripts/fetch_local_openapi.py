@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import http.client
 import ipaddress
@@ -20,6 +21,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+sys.dont_write_bytecode = True
 
 
 DEFAULT_PATHS = (
@@ -130,6 +133,27 @@ def render_document(document: dict[str, Any], output: Path) -> bytes:
     except ModuleNotFoundError as exc:
         raise SystemExit("YAML output requires an existing PyYAML installation") from exc
     return yaml.safe_dump(document, allow_unicode=True, sort_keys=False).encode("utf-8")
+
+
+def contract_identity(document: dict[str, Any]) -> dict[str, Any]:
+    """Ignore deployment/provenance fields while comparing API identity."""
+
+    normalized = copy.deepcopy(document)
+    normalized.pop("provenance", None)
+    normalized.pop("host", None)
+    normalized.pop("schemes", None)
+
+    def strip_servers(value: Any) -> None:
+        if isinstance(value, dict):
+            value.pop("servers", None)
+            for child in value.values():
+                strip_servers(child)
+        elif isinstance(value, list):
+            for child in value:
+                strip_servers(child)
+
+    strip_servers(normalized)
+    return normalized
 
 
 def write_atomic(output: Path, payload: bytes) -> None:
@@ -264,7 +288,7 @@ def main() -> int:
         if document is None:
             failures.append(f"{url}: {reason}")
             continue
-        if not any(existing == document for _, existing in valid):
+        if not any(contract_identity(existing) == contract_identity(document) for _, existing in valid):
             valid.append((url, document))
 
     if len(valid) > 1:

@@ -8,9 +8,12 @@ import fnmatch
 import hashlib
 import json
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+sys.dont_write_bytecode = True
 
 from manifest_io import load_data
 
@@ -221,6 +224,7 @@ def main() -> int:
     parser.add_argument("contracts_root", type=Path)
     parser.add_argument("--rules", type=Path, help="impact-rules.yaml override")
     parser.add_argument("--write", action="store_true", help="advance version-lock.yaml")
+    parser.add_argument("--init", action="store_true", help="create a draft version-lock baseline without execution evidence")
     parser.add_argument("--tests-adapted", action="store_true", help="confirm affected Bruno tests were adapted and run")
     parser.add_argument(
         "--phase",
@@ -234,6 +238,38 @@ def main() -> int:
     )
     parser.add_argument("--json", action="store_true", dest="as_json")
     args = parser.parse_args()
+
+    if args.init and (args.write or args.phase or args.completion_report or args.tests_adapted):
+        parser.error("--init cannot be combined with phase, completion, or update options")
+    if not args.business_repo.is_dir():
+        parser.error(f"business repository does not exist: {args.business_repo}")
+
+    lock_path = args.contracts_root / "version-lock.yaml"
+    if args.init:
+        if lock_path.exists():
+            print(f"ERROR: version lock already exists: {lock_path}")
+            return 3
+        digest = source_digest(args.business_repo)
+        has_git = git_available(args.business_repo)
+        current_sha = git(args.business_repo, "rev-parse", "HEAD") if has_git else f"filesystem:{digest[:16]}"
+        current_ref = git(args.business_repo, "symbolic-ref", "--short", "-q", "HEAD") or "detached" if has_git else "filesystem"
+        initialized_at = datetime.now(timezone.utc).isoformat()
+        lock = {
+            "version": 1,
+            "status": "draft",
+            "business": {
+                "repo": str(args.business_repo),
+                "commit": current_sha,
+                "ref": current_ref,
+                "source_digest": digest,
+                "initialized_at": initialized_at,
+                "baseline_status": "draft",
+            },
+        }
+        dump_lock(lock_path, lock)
+        report = {"status": "initialized", "baseline_status": "draft", "current_sha": current_sha, "current_source_digest": digest}
+        print(json.dumps(report, ensure_ascii=True, indent=2) if args.as_json else f"initialized draft version lock: {lock_path}")
+        return 0
 
     completion_report: dict[str, Any] | None = None
     if args.completion_report:
@@ -253,11 +289,8 @@ def main() -> int:
         print("ERROR: version lock cannot be written during a pre-generation or pre-execution phase")
         return 3
 
-    lock_path = args.contracts_root / "version-lock.yaml"
     if not lock_path.is_file():
         raise SystemExit(f"missing version lock: {lock_path}")
-    if not args.business_repo.is_dir():
-        parser.error(f"business repository does not exist: {args.business_repo}")
 
     lock = load_data(lock_path)
     if not isinstance(lock, dict):

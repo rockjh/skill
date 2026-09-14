@@ -12,8 +12,13 @@ import argparse
 import hashlib
 import json
 import re
+import sys
+import unicodedata
+import urllib.parse
 from pathlib import Path
 from typing import Any
+
+sys.dont_write_bytecode = True
 
 try:
     from manifest_io import first_list, list_at, load_data
@@ -85,6 +90,13 @@ except ImportError:  # The checker is also intended to be copied on its own.
                     })
         return {"endpoints": sorted(endpoints, key=lambda item: (item["path"], item["method"]))}
 
+from execution_config import (
+    COLLECTION_END_MARKER,
+    COLLECTION_MARKER,
+    HEADER_NAME_RE,
+    load_execution_config,
+)
+
 SCENARIO_CATEGORIES = (
     "success",
     "authentication",
@@ -95,170 +107,69 @@ SCENARIO_CATEGORIES = (
     "safety",
     "file",
 )
+RISK_CLASSES = {"read-only", "isolated-write", "destructive", "external-side-effect"}
 
 INTEGRITY_SUFFIXES = {".yaml", ".yml", ".md", ".bru"}
 MOJIBAKE_RE = re.compile(r"(?:\ufffd|(?:Ã|Â|å|æ|ç)[\x80-\xBF]|â(?:€|™|œ|€�))")
-SIGNING_MARKERS = ("script:pre-request", "SECRET_KEY", "ACCESS_KEY", "SHA256", "timestamp", "accesskey")
-MODE_ALIASES = {
-    "seres.sign": "seres-sign",
-    "seres_sign": "seres-sign",
-    "seres-sign": "seres-sign",
-    "oauth2-client-credentials": "oauth2",
-    "oauth2-authorization-code": "oauth2",
-    "session": "cookie",
-    "cookie-session": "cookie",
-}
 CASE_DOCS_START = "<!-- AUTO_CASES_START -->"
 CASE_DOCS_END = "<!-- AUTO_CASES_END -->"
+CHINESE_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+BUSINESS_FILE_RE = re.compile(r"^\d{2,}-.+\.bru$", re.IGNORECASE)
 
 
-def canonical_mode(value: Any) -> str:
-    name = str(value or "").strip().lower()
-    return MODE_ALIASES.get(name, name)
-
-
-def auth_mode_settings(config: dict[str, Any], mode: str) -> dict[str, Any]:
-    modes = config.get("modes") if isinstance(config.get("modes"), dict) else {}
-    for name, value in modes.items():
-        if canonical_mode(name) == mode and isinstance(value, dict):
-            return value
-    return {}
-
-
-def validate_auth_config_document(config: Any) -> list[str]:
-    """Validate mode selection without requiring runtime credentials.
-
-    The preflight script performs the same validation before execution. The
-    coverage checker keeps a small local copy so it remains usable when copied
-    into a business repository without the rest of this skill's scripts.
-    """
-
-    if not isinstance(config, dict):
-        return ["authentication config must contain an object"]
-    aliases = MODE_ALIASES
-    mode_value = config.get("mode")
-    modes = config.get("modes") if isinstance(config.get("modes"), dict) else {}
-    enabled_modes = {
-        aliases.get(str(name).strip().lower(), str(name).strip().lower())
-        for name, value in modes.items()
-        if isinstance(value, dict) and value.get("enabled") is True
+def is_business_request(path: Path, root: Path) -> bool:
+    relative = path.relative_to(root)
+    return path.name.lower() != "collection.bru" and "environments" not in {
+        part.lower() for part in relative.parts[:-1]
     }
-    enabled_modes.update(
-        aliases.get(str(name).strip().lower(), str(name).strip().lower())
-        for name, value in config.items()
-        if name not in {"mode", "modes", "version", "base_url_env"} and value is True
+
+
+def normalized_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9\u3400-\u4dbf\u4e00-\u9fff]+", "", value.casefold())
+
+
+def valid_business_filename(
+    path: Path,
+    case_id: str,
+    title: str,
+    sequence: int | None = None,
+) -> bool:
+    if not BUSINESS_FILE_RE.fullmatch(path.name):
+        return False
+    number, description = path.stem.split("-", 1)
+    expected_title = re.sub(r"[\\/\x00-\x1f<>:\"|?*]", "", title).strip(" .")
+    return bool(
+        description.strip()
+        and CHINESE_RE.search(description)
+        and normalized_name(description) != normalized_name(case_id)
+        and description == expected_title
+        and (sequence is None or int(number) == sequence)
     )
-    selected = str(mode_value).strip().lower() if isinstance(mode_value, str) and mode_value.strip() else None
-    selected = aliases.get(selected, selected) if selected else None
-    if selected is None:
-        if len(enabled_modes) > 1:
-            return ["authentication config enables more than one mode: " + ", ".join(sorted(enabled_modes))]
-        selected = next(iter(enabled_modes), "none")
-    allowed = {
-        "none", "disabled", "seres-sign", "bearer", "bearer-token", "token",
-        "oauth2", "cookie", "api-key", "apikey", "headers", "custom", "custom-headers",
-    }
-    errors: list[str] = []
-    if selected not in allowed:
-        errors.append(f"unsupported authentication mode: {selected}")
-    if enabled_modes - {selected}:
-        errors.append("authentication config enables more than one mode: " + ", ".join(sorted(enabled_modes)))
-    settings = auth_mode_settings(config, selected)
-    if settings.get("enabled") is False:
-        return errors
-    def check_env(value: Any, default: str, label: str) -> None:
-        candidate = default if value is None else str(value).strip()
-        if not candidate or candidate.lower() in {"none", "null"}:
-            errors.append(f"{label} must name an environment variable")
-
-    check_env(config.get("base_url_env"), "BASE_URL", "base_url_env")
-    if selected == "seres-sign" and str(settings.get("algorithm", "SHA256")).upper() != "SHA256":
-        errors.append("seres-sign currently supports only algorithm: SHA256")
-    if selected == "seres-sign":
-        signature = settings.get("signature") if isinstance(settings.get("signature"), dict) else {}
-        parameters = signature.get("parameters") if isinstance(signature.get("parameters"), dict) else {}
-        check_env(
-            parameters.get("secret_key_env", signature.get("secret_key_env", settings.get("secret_key_env"))),
-            "SECRET_KEY",
-            "secret_key_env",
-        )
-        check_env(
-            parameters.get("access_key_env", signature.get("access_key_env", settings.get("access_key_env"))),
-            "ACCESS_KEY",
-            "access_key_env",
-        )
-        extra_headers = settings.get("extra_headers") if isinstance(settings.get("extra_headers"), dict) else {}
-        for header, value in extra_headers.items():
-            check_env(value.get("env") if isinstance(value, dict) else value, "", f"extra header {header} env")
-    elif selected in {"bearer", "bearer-token", "token", "oauth2", "api-key", "apikey"}:
-        check_env(
-            settings.get("token_env"),
-            "API_KEY" if selected in {"api-key", "apikey"} else "ACCESS_TOKEN",
-            "token_env",
-        )
-    elif selected == "cookie":
-        check_env(settings.get("cookie_env", settings.get("token_env")), "SESSION_COOKIE", "cookie_env")
-    if selected in {"custom", "custom-headers", "headers"}:
-        headers = settings.get("headers") if isinstance(settings.get("headers"), dict) else {}
-        if not headers:
-            errors.append("custom request authentication mode requires modes.custom.headers")
-        for header, value in headers.items():
-            check_env(value.get("env") if isinstance(value, dict) else value, "", f"custom header {header} env")
-    return errors
 
 
-def auth_markers(config: Any) -> tuple[str, ...]:
-    if not isinstance(config, dict):
-        return SIGNING_MARKERS
-    mode_value = config.get("mode")
-    if not isinstance(mode_value, str) or not mode_value.strip():
-        modes = config.get("modes") if isinstance(config.get("modes"), dict) else {}
-        candidates = [canonical_mode(name) for name, value in modes.items() if isinstance(value, dict) and value.get("enabled") is True]
-        candidates.extend(canonical_mode(name) for name, value in config.items() if name not in {"modes", "version", "base_url_env"} and value is True)
-        # A present but empty/disabled config means no authentication. The
-        # legacy signing markers are reserved for a completely missing config
-        # (handled by auth_markers(None)).
-        mode_value = next(iter(dict.fromkeys(candidates)), "none")
-    mode = canonical_mode(mode_value)
-    if config.get(str(mode_value)) is False or config.get(mode) is False:
-        return ()
-    settings = auth_mode_settings(config, mode)
-    if settings.get("enabled") is False:
-        return ()
-    if mode in {"none", "disabled"}:
-        return ()
-    if mode in {"bearer", "bearer-token", "token", "oauth2"}:
-        return ("script:pre-request", str(settings.get("token_env", "ACCESS_TOKEN")), str(settings.get("header", "Authorization")))
-    if mode == "cookie":
-        return ("script:pre-request", str(settings.get("cookie_env", settings.get("token_env", "SESSION_COOKIE"))), str(settings.get("header", "Cookie")))
-    if mode in {"api-key", "apikey"}:
-        return ("script:pre-request", str(settings.get("token_env", "API_KEY")), str(settings.get("header", "X-API-Key")))
-    if mode in {"headers", "custom", "custom-headers"}:
-        headers = settings.get("headers") if isinstance(settings.get("headers"), dict) else {}
-        values = [str(value.get("env")) if isinstance(value, dict) else str(value) for value in headers.values()]
-        return ("script:pre-request", *values)
-    if mode == "seres-sign":
-        signature = settings.get("signature") if isinstance(settings.get("signature"), dict) else {}
-        parameter_config = signature.get("parameters") if isinstance(signature.get("parameters"), dict) else {}
-        signature_headers = settings.get("headers") if isinstance(settings.get("headers"), dict) else {}
-        extra_headers = settings.get("extra_headers") if isinstance(settings.get("extra_headers"), dict) else {}
-        return (
-            "script:pre-request",
-            str(parameter_config.get("secret_key_env", signature.get("secret_key_env", settings.get("secret_key_env", "SECRET_KEY")))),
-            str(parameter_config.get("access_key_env", signature.get("access_key_env", settings.get("access_key_env", "ACCESS_KEY")))),
-            str(settings.get("algorithm", "SHA256")).upper(),
-            str(parameter_config.get("timestamp", signature.get("timestamp_parameter", "timestamp"))),
-            *[str(value) for value in signature_headers.values()],
-            *[str(value.get("env")) if isinstance(value, dict) else str(value) for value in extra_headers.values()],
-        )
-    return (
-        "script:pre-request",
-        str(settings.get("secret_key_env", "SECRET_KEY")),
-        str(settings.get("access_key_env", "ACCESS_KEY")),
-        "SHA256",
-        "timestamp",
-        "accesskey",
-    )
+def bru_meta_name(content: str) -> str | None:
+    block = re.search(r"(?ms)^\s*meta\s*\{(.*?)^\s*\}", content)
+    if block is None:
+        block = re.search(r"(?s)\bmeta\s*\{(.*?)\}", content)
+    if block is None:
+        return None
+    match = re.search(r"(?:^|\s)name:\s*([^\r\n}]+)", block.group(1))
+    return match.group(1).strip() if match else None
+
+
+def bru_meta_sequence(content: str) -> int | None:
+    block = re.search(r"(?ms)^\s*meta\s*\{(.*?)^\s*\}", content)
+    if block is None:
+        return None
+    match = re.search(r"(?m)^\s*seq:\s*(\d+)\s*$", block.group(1))
+    return int(match.group(1)) if match else None
+
+
+def is_http_request_content(content: str) -> bool:
+    meta = re.search(r"(?ms)^\s*meta\s*\{(.*?)^\s*\}", content)
+    if meta is None or not re.search(r"(?m)^\s*type:\s*http\s*$", meta.group(1), re.IGNORECASE):
+        return False
+    return bool(re.search(r"(?mi)^\s*(?:get|post|put|patch|delete|head|options|trace)\s*\{", content))
 
 
 def iter_integrity_files(*roots: Path):
@@ -411,11 +322,67 @@ def bruno_assertion_paths(json_path: Any) -> set[str]:
     return set()
 
 
+def assertion_requirements(assertion: dict[str, Any]) -> list[tuple[str, list[str]]]:
+    expressions = bruno_assertion_paths(assertion)
+    if not expressions:
+        return []
+    requirements: list[tuple[str, list[str]]] = []
+
+    def value(key: str) -> str:
+        return json.dumps(assertion[key], ensure_ascii=False, separators=(",", ": "))
+
+    operators = {
+        "equals": ("eq", lambda: value("equals")),
+        "eq": ("eq", lambda: value("eq")),
+        "contains": ("contains", lambda: value("contains")),
+        "matches": ("matches", lambda: value("matches")),
+        "length": ("length", lambda: str(assertion["length"])),
+        "minimum": ("gte", lambda: value("minimum")),
+        "maximum": ("lte", lambda: value("maximum")),
+        "equals_variable": ("eq", lambda: "{{" + str(assertion["equals_variable"]) + "}}"),
+    }
+    for key, (operator, rendered) in operators.items():
+        if key in assertion:
+            requirements.append((key, [f"{expression}: {operator} {rendered()}" for expression in expressions]))
+    if assertion.get("exists") is True:
+        requirements.append(("exists", [f"{expression}: exists" for expression in expressions]))
+    type_operator = {
+        "string": "isString", "number": "isNumber", "integer": "isNumber",
+        "boolean": "isBoolean", "array": "isArray", "object": "isObject",
+    }.get(str(assertion.get("type", "")).lower())
+    if type_operator:
+        requirements.append(("type", [f"{expression}: {type_operator}" for expression in expressions]))
+    if assertion.get("nullable") is False:
+        requirements.append(("nullable", [f"{expression}: isNotNull" for expression in expressions]))
+    if assertion.get("is_null") is True:
+        requirements.append(("is_null", [f"{expression}: isNull" for expression in expressions]))
+    capture = assertion.get("capture_as") or assertion.get("capture")
+    if capture:
+        name = json.dumps(str(capture))
+        requirements.append(("capture", [f"bru.setVar({name}, {expression})" for expression in expressions]))
+    items = assertion.get("items")
+    item_type = items.get("type") if isinstance(items, dict) else assertion.get("item_type")
+    if item_type:
+        requirements.append(("items.type", [f"{expression}.forEach" for expression in expressions]))
+    if str(assertion.get("type", "")).lower() == "integer":
+        requirements.append(("integer", [f"Number.isInteger({expression})" for expression in expressions]))
+    return requirements
+
+
 def module_directory_name(module: Any, module_id: str) -> str:
     value = module.get("directory", module_id) if isinstance(module, dict) else module_id
     directory = str(value).strip()
     if not directory or directory in {".", ".."} or Path(directory).name != directory:
         raise ValueError(f"module {module_id} directory must be one safe path segment")
+    tags = module.get("swagger_tags") if isinstance(module, dict) else None
+    if isinstance(tags, list) and len(tags) == 1 and isinstance(tags[0], str):
+        expected = unicodedata.normalize("NFC", tags[0]).strip()
+        expected = re.sub(r"[\\/\x00-\x1f<>:\"|?*]+", "-", expected)
+        expected = re.sub(r"\s+", "-", expected).strip(" .-") or module_id
+        if directory != expected:
+            raise ValueError(
+                f"module {module_id} directory must come from Swagger tag {tags[0]!r}: expected {expected!r}"
+            )
     return directory
 
 
@@ -659,6 +626,8 @@ def validate_module_documentation(path: Path, cases: list[dict[str, Any]]) -> li
             errors.append(f"{path.name} is missing required section marker {marker}")
     documented_ids = re.findall(r"<!-- CASE_START: ([^\s>]+) -->", content)
     declared_ids = {str(case.get("id")) for case in cases if case.get("id")}
+    if cases and not re.search(r"```mermaid\s*\n\s*sequenceDiagram\b", content):
+        errors.append(f"{path.name} has no module-level Mermaid sequenceDiagram")
     for case_id in sorted(declared_ids):
         if documented_ids.count(case_id) != 1:
             errors.append(f"case {case_id} must have exactly one documentation block in {path.name}")
@@ -676,10 +645,12 @@ def validate_module_documentation(path: Path, cases: list[dict[str, Any]]) -> li
             errors.append(f"case {case_id} documentation has no title")
         if not re.search(r"(?m)^简短描述：\s*\S", block):
             errors.append(f"case {case_id} documentation has no short description")
-        if not re.search(r"```mermaid\s*\n\s*sequenceDiagram\b", block):
-            errors.append(f"case {case_id} documentation has no Mermaid sequenceDiagram swimlane")
-        if len(re.findall(r"(?m)^\s*participant\s+", block)) < 2 or "->>" not in block:
-            errors.append(f"case {case_id} Mermaid swimlane has insufficient participants or messages")
+        case = next((item for item in cases if str(item.get("id")) == case_id), {})
+        if case.get("flow_required") is True:
+            if not re.search(r"```mermaid\s*\n\s*sequenceDiagram\b", block):
+                errors.append(f"flow case {case_id} documentation has no Mermaid sequenceDiagram swimlane")
+            elif len(re.findall(r"(?m)^\s*participant\s+", block)) < 2 or "->>" not in block:
+                errors.append(f"flow case {case_id} Mermaid swimlane has insufficient participants or messages")
     for case_id in sorted(set(documented_ids) - declared_ids):
         errors.append(f"{path.name} documents unknown case {case_id}")
     return errors
@@ -740,50 +711,152 @@ def referenced_components(value: Any) -> set[tuple[str, str]]:
     return found
 
 
+def bruno_request(content: str) -> dict[str, Any]:
+    match = re.search(
+        r"(?mis)^\s*(get|post|put|patch|delete|head|options|trace)\s*\{(.*?)^\s*\}",
+        content,
+    )
+    if match is None:
+        return {}
+    block = match.group(2)
+    url = re.search(r"(?m)^\s*url:\s*(\S+)\s*$", block)
+    body_type = re.search(r"(?m)^\s*body:\s*(\S+)\s*$", block)
+    return {
+        "method": match.group(1).upper(),
+        "url": url.group(1) if url else "",
+        "body_type": body_type.group(1).lower() if body_type else "none",
+    }
+
+
+def bruno_body(content: str, kind: str) -> str | None:
+    match = re.search(rf"(?mi)^\s*body:{re.escape(kind)}\s*\{{", content)
+    if match is None:
+        return None
+    start = content.find("{", match.start())
+    depth = 0
+    quote = ""
+    escaped = False
+    for index in range(start, len(content)):
+        char = content[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in {'"', "'"}:
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return content[start + 1:index].strip()
+    return None
+
+
+def bruno_headers(content: str) -> dict[str, str]:
+    match = re.search(r"(?mis)^\s*headers\s*\{(.*?)^\s*\}", content)
+    if match is None:
+        return {}
+    result = {}
+    for line in match.group(1).splitlines():
+        item = re.match(r"\s*([^:]+):\s*(.*)$", line)
+        if item:
+            result[item.group(1).strip()] = item.group(2).strip()
+    return result
+
+
+def normalized_body(value: Any, kind: str, rendered: bool = False) -> Any:
+    if kind == "json":
+        if rendered:
+            try:
+                return json.loads(str(value))
+            except json.JSONDecodeError:
+                return str(value).strip()
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                return value.strip()
+        return value
+    if kind in {"form-urlencoded", "multipart-form", "file"}:
+        if rendered:
+            pairs = {}
+            for line in str(value).splitlines():
+                match = re.match(r"\s*([^:]+):\s*(.*)$", line)
+                if match:
+                    pairs[match.group(1).strip()] = match.group(2).strip()
+            return pairs
+        if isinstance(value, dict):
+            pairs = {}
+            for key, item in value.items():
+                if isinstance(item, dict):
+                    item = item.get("file") or item.get("path") or ""
+                    item = ("@" if kind == "multipart-form" else "@file(") + str(item) + ("" if kind == "multipart-form" else ")")
+                elif kind == "file" and not str(item).startswith("@file("):
+                    item = f"@file({item})"
+                pairs[str(key)] = str(item)
+            return pairs
+        if kind == "file":
+            item = str(value)
+            return {"file": item if item.startswith("@file(") else f"@file({item})"}
+    if kind == "graphql" and isinstance(value, dict):
+        return str(value.get("query", "")).strip()
+    return str(value if value is not None else "").strip()
+
+
+def case_risk(case: dict[str, Any], endpoint: dict[str, Any] | None = None) -> str:
+    declared = str(case.get("risk", "")).strip().lower()
+    if declared:
+        return declared
+    method = str((endpoint or {}).get("method", "GET")).upper()
+    return "read-only" if method in {"GET", "HEAD", "OPTIONS"} else "isolated-write"
+
+
+def normalized_request_path(url: str) -> str:
+    value = re.sub(r"^\{\{[^}]+\}\}", "", url).split("?", 1)[0]
+    value = re.sub(r"^https?://[^/]+", "", value, flags=re.IGNORECASE)
+    return re.sub(r"\{\{([^}]+)\}\}", r"{\1}", value) or "/"
+
+
 def case_files(
     cases: list[dict[str, Any]],
     bru_root: Path,
-    require_signing: bool = False,
-    required_auth_markers: tuple[str, ...] = SIGNING_MARKERS,
-    required_base_url_env: str | None = None,
+    endpoints: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[set[str], set[Path], dict[str, Path], list[str]]:
     if not bru_root.is_dir():
         return set(), set(), {}, [f"Bruno directory does not exist: {bru_root}"]
     errors: list[str] = []
-    known_files = {path.resolve(): path for path in bru_root.rglob("*.bru")}
+    candidates = [path for path in bru_root.rglob("*.bru") if is_business_request(path, bru_root)]
     contents: dict[Path, str] = {}
-    for path in known_files:
+    known_files: dict[Path, Path] = {}
+    for source in candidates:
+        path = source.resolve()
         try:
-            contents[path] = path.read_text(encoding="utf-8", errors="strict")
+            content = path.read_text(encoding="utf-8", errors="strict")
         except (OSError, UnicodeDecodeError) as exc:
             errors = [f"UTF-8 integrity failure {path}: {exc}"]
             return set(), set(), {}, errors
-    if require_signing:
-        for path, content in contents.items():
-            missing = [marker for marker in required_auth_markers if marker not in content]
-            if missing:
-                errors.append(
-                    f"Bruno file {path} has no complete configured pre-request script; missing {', '.join(missing)}"
-                )
-            if re.search(r"\burl:\s+https?://(?!\{\{)", content, re.IGNORECASE):
-                errors.append(f"Bruno file {path} hard-codes a URL; use the configured environment base URL")
-            if required_base_url_env and not re.search(
-                rf"\burl:\s*\{{\{{{re.escape(required_base_url_env)}\}}\}}(?:/|\?|\s|$)",
-                content,
-            ):
-                errors.append(
-                    f"Bruno file {path} does not use the configured base URL environment "
-                    f"{{{{{required_base_url_env}}}}}"
-                )
+        if is_http_request_content(content):
+            known_files[path] = source
+            contents[path] = content
+    for path, content in contents.items():
+        if re.search(r"\burl:\s+https?://(?!\{\{)", content, re.IGNORECASE):
+            errors.append(f"Bruno file {path} hard-codes a URL; use the BASE_URL environment variable")
+        if not re.search(r"\burl:\s*\{\{BASE_URL\}\}(?:/|\?|\s|$)", content):
+            errors.append(f"Bruno file {path} does not use the BASE_URL environment variable")
     covered: set[str] = set()
     used_paths: set[Path] = set()
     case_paths: dict[str, Path] = {}
-    for case in cases:
+    for position, case in enumerate(cases, 1):
         case_id = str(case.get("id", ""))
         if not case_id:
             errors.append("case without id")
             continue
-        configured = case.get("bru") or case.get("bru_file")
+        configured = case.get("bru") or case.get("bru_file") or case.get("file_name")
         matched = None
         if isinstance(configured, str):
             candidate = (bru_root / configured).resolve()
@@ -793,6 +866,9 @@ def case_files(
                 errors.append(f"case {case_id} points outside Bruno directory: {configured}")
             if candidate in known_files:
                 matched = candidate
+            else:
+                errors.append(f"case {case_id} configured Bruno file does not exist: {configured}")
+                continue
         if matched is None:
             marker = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(case_id)}(?![A-Za-z0-9_])")
             candidates = sorted(
@@ -812,6 +888,129 @@ def case_files(
             errors.append(f"case {case_id} reuses Bruno file already mapped to another case: {matched}")
         used_paths.add(matched)
         case_paths[case_id] = matched
+        explicit_sequence = case.get("sequence", case.get("seq"))
+        try:
+            expected_sequence = int(explicit_sequence) if explicit_sequence is not None else None
+        except (TypeError, ValueError):
+            expected_sequence = -1
+        relative_business_path = known_files[matched].relative_to(bru_root)
+        if relative_business_path.parent != Path(".") or not valid_business_filename(
+            known_files[matched],
+            case_id,
+            str(case.get("title", "")),
+            expected_sequence,
+        ):
+            errors.append(
+                f"case {case_id} Bruno filename must match its sequence and sanitized Chinese case.title: "
+                f"{known_files[matched].name}"
+            )
+        actual_meta_name = bru_meta_name(contents[matched])
+        if actual_meta_name != case_id:
+            errors.append(
+                f"case {case_id} Bruno meta.name is {actual_meta_name or '<missing>'}, expected {case_id}"
+            )
+        filename_sequence = int(known_files[matched].stem.split("-", 1)[0])
+        meta_sequence = bru_meta_sequence(contents[matched])
+        if meta_sequence is not None and meta_sequence != filename_sequence:
+            errors.append(
+                f"case {case_id} Bruno meta.seq is {meta_sequence}, expected filename sequence {filename_sequence}"
+            )
+        endpoint = (endpoints or {}).get(str(case.get("endpoint_id")))
+        if endpoint:
+            actual_request = bruno_request(contents[matched])
+            expected_method = str(endpoint.get("method", "GET")).upper()
+            expected_path = str((case.get("request") or {}).get("path") or endpoint.get("path") or "/")
+            if actual_request.get("method") != expected_method:
+                errors.append(f"case {case_id} Bruno method is {actual_request.get('method')}, expected {expected_method}")
+            if normalized_request_path(str(actual_request.get("url", ""))) != expected_path:
+                errors.append(
+                    f"case {case_id} Bruno URL path is {normalized_request_path(str(actual_request.get('url', '')))}, "
+                    f"expected {expected_path}"
+                )
+            request = case.get("request") if isinstance(case.get("request"), dict) else {}
+            expected_query = request.get("query") if isinstance(request.get("query"), dict) else {}
+            actual_url = str(actual_request.get("url", ""))
+            actual_query = {
+                urllib.parse.unquote(key): urllib.parse.unquote(value)
+                for key, value in re.findall(r"[?&]([^=&\s]+)=([^&\s]*)", actual_url)
+            }
+            expected_query_rendered = {
+                str(key): (
+                    str(value).lower() if isinstance(value, bool)
+                    else "" if value is None
+                    else str(value)
+                )
+                for key, value in expected_query.items()
+                if not isinstance(value, (dict, list))
+            }
+            for key, value in expected_query.items():
+                if isinstance(value, (dict, list)):
+                    errors.append(f"case {case_id} query field {key} must be flattened or declare supported serialization")
+            if actual_query != expected_query_rendered:
+                errors.append(
+                    f"case {case_id} Bruno query is {actual_query}, expected {expected_query_rendered}"
+                )
+            expected_headers = request.get("headers") if isinstance(request.get("headers"), dict) else {}
+            actual_headers = bruno_headers(contents[matched])
+            for key, value in expected_headers.items():
+                if actual_headers.get(str(key)) != str(value):
+                    errors.append(
+                        f"case {case_id} Bruno header {key} is {actual_headers.get(str(key))!r}, expected {str(value)!r}"
+                    )
+            omitted_headers = request.get("omit_common_headers", [])
+            if omitted_headers is not None and (
+                not isinstance(omitted_headers, list)
+                or any(
+                    not isinstance(name, str) or not HEADER_NAME_RE.fullmatch(name.strip())
+                    for name in omitted_headers
+                )
+            ):
+                errors.append(f"case {case_id} request.omit_common_headers must be a list of Header names")
+            elif omitted_headers:
+                if "bru-api-test-generator: omit-common-headers" not in contents[matched]:
+                    errors.append(f"case {case_id} does not remove its omitted common Headers at request level")
+                for name in omitted_headers:
+                    if json.dumps(name, ensure_ascii=False) not in contents[matched]:
+                        errors.append(f"case {case_id} does not remove common Header {name}")
+            expected_body_type = str(request.get("body_type") or request.get("content_type") or "").lower()
+            body = request.get("body")
+            endpoint_body = endpoint.get("request_body") if isinstance(endpoint.get("request_body"), dict) else {}
+            endpoint_content = endpoint_body.get("content") if isinstance(endpoint_body.get("content"), dict) else {}
+            if not expected_body_type and endpoint_content:
+                expected_body_type = str(next(iter(endpoint_content))).lower()
+            if not expected_body_type and body is not None:
+                expected_body_type = "json"
+            if expected_body_type:
+                aliases = {
+                    "application/json": "json",
+                    "multipart/form-data": "multipart-form",
+                    "application/x-www-form-urlencoded": "form-urlencoded",
+                    "text/plain": "text",
+                    "application/xml": "xml",
+                }
+                expected_body_type = aliases.get(expected_body_type, expected_body_type)
+                if actual_request.get("body_type") != expected_body_type:
+                    errors.append(
+                        f"case {case_id} Bruno body type is {actual_request.get('body_type')}, expected {expected_body_type}"
+                    )
+            # Reconcile what this case declares. Negative cases intentionally
+            # omit OpenAPI-required fields, so the schema cannot define the
+            # fields that must appear in every generated request.
+            required_body_fields = set(body) if isinstance(body, dict) else set()
+            if required_body_fields:
+                body_blocks = "\n".join(re.findall(r"(?mis)^\s*body:[^\s{]+\s*\{(.*?)^\s*\}", contents[matched]))
+                for key in required_body_fields:
+                    if not re.search(rf"(?:\"{re.escape(str(key))}\"|^\s*{re.escape(str(key))}\s*:)", body_blocks, re.MULTILINE):
+                        errors.append(f"case {case_id} Bruno body is missing request field {key}")
+            actual_kind = str(actual_request.get("body_type", "none"))
+            if actual_kind != "none":
+                actual_body = bruno_body(contents[matched], actual_kind)
+                if actual_body is None or normalized_body(actual_body, actual_kind, True) != normalized_body(body, actual_kind):
+                    errors.append(f"case {case_id} Bruno body content does not match manifest request")
+                if actual_kind == "graphql" and isinstance(body, dict) and body.get("variables") is not None:
+                    actual_variables = bruno_body(contents[matched], "graphql:vars")
+                    if actual_variables is None or normalized_body(actual_variables, "json", True) != body.get("variables"):
+                        errors.append(f"case {case_id} Bruno GraphQL variables do not match manifest request")
         if "assert {" not in contents[matched]:
             errors.append(f"case {case_id} Bruno file has no assert block: {matched}")
         covered.add(case_id)
@@ -819,13 +1018,16 @@ def case_files(
         if not isinstance(assertions, list) or not any(
             isinstance(item, dict)
             and (
-                str(item.get("target") or item.get("kind") or "").strip().lower()
-                in {"header", "response.header", "headers", "response.headers", "cookie", "response.cookie", "cookies", "response.cookies", "text", "body_text", "response.body", "raw", "xml", "binary", "file"}
-                or str(item.get("path", "")) not in {"$.code", "$.status", "$.http_status"}
+                any(key in item for key in ("equals", "eq", "contains", "matches", "type", "length", "minimum", "maximum", "nullable", "is_null", "equals_variable"))
+                or (
+                    case.get("review_required") is True
+                    and item.get("exists") is True
+                    and str(item.get("path", "")) not in {"$.code", "$.status", "$.http_status"}
+                )
             )
             for item in assertions
         ):
-            errors.append(f"case {case_id} has no concrete response assertion beyond status/code")
+            errors.append(f"case {case_id} has no precise response assertion beyond status/code/exists")
         for assertion in assertions if isinstance(assertions, list) else []:
             if not isinstance(assertion, dict):
                 continue
@@ -835,6 +1037,23 @@ def case_files(
                     f"case {case_id} manifest assertion {assertion.get('path')} "
                     "is not represented in its Bruno assert block"
                 )
+                continue
+            for requirement, alternatives in assertion_requirements(assertion):
+                if not any(fragment in contents[matched] for fragment in alternatives):
+                    errors.append(
+                        f"case {case_id} manifest assertion {assertion.get('path')} "
+                        f"is missing {requirement} in Bruno"
+                    )
+        captures = case.get("captures", [])
+        if isinstance(captures, dict):
+            captures = [{"name": name, "path": path} for name, path in captures.items()]
+        for capture in captures if isinstance(captures, list) else []:
+            if not isinstance(capture, dict) or not capture.get("name"):
+                continue
+            expressions = bruno_assertion_paths({"path": capture.get("path", "$")})
+            name = json.dumps(str(capture["name"]))
+            if not any(f"bru.setVar({name}, {expression})" in contents[matched] for expression in expressions):
+                errors.append(f"case {case_id} capture {capture['name']} is not represented in Bruno")
         expected = case.get("expected") if isinstance(case.get("expected"), dict) else {}
         business_code_path = expected.get("business_code_path", "$.code")
         business_expression = next(iter(bruno_assertion_paths({"path": business_code_path})), "res.body.code")
@@ -852,37 +1071,48 @@ def case_files(
     return covered, used_paths, case_paths, errors
 
 
-def auth_file_errors(
-    bru_root: Path,
-    required_auth_markers: tuple[str, ...],
-    required_base_url_env: str | None,
-    excluded_roots: list[Path] | None = None,
-) -> list[str]:
-    """Check Bruno files outside module-owned roots for the selected mode."""
-
+def collection_runtime_errors(bru_root: Path, request_roots: list[Path] | None = None) -> list[str]:
     if not bru_root.is_dir():
         return [f"Bruno directory does not exist: {bru_root}"]
-    excluded = [root.resolve() for root in (excluded_roots or []) if root.is_dir()]
     errors: list[str] = []
-    for path in bru_root.rglob("*.bru"):
-        resolved = path.resolve()
-        if any(root == resolved or root in resolved.parents for root in excluded):
+    collection_path = bru_root / "collection.bru"
+    if not collection_path.is_file():
+        errors.append(f"Bruno collection runtime config does not exist: {collection_path}")
+    else:
+        try:
+            collection = collection_path.read_text(encoding="utf-8", errors="strict")
+        except (OSError, UnicodeDecodeError) as exc:
+            errors.append(f"UTF-8 integrity failure {collection_path}: {exc}")
+        else:
+            for marker in (
+                COLLECTION_MARKER,
+                COLLECTION_END_MARKER,
+                "__QA_EXECUTION_CONFIG",
+                "req.getHeader",
+                "req.setHeader",
+                "req.getPath",
+                'value === ""',
+                "globMatches(pattern, requestPath)",
+                "CryptoJS.SHA256(signText)",
+                'setCommonHeader("sign"',
+                'setCommonHeader("timestamp"',
+                'setCommonHeader("accesskey"',
+            ):
+                if marker not in collection:
+                    errors.append(f"Bruno collection runtime config is incomplete; missing {marker}")
+    roots = request_roots or [bru_root]
+    for path in (path for root in roots if root.is_dir() for path in root.rglob("*.bru")):
+        if not is_business_request(path, bru_root):
             continue
         try:
             content = path.read_text(encoding="utf-8", errors="strict")
         except (OSError, UnicodeDecodeError) as exc:
             errors.append(f"UTF-8 integrity failure {path}: {exc}")
             continue
-        missing = [marker for marker in required_auth_markers if marker not in content]
-        if missing:
-            errors.append(f"Bruno file {path} has no complete configured pre-request script; missing {', '.join(missing)}")
-        if re.search(r"\burl:\s+https?://(?!\{\{)", content, re.IGNORECASE):
-            errors.append(f"Bruno file {path} hard-codes a URL; use the configured environment base URL")
-        if required_base_url_env and not re.search(
-            rf"\burl:\s*\{{\{{{re.escape(required_base_url_env)}\}}\}}(?:/|\?|\s|$)",
-            content,
-        ):
-            errors.append(f"Bruno file {path} does not use the configured base URL environment {{{{{required_base_url_env}}}}}")
+        if not is_http_request_content(content):
+            continue
+        if "bru-api-test-generator: auth-start" in content:
+            errors.append(f"Bruno file {path} still contains a legacy per-request authentication script")
     return errors
 
 
@@ -959,10 +1189,8 @@ def check_module(
     require_scenarios: bool = False,
     module_tag: str | None = None,
     strict_bru_modules: bool = False,
-    require_signing: bool = False,
-    required_auth_markers: tuple[str, ...] = SIGNING_MARKERS,
     bru_module_name: str | None = None,
-    required_base_url_env: str | None = None,
+    selected_risks: set[str] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     errors: list[str] = []
     endpoints_doc = load_data(module_dir / "endpoints.yaml")
@@ -1067,6 +1295,10 @@ def check_module(
             errors.append(f"case {case.get('id')} points to unknown endpoint {endpoint_id}")
         if module_tag and case.get("swagger_tag") and str(case.get("swagger_tag")).strip() != module_tag:
             errors.append(f"case {case.get('id')} Swagger tag does not match module {module_id}")
+        endpoint_for_case = next((item for item in endpoints if item.get("id") == endpoint_id), None)
+        risk = case_risk(case, endpoint_for_case)
+        if risk not in RISK_CLASSES:
+            errors.append(f"case {case.get('id')} has invalid risk class {risk}")
     for endpoint in endpoints:
         endpoint_cases = endpoint.get("case_ids", [])
         if not endpoint_cases:
@@ -1128,9 +1360,7 @@ def check_module(
     covered_cases, _, case_paths, file_errors = case_files(
         cases,
         module_bru_root,
-        require_signing=require_signing,
-        required_auth_markers=required_auth_markers,
-        required_base_url_env=required_base_url_env,
+        {str(item.get("id")): item for item in endpoints},
     )
     errors.extend(file_errors)
 
@@ -1219,11 +1449,30 @@ def check_module(
         required_case_ids = {
             case_id for case_id, case in cases_by_id.items()
             if str(case.get("endpoint_id")) not in approved_excluded_endpoint_ids
+            and (
+                not selected_risks
+                or case_risk(case, next((item for item in endpoints if item.get("id") == case.get("endpoint_id")), None)) in selected_risks
+            )
         }
         errors.extend(f"case {case_id} was not executed" for case_id in sorted(required_case_ids - executed))
         errors.extend(f"case {case_id} failed" for case_id in sorted(required_case_ids & executed - passed))
-        if flow_items:
-            errors.extend(flow_execution_errors(flow_items, results))
+        selected_flows = [
+            flow for flow in flow_items
+            if all(
+                step.get("case_id") in cases_by_id
+                and (
+                    not selected_risks
+                    or case_risk(
+                        cases_by_id[step["case_id"]],
+                        next((item for item in endpoints if item.get("id") == cases_by_id[step["case_id"]].get("endpoint_id")), None),
+                    ) in selected_risks
+                )
+                for step in flow.get("steps", [])
+                if isinstance(step, dict)
+            )
+        ]
+        if selected_flows:
+            errors.extend(flow_execution_errors(selected_flows, results))
 
     endpoints_with_cases = 0
     for endpoint in endpoints:
@@ -1340,40 +1589,46 @@ def main() -> int:
         help="require a decision for every case-matrix category on every endpoint",
     )
     parser.add_argument(
-        "--require-signing",
-        action="store_true",
-        help="require the shared SECRET_KEY/ACCESS_KEY pre-request signing script in every Bruno file",
-    )
-    parser.add_argument(
         "--require-auth",
         action="store_true",
-        help="require the pre-request script selected by request-auth.yaml in every Bruno file",
+        help="require valid execution config and collection-level runtime injection",
     )
     parser.add_argument(
-        "--auth-config",
+        "--execution-config",
         type=Path,
-        help="request-auth.yaml selecting the expected pre-request mode",
+        help="qa/execution/config.yaml (the only shared runtime config)",
     )
+    parser.add_argument("--module", help="check one module id, display name, Tag, or directory")
+    parser.add_argument("--risk", action="append", choices=sorted(RISK_CLASSES), help="execution risk class; defaults to read-only")
+    parser.add_argument("--allow-dangerous", action="store_true", help="explicitly allow destructive or external-side-effect evidence")
     parser.add_argument("--json", action="store_true", dest="as_json")
     args = parser.parse_args()
+    selected_risks = set(args.risk or ["read-only"])
+    if selected_risks & {"destructive", "external-side-effect"} and not args.allow_dangerous:
+        parser.error("destructive and external-side-effect scopes require --allow-dangerous")
 
     results = execution_evidence(load_data(args.results)) if args.results else None
     preflight = load_data(args.preflight_results) if args.preflight_results else None
     preflight_ok = (
         isinstance(preflight, dict)
-        and preflight.get("status") in {"runnable", "passed", "ok"}
+        and (
+            (
+                preflight.get("static_ready") is True
+                and preflight.get("context_ready") is True
+                and preflight.get("execution_ready") is True
+            )
+            or preflight.get("status") in {"runnable", "passed", "ok"}
+        )
         and not preflight.get("errors")
     )
-    auth_config_path = args.auth_config or (args.contracts_root / "request-auth.yaml")
-    auth_config = None
-    auth_config_load_error: str | None = None
-    if auth_config_path.is_file():
+    execution_config_path = args.execution_config or (args.contracts_root.parent / "execution" / "config.yaml")
+    execution_config = None
+    execution_config_error: str | None = None
+    if execution_config_path.is_file():
         try:
-            auth_config = load_data(auth_config_path)
-        except SystemExit as exc:
-            auth_config_load_error = str(exc)
-    required_auth_markers = auth_markers(auth_config)
-    auth_config_valid = True
+            execution_config = load_execution_config(execution_config_path)
+        except ValueError as exc:
+            execution_config_error = str(exc)
     errors: list[str] = text_integrity_errors(args.contracts_root, args.bru_root)
     if args.results:
         if args.openapi is None:
@@ -1382,26 +1637,21 @@ def main() -> int:
             errors.append("completion requires --require-scenarios")
         if not args.require_auth:
             errors.append("completion requires --require-auth")
-        if args.auth_config is None:
-            errors.append("completion requires explicit --auth-config")
+        if args.execution_config is None:
+            errors.append("completion requires explicit --execution-config")
         if not args.preflight_results:
             errors.append("completion requires --preflight-results")
         elif not preflight_ok:
             errors.append("runtime preflight did not pass")
-        if not auth_config_path.is_file():
-            errors.append(f"completion requires request authentication config: {auth_config_path}")
+        if not execution_config_path.is_file():
+            errors.append(f"completion requires execution config: {execution_config_path}")
     if args.require_auth:
-        if not auth_config_path.is_file():
-            auth_config_valid = False
-            errors.append(f"--require-auth requires request authentication config: {auth_config_path}")
-        elif auth_config_load_error:
-            auth_config_valid = False
-            errors.append(f"invalid request authentication config {auth_config_path}: {auth_config_load_error}")
-        else:
-            auth_errors = validate_auth_config_document(auth_config)
-            auth_config_valid = not auth_errors
-            errors.extend(f"invalid request authentication config {auth_config_path}: {error}" for error in auth_errors)
-    required_base_url_env = str(auth_config.get("base_url_env", "BASE_URL")) if isinstance(auth_config, dict) else "BASE_URL"
+        if not execution_config_path.is_file():
+            errors.append(f"--require-auth requires execution config: {execution_config_path}")
+        elif execution_config_error:
+            errors.append(f"invalid execution config {execution_config_path}: {execution_config_error}")
+        elif execution_config is None:
+            errors.append(f"invalid execution config {execution_config_path}")
     totals = {
         "endpoints": 0,
         "inventory_endpoints": 0,
@@ -1424,20 +1674,28 @@ def main() -> int:
     module_map_path = args.contracts_root / "module-map.yaml"
     module_map_doc: Any = load_data(module_map_path) if module_map_path.is_file() else None
     modules = module_dirs(args.contracts_root, module_map_doc)
-    if (args.require_auth or args.require_signing) and (not args.require_auth or auth_config_valid):
-        strict_bru_modules = (args.contracts_root / "modules").is_dir()
-        module_bru_roots = []
-        for _, module_dir in modules:
-            candidate = args.bru_root / module_dir.name
-            module_bru_roots.append(candidate if strict_bru_modules or candidate.is_dir() else args.bru_root)
-        errors.extend(
-            auth_file_errors(
-                args.bru_root,
-                required_auth_markers,
-                required_base_url_env if args.require_auth else None,
-                list(dict.fromkeys(module_bru_roots)),
-            )
-        )
+    if args.module:
+        metadata = {
+            str(item.get("id")): item
+            for item in (module_map_doc.get("modules", []) if isinstance(module_map_doc, dict) else [])
+            if isinstance(item, dict) and item.get("id")
+        }
+        modules = [
+            (module_id, module_dir)
+            for module_id, module_dir in modules
+            if args.module in {
+                module_id,
+                module_dir.name,
+                str(metadata.get(module_id, {}).get("name", "")),
+                str(metadata.get(module_id, {}).get("tag", "")),
+                *[str(tag) for tag in metadata.get(module_id, {}).get("swagger_tags", [])],
+            }
+        ]
+        if not modules:
+            errors.append(f"unknown module: {args.module}")
+    if args.require_auth:
+        roots = [args.bru_root / module_dir.name for _, module_dir in modules] if args.module else None
+        errors.extend(collection_runtime_errors(args.bru_root, roots))
     endpoint_records: list[tuple[str, dict[str, Any]]] = []
     all_case_ids: dict[str, str] = {}
     all_case_fingerprints: dict[str, str] = {}
@@ -1448,7 +1706,8 @@ def main() -> int:
     contract_provenance_unverified = False
     for module_id, module_dir in modules:
         endpoint_doc = load_data(module_dir / "endpoints.yaml")
-        for endpoint in first_list(endpoint_doc, "endpoints"):
+        endpoint_lookup = {str(item.get("id")): item for item in first_list(endpoint_doc, "endpoints")}
+        for endpoint in endpoint_lookup.values():
             if endpoint.get("module") and str(endpoint.get("module")) != module_id:
                 errors.append(
                     f"endpoint {endpoint.get('id')} declares module {endpoint.get('module')} "
@@ -1485,7 +1744,10 @@ def main() -> int:
                         f"cases {previous_fingerprint} and {case_id} duplicate endpoint/scenario/request/assertions"
                     )
                 all_case_fingerprints[fingerprint] = case_id
-                if str(case.get("endpoint_id")) not in approved_endpoint_ids:
+                if (
+                    str(case.get("endpoint_id")) not in approved_endpoint_ids
+                    and case_risk(case, endpoint_lookup.get(str(case.get("endpoint_id")))) in selected_risks
+                ):
                     required_case_ids_global.add(case_id)
         flow_path = module_dir / "flows.yaml"
         if flow_path.is_file():
@@ -1506,7 +1768,8 @@ def main() -> int:
                 if logic_id:
                     all_logic_ids[logic_id] = module_id
 
-    errors.extend(validate_cross_module_flows(args.contracts_root, all_case_ids))
+    if not args.module:
+        errors.extend(validate_cross_module_flows(args.contracts_root, all_case_ids))
 
     endpoint_ids = [str(endpoint.get("id", "")) for _, endpoint in endpoint_records]
     duplicate_endpoint_ids = sorted({item for item in endpoint_ids if item and endpoint_ids.count(item) > 1})
@@ -1516,6 +1779,7 @@ def main() -> int:
     )
 
     openapi_path = args.openapi
+    openapi_sha256: str | None = None
     if openapi_path is None:
         candidate = args.contracts_root / "openapi.json"
         if candidate.is_file():
@@ -1523,13 +1787,14 @@ def main() -> int:
     if args.results and openapi_path is None:
         errors.append("completion requires an offline OpenAPI document; pass --openapi")
     global_contracts = (args.contracts_root / "modules").is_dir()
-    if global_contracts:
+    if global_contracts and not args.module:
         errors.extend(validate_contracts_readme(args.contracts_root, modules))
     offline_endpoints: list[dict[str, Any]] = []
     if openapi_path is not None:
         if not openapi_path.is_file():
             errors.append(f"offline OpenAPI document does not exist: {openapi_path}")
         else:
+            openapi_sha256 = hashlib.sha256(openapi_path.read_bytes()).hexdigest()
             try:
                 offline_document = load_document(openapi_path)
                 provenance = offline_document.get("provenance") if isinstance(offline_document, dict) else None
@@ -1537,7 +1802,7 @@ def main() -> int:
                 offline = extract(openapi_path, offline_document)
                 offline_endpoints = offline["endpoints"]
                 offline_inventory_count = len(offline["endpoints"])
-                if global_contracts:
+                if global_contracts and not args.module:
                     offline_by_id = {str(item["id"]): item for item in offline["endpoints"]}
                     manifest_by_id = {
                         str(item.get("id")): item
@@ -1573,12 +1838,23 @@ def main() -> int:
                         f"manifest operation {method} {path} is not present in offline OpenAPI"
                         for method, path in sorted(set(manifest_keys) - set(offline_keys))
                     )
+                elif args.module:
+                    offline_keys = {
+                        (str(item.get("method", "")).upper(), str(item.get("path", "")))
+                        for item in offline["endpoints"]
+                    }
+                    errors.extend(
+                        f"manifest operation {item.get('method')} {item.get('path')} is not present in offline OpenAPI"
+                        for _, item in endpoint_records
+                        if (str(item.get("method", "")).upper(), str(item.get("path", ""))) not in offline_keys
+                    )
+                    offline_inventory_count = len(endpoint_records)
             except (SystemExit, ValueError, TypeError) as exc:
                 errors.append(f"cannot reconcile offline OpenAPI {openapi_path}: {exc}")
-    if offline_endpoints:
+    if offline_endpoints and not args.module:
         errors.extend(validate_tag_partition(module_map_doc, endpoint_records, offline_endpoints))
     index_path = args.contracts_root / "index.yaml"
-    if not index_path.is_file() and global_contracts:
+    if not index_path.is_file() and global_contracts and not args.module:
         errors.append(f"missing global index.yaml: {index_path}")
     if index_path.is_file():
         index = load_data(index_path)
@@ -1588,8 +1864,9 @@ def main() -> int:
         errors.extend(f"index.yaml repeats module id {module_id}" for module_id in duplicate_index_ids)
         declared = {str(item.get("id")): item for item in index_modules}
         actual = {module_id for module_id, _ in modules}
-        errors.extend(f"index.yaml lists missing module {module_id}" for module_id in sorted(set(declared) - actual))
-        errors.extend(f"module {module_id} is missing from index.yaml" for module_id in sorted(actual - set(declared)))
+        if not args.module:
+            errors.extend(f"index.yaml lists missing module {module_id}" for module_id in sorted(set(declared) - actual))
+            errors.extend(f"module {module_id} is missing from index.yaml" for module_id in sorted(actual - set(declared)))
 
     module_reports = {}
     module_tags = {
@@ -1617,10 +1894,8 @@ def main() -> int:
             require_scenarios=args.require_scenarios,
             module_tag=module_tags.get(module_id),
             strict_bru_modules=(args.contracts_root / "modules").is_dir(),
-            require_signing=args.require_signing or (args.require_auth and auth_config_valid),
-            required_auth_markers=required_auth_markers,
             bru_module_name=module_dir.name,
-            required_base_url_env=required_base_url_env if args.require_auth else None,
+            selected_risks=selected_risks,
         )
         module_reports[module_id] = report
         for key in totals:
@@ -1671,10 +1946,16 @@ def main() -> int:
         "blocked_modules": sum(value.get("status") == "blocked" for value in module_reports.values()),
         "errors": errors,
         "static_ok": static_ok,
+        "static_ready": static_ok,
+        "context_ready": bool(isinstance(preflight, dict) and preflight.get("context_ready") is True),
+        "execution_ready": bool(isinstance(preflight, dict) and preflight.get("execution_ready") is True),
         "completion_ok": completion_ok,
         "status": status,
         "ok": completion_ok,
         "contract_provenance_unverified": contract_provenance_unverified,
+        "execution_scope": sorted(selected_risks),
+        "module_scope": args.module,
+        "openapi_sha256": openapi_sha256,
         "by_tag": {
             module_id: {
                 "swagger_tag": report.get("swagger_tag"),
@@ -1689,7 +1970,8 @@ def main() -> int:
             for module_id, report in module_reports.items()
         },
     }
-    sync_global_index(args.contracts_root / "index.yaml", status, totals, module_reports)
+    if not args.module:
+        sync_global_index(args.contracts_root / "index.yaml", status, totals, module_reports)
     if args.as_json:
         print(json.dumps(report, ensure_ascii=True, indent=2))
     else:
