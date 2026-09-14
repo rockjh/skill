@@ -1,0 +1,39 @@
+# mno-bruno-qa CLI
+
+The skill is installable as a Python package with the `mno-bruno-qa` console
+command:
+
+```bash
+pipx install /path/to/bru-api-test-generator
+```
+
+Supported commands:
+
+```text
+mno-bruno-qa init
+mno-bruno-qa generate
+mno-bruno-qa check
+mno-bruno-qa run
+mno-bruno-qa preflight
+mno-bruno-qa reconcile
+mno-bruno-qa scripts sync
+mno-bruno-qa scripts check
+```
+
+Transition mode is the default: `init` synchronizes the complete Python bundle
+into `qa/scripts`, writes `README.md`, and creates `scripts-version.yaml` with
+skill/script versions, source, aggregate/per-file SHA, and synchronization
+time. Run `scripts check` after upgrading the installed skill and `scripts
+sync` to update a project explicitly.
+
+Shared mode is opt-in with `init --shared-cli` or `generate --shared-cli`.
+`qa/qa.yaml` records `tooling: shared-cli`; launchers call the installed
+command and the business repository keeps only Bruno, contracts, execution
+assets, and `qa.yaml`.
+
+`generate --incremental` updates only affected modules and accepts repeated
+`--source-root` arguments for source enhancement. `check` performs strict
+static reconciliation. `preflight` builds a fresh static report and evaluates
+runtime readiness. `reconcile` requires both normalized results and preflight
+results. `run` performs the complete version, preflight, risk-filtered Bruno,
+normalization, reconciliation, and global completion pipeline.

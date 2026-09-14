@@ -10,6 +10,8 @@ import sys
 import tempfile
 import unittest
 
+import yaml
+
 
 ROOT = Path(__file__).parents[1]
 os.environ.setdefault("PYTHONUTF8", "1")
@@ -42,8 +44,8 @@ def static_preflight_inputs(root: Path) -> tuple[Path, Path]:
 
 def execution_fixture(
     root: Path,
-    auth: dict | None = None,
-    custom_headers: dict | None = None,
+    sign: str = "disabled",
+    headers: dict[str, str] | None = None,
     environment: dict[str, str] | None = None,
 ) -> tuple[Path, Path]:
     execution = root / "execution"
@@ -52,13 +54,13 @@ def execution_fixture(
     config = execution / "config.yaml"
     config.write_text(json.dumps({
         "active_environment": "local",
-        "auth": auth or {"mode": "none"},
-        "custom_headers": custom_headers or {},
+        "sign": sign,
     }, ensure_ascii=False), encoding="utf-8")
     env_file = environments / "local.bru"
     values = {"BASE_URL": "http://127.0.0.1:18080", **(environment or {})}
     env_file.write_text(
-        "vars {\n" + "".join(f"  {name}: {value}\n" for name, value in values.items()) + "}\n",
+        "vars {\n" + "".join(f"  {name}: {value}\n" for name, value in values.items()) + "}\n"
+        + ("headers {\n" + "".join(f"  {name}: {value}\n" for name, value in (headers or {}).items()) + "}\n" if headers else ""),
         encoding="utf-8",
     )
     return config, env_file
@@ -165,21 +167,16 @@ class RegressionTests(unittest.TestCase):
         config = load_script("execution_config")
         valid = config.validate_execution_config({
             "active_environment": "local",
-            "auth": {"mode": "bearer", "token_env": "ACCESS_TOKEN"},
-            "custom_headers": {
-                "operatorInfo": {"env": "OPERATOR_INFO", "paths": ["/v*/admin/**"]},
-                "X-Gray-Traffic": {"value": "true"},
-            },
+            "sign": "disabled",
         })
-        self.assertEqual(valid["auth"]["mode"], "bearer")
+        self.assertEqual(valid, {"active_environment": "local", "sign": "disabled"})
         for invalid in (
-            {"version": 1, "active_environment": "local", "auth": {"mode": "none"}},
-            {"active_environment": "local.bru", "auth": {"mode": "none"}},
-            {"active_environment": "local:bad", "auth": {"mode": "none"}},
-            {"active_environment": "local", "auth": {"mode": "oauth2"}},
-            {"active_environment": "local", "auth": {"mode": "bearer"}},
-            {"active_environment": "local", "auth": {"mode": "none"}, "custom_headers": {"X-Test": {"env": "A", "value": "b"}}},
-            {"active_environment": "local", "auth": {"mode": "none"}, "custom_headers": {1: {"value": "x"}}},
+            {"version": 1, "active_environment": "local", "sign": "disabled"},
+            {"active_environment": "local.bru", "sign": "disabled"},
+            {"active_environment": "local:bad", "sign": "disabled"},
+            {"active_environment": "local", "sign": "enabled"},
+            {"active_environment": "local", "sign": "disabled", "auth": {}},
+            {"active_environment": "local", "sign": "disabled", "custom_headers": {}},
         ):
             with self.assertRaises(ValueError):
                 config.validate_execution_config(invalid)
@@ -322,14 +319,16 @@ class RegressionTests(unittest.TestCase):
             self.assertTrue((root / "contracts" / "security-profile.yaml").is_file())
             config_text = (root / "execution" / "config.yaml").read_text(encoding="utf-8")
             self.assertIn("active_environment: local", config_text)
-            self.assertIn("mode: none", config_text)
+            self.assertIn("sign: disabled", config_text)
+            self.assertNotIn("auth:", config_text)
+            self.assertNotIn("custom_headers:", config_text)
             self.assertNotIn("version:", config_text)
             self.assertTrue((root / "execution" / "environments" / "local.bru").is_file())
             self.assertFalse((root / "bruno" / "environments").exists())
             self.assertTrue((root / "execution" / "run.bat").is_file())
             self.assertTrue((root / "execution" / "run.sh").is_file())
-            self.assertIn("run_bruno.py\" %*", (root / "execution" / "run.bat").read_text(encoding="utf-8"))
-            self.assertIn('run_bruno.py" "$@"', (root / "execution" / "run.sh").read_text(encoding="utf-8"))
+            self.assertIn("mno_bruno_qa.py\" run", (root / "execution" / "run.bat").read_text(encoding="utf-8"))
+            self.assertIn('mno_bruno_qa.py" run', (root / "execution" / "run.sh").read_text(encoding="utf-8"))
             self.assertEqual(
                 sorted(path.name for path in (root / "execution" / "environments").glob("*.bru")),
                 ["local.bru"],
@@ -570,7 +569,7 @@ class RegressionTests(unittest.TestCase):
             {"method": "GET", "path": "/traffic"},
         )
         self.assertIn("name: traffic_query_success", rendered)
-        self.assertIn("url: {{BASE_URL}}/traffic", rendered)
+        self.assertIn("url: {{baseUrl}}/traffic", rendered)
 
     def test_materializer_rejects_explicit_case_id_filename(self):
         materializer = load_script("materialize_missing_bru")
@@ -754,6 +753,7 @@ class RegressionTests(unittest.TestCase):
             "parameters": [
                 {"name": "status", "required": True, "schema": {"enum": ["ON", "OFF"]}},
                 {"name": "pageNum", "schema": {"type": "integer"}},
+                {"name": "operatorInfo", "in": "header", "required": True, "schema": {"type": "string"}},
             ],
             "request_body": {"content": {"multipart/form-data": {"schema": {
                 "type": "object",
@@ -768,6 +768,8 @@ class RegressionTests(unittest.TestCase):
         )
         self.assertTrue(all(case["review_required"] is True for case in seeded))
         self.assertTrue(all("business_error" != case["scenario"] for case in seeded))
+        header_case = next(case for case in seeded if case["id"].endswith("MISSING_OPERATORINFO"))
+        self.assertEqual(header_case["request"]["omit_common_headers"], ["operatorInfo"])
 
     def test_seed_cases_populate_success_body_and_omit_each_required_field(self):
         parser = load_script("parse_openapi")
@@ -823,12 +825,10 @@ class RegressionTests(unittest.TestCase):
             root = Path(directory)
             config, env_file = execution_fixture(
                 root,
-                custom_headers={
-                    "operatorInfo": {"env": "OPERATOR_INFO", "paths": ["/admin/**"]},
-                },
+                headers={"operatorInfo": "{{OPERATOR_INFO}}"},
             )
             loaded = execution_config.load_execution_config(config)
-            self.assertEqual(execution_config.required_environment_names(loaded), ["BASE_URL"])
+            self.assertEqual(execution_config.required_environment_names(loaded), [])
             openapi, static_results = static_preflight_inputs(root)
             result = subprocess.run(
                 [
@@ -874,7 +874,6 @@ class RegressionTests(unittest.TestCase):
             self.assertTrue(any("URL path" in error for error in errors))
             self.assertTrue(any("Bruno query" in error for error in errors))
             self.assertTrue(any("body type" in error for error in errors))
-            self.assertTrue(any("request field name" in error for error in errors))
 
     def test_coverage_allows_required_body_field_to_be_omitted_by_negative_case(self):
         coverage = load_script("check_api_coverage")
@@ -1079,16 +1078,12 @@ class RegressionTests(unittest.TestCase):
         execution_config = load_script("execution_config")
         config = execution_config.validate_execution_config({
             "active_environment": "local",
-            "auth": {
-                "mode": "seres-sign",
-                "secret_key_env": "SIGN_SECRET",
-                "access_key_env": "SIGN_ACCESS",
-            },
+            "sign": "seres-sign",
         })
         script = execution_config.COLLECTION_TEMPLATE
         self.assertEqual(
             execution_config.required_environment_names(config),
-            ["BASE_URL", "SIGN_ACCESS", "SIGN_SECRET"],
+            ["ACCESS_KEY", "SECRET_KEY"],
         )
         self.assertIn('CryptoJS.SHA256(signText)', script)
         self.assertIn('setCommonHeader("sign"', script)
@@ -1097,34 +1092,21 @@ class RegressionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             execution_config.validate_execution_config({
                 "active_environment": "local",
-                "auth": {
-                    "mode": "seres-sign",
-                    "secret_key_env": "SIGN_SECRET",
-                    "access_key_env": "SIGN_ACCESS",
-                    "algorithm": "SHA512",
-                },
+                "sign": "SHA512",
             })
 
-    def test_custom_header_objects_and_preflight_variables_are_supported(self):
+    def test_environment_headers_are_resolved_and_injected(self):
         execution_config = load_script("execution_config")
-        config = execution_config.validate_execution_config({
-            "active_environment": "local",
-            "auth": {"mode": "bearer", "token_env": "SERVICE_TOKEN"},
-            "custom_headers": {
-                "operatorInfo": {"env": "OPERATOR_INFO", "paths": ["/v*/admin/**"]},
-                "X-Gray-Traffic": {"value": "true", "paths": ["/v*/internal/**"]},
-            },
-        })
-        self.assertEqual(
-            execution_config.required_environment_names(config),
-            ["BASE_URL", "SERVICE_TOKEN"],
-        )
-        payload = json.loads(execution_config.runtime_payload(config))
-        self.assertEqual(payload["custom_headers"]["operatorInfo"]["env"], "OPERATOR_INFO")
-        self.assertEqual(payload["custom_headers"]["X-Gray-Traffic"]["value"], "true")
+        config = execution_config.validate_execution_config({"active_environment": "local", "sign": "disabled"})
+        environment = {
+            "vars": {"BASE_URL": "http://localhost", "SERVICE_TOKEN": "secret"},
+            "headers": {"Authorization": "Bearer {{SERVICE_TOKEN}}", "operatorInfo": "qa"},
+        }
+        payload = json.loads(execution_config.runtime_payload(config, environment))
+        self.assertEqual(payload["headers"]["Authorization"], "Bearer secret")
+        self.assertEqual(payload["headers"]["operatorInfo"], "qa")
         script = execution_config.COLLECTION_TEMPLATE
-        self.assertIn("globMatches(pattern, requestPath)", script)
-        self.assertIn("bru.getEnvVar(settings.env)", script)
+        self.assertIn("runtimeConfig.headers", script)
         self.assertIn("if (value === undefined || value === null || value === \"\") return", script)
         self.assertIn("const current = req.getHeader(name)", script)
         self.assertIn("if (current === undefined || current === null)", script)
@@ -1324,22 +1306,21 @@ class RegressionTests(unittest.TestCase):
         errors = coverage.flow_execution_errors([flow], {"executed": ["THING_OK"], "passed": ["THING_OK"]})
         self.assertIn("flow THING_FLOW has no execution evidence", errors)
 
-    def test_bearer_api_key_and_cookie_auth_are_environment_backed(self):
+    def test_authorization_api_key_and_cookie_are_plain_environment_headers(self):
         execution_config = load_script("execution_config")
-        modes = (
-            ({"mode": "bearer", "token_env": "ACCESS_TOKEN"}, "ACCESS_TOKEN"),
-            ({"mode": "api-key", "key_env": "API_KEY"}, "API_KEY"),
-            ({"mode": "cookie", "cookie_env": "SESSION"}, "SESSION"),
-        )
-        for auth, expected in modes:
-            config = execution_config.validate_execution_config({
-                "active_environment": "local",
-                "auth": auth,
-            })
-            self.assertEqual(
-                execution_config.required_environment_names(config),
-                ["BASE_URL", expected],
-            )
+        document = {
+            "vars": {"ACCESS_TOKEN": "token", "API_KEY": "key", "SESSION": "cookie"},
+            "headers": {
+                "Authorization": "Bearer {{ACCESS_TOKEN}}",
+                "X-API-Key": "{{API_KEY}}",
+                "Cookie": "{{SESSION}}",
+            },
+        }
+        self.assertEqual(execution_config.resolved_environment_headers(document), {
+            "Authorization": "Bearer token",
+            "X-API-Key": "key",
+            "Cookie": "cookie",
+        })
 
     def test_cross_language_source_scanner_is_not_java_only(self):
         scanner = load_script("analyze_source_logic")
@@ -1575,7 +1556,7 @@ class RegressionTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (bru / "01-查询事物列表成功.bru").write_text(
-                "meta {\n  name: THING_LIST_OK\n  type: http\n}\nget {\n  url: {{BASE_URL}}/things\n}\nassert {\n  res.status: eq 200\n  res.body.code: eq 0\n  res.body.data: eq {}\n}\n",
+                "meta {\n  name: THING_LIST_OK\n  type: http\n  tags: [read-only]\n}\nget {\n  url: {{BASE_URL}}/things\n}\nassert {\n  res.status: eq 200\n  res.body.code: eq 0\n  res.body.data: eq {}\n}\n",
                 encoding="utf-8",
             )
             result = subprocess.run(
@@ -1614,6 +1595,350 @@ class RegressionTests(unittest.TestCase):
             self.assertFalse(verified_report["completion_ok"])
             self.assertEqual(verified_report["status"], "blocked")
             self.assertTrue(any("completion requires --require-scenarios" in error for error in verified_report["errors"]))
+
+    def test_nested_json_body_is_compared_structurally(self):
+        coverage = load_script("check_api_coverage")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            title = "批量更新 AC 信息成功"
+            case = {
+                "id": "AC_BATCH_UPDATE_SUCCESS",
+                "title": title,
+                "endpoint_id": "AC_BATCH_UPDATE",
+                "bru": f"01-{title}.bru",
+                "risk": "isolated-write",
+                "request": {
+                    "body_type": "application/json",
+                    "body": {
+                        "payload": {
+                            "pdid": "p-1",
+                            "items": [{"url": "https://example.invalid/ac", "totalNum": 2}],
+                        }
+                    },
+                },
+                "expected": {"http_status": 200},
+                "assertions": [{"path": "$.data.accepted", "equals": True}],
+            }
+            (root / case["bru"]).write_text(
+                "meta {\n  name: AC_BATCH_UPDATE_SUCCESS\n  type: http\n  tags: [isolated-write]\n}\n"
+                "post {\n  url: {{BASE_URL}}/ac/batch\n  body: json\n}\n"
+                "body:json {\n"
+                "  {\n    \"payload\": {\n      \"pdid\": \"p-1\",\n"
+                "      \"items\": [{\"url\": \"https://example.invalid/ac\", \"totalNum\": 2}]\n    }\n  }\n"
+                "}\nassert {\n  res.status: eq 200\n  res.body.data.accepted: eq true\n}\n",
+                encoding="utf-8",
+            )
+            endpoint = {"id": "AC_BATCH_UPDATE", "method": "POST", "path": "/ac/batch"}
+            _, _, _, errors = coverage.case_files([case], root, {endpoint["id"]: endpoint})
+            self.assertEqual(errors, [])
+
+            changed = (root / case["bru"]).read_text(encoding="utf-8").replace('"totalNum": 2', '"totalNum": 3')
+            (root / case["bru"]).write_text(changed, encoding="utf-8")
+            _, _, _, errors = coverage.case_files([case], root, {endpoint["id"]: endpoint})
+            self.assertTrue(any("body content does not match" in error for error in errors))
+
+    def test_invalid_bruno_json_body_has_an_explicit_parse_error(self):
+        coverage = load_script("check_api_coverage")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            title = "新增 AC 信息成功"
+            case = {
+                "id": "AC_CREATE_SUCCESS",
+                "title": title,
+                "endpoint_id": "AC_CREATE",
+                "bru": f"01-{title}.bru",
+                "risk": "isolated-write",
+                "request": {"body_type": "application/json", "body": {"pdid": "p-1"}},
+                "expected": {"http_status": 200},
+                "assertions": [{"path": "$.data.id", "equals": "1"}],
+            }
+            (root / case["bru"]).write_text(
+                "meta {\n  name: AC_CREATE_SUCCESS\n  type: http\n  tags: [isolated-write]\n}\n"
+                "post {\n  url: {{BASE_URL}}/ac\n  body: json\n}\n"
+                "body:json {\n  {\"pdid\": \"p-1\",}\n}\n"
+                "assert {\n  res.status: eq 200\n  res.body.data.id: eq \"1\"\n}\n",
+                encoding="utf-8",
+            )
+            endpoint = {"id": "AC_CREATE", "method": "POST", "path": "/ac"}
+            _, _, _, errors = coverage.case_files([case], root, {endpoint["id"]: endpoint})
+            self.assertTrue(any("invalid JSON at line" in error and "column" in error for error in errors), errors)
+
+    def test_seed_titles_use_endpoint_business_semantics(self):
+        parser = load_script("parse_openapi")
+        cases = (
+            ({"id": "LIST", "method": "GET", "operation_id": "listByPage", "tags": ["AC"], "responses": {"200": {}}}, "分页查询 AC 信息成功"),
+            ({"id": "GROUP", "method": "POST", "operation_id": "batchChangeGroup", "tags": ["AC"], "responses": {"200": {}}}, "批量变更 AC 分组成功"),
+            ({"id": "DELETE", "method": "DELETE", "operation_id": "batchDelete", "tags": ["AC"], "responses": {"200": {}}}, "批量删除 AC 信息成功"),
+            ({"id": "IMPORT", "method": "POST", "operation_id": "importAc", "tags": ["AC"], "responses": {"202": {}}}, "导入 AC 文件成功受理"),
+        )
+        for endpoint, expected in cases:
+            self.assertEqual(parser.seed_contract_cases(endpoint)[0]["title"], expected)
+
+    def test_scenario_matrix_is_inferred_from_real_contract_features(self):
+        parser = load_script("parse_openapi")
+        endpoint = {
+            "id": "AC_LIST",
+            "method": "GET",
+            "path": "/v1/admin/ac",
+            "security": [{"bearerAuth": []}],
+            "parameters": [
+                {"name": "pageNum", "in": "query", "schema": {"type": "integer", "minimum": 1}},
+                {"name": "status", "in": "query", "schema": {"type": "string", "enum": ["ON", "OFF"]}},
+                {"name": "operatorInfo", "in": "header", "required": True, "schema": {"type": "string"}},
+            ],
+            "responses": {"200": {}, "400": {}},
+        }
+        matrix = parser.inferred_scenario_matrix(endpoint)
+        self.assertTrue(matrix["authentication"]["applicable"])
+        self.assertTrue(matrix["authorization"]["applicable"])
+        self.assertTrue(matrix["query"]["applicable"])
+        self.assertTrue(matrix["validation"]["applicable"])
+        self.assertTrue(all(item["status"] == "inferred" for item in matrix.values()))
+        seeded_ids = {case["id"] for case in parser.seed_contract_cases(endpoint)}
+        self.assertIn("AC_LIST_MISSING_OPERATORINFO", seeded_ids)
+        self.assertIn("AC_LIST_INVALID_STATUS", seeded_ids)
+        self.assertIn("AC_LIST_BOUNDARY_PAGENUM", seeded_ids)
+
+    def test_script_bundle_sync_is_versioned_and_checkable(self):
+        manager = load_script("scripts_manager")
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = Path(directory) / "qa"
+            changed = manager.sync_scripts(qa_root, ROOT / "scripts")
+            self.assertTrue(changed)
+            self.assertEqual(manager.check_scripts(qa_root, ROOT / "scripts"), [])
+            metadata = load_script("manifest_io").load_data(qa_root / "scripts" / "scripts-version.yaml")
+            for key in ("skill_version", "scripts_version", "source_repository", "scripts_sha256", "synchronized_at", "files"):
+                self.assertIn(key, metadata)
+            (qa_root / "scripts" / "run_bruno.py").write_text("outdated", encoding="utf-8")
+            self.assertTrue(any("outdated" in error for error in manager.check_scripts(qa_root, ROOT / "scripts")))
+
+    def test_risk_plans_and_confirmations_are_enforced(self):
+        runner = load_script("run_bruno")
+        with tempfile.TemporaryDirectory() as directory:
+            plans = Path(directory) / "plans.yaml"
+            plans.write_text(json.dumps({"plans": {"regression": {"risks": ["read-only", "isolated-write"]}}}), encoding="utf-8")
+            risks, name, plan = runner.execution_scope(plans, "regression", None)
+            self.assertEqual(risks, {"read-only", "isolated-write"})
+            self.assertEqual(name, "regression")
+            self.assertIn("--confirm-write", runner.confirmation_error(risks, plan, False, False, False))
+            self.assertIsNone(runner.confirmation_error(risks, plan, True, False, False))
+            self.assertIn(
+                "--confirm-destructive",
+                runner.confirmation_error({"destructive"}, {}, True, False, False),
+            )
+            self.assertIn(
+                "--confirm-external",
+                runner.confirmation_error({"external-side-effect"}, {}, False, False, False),
+            )
+
+    def test_incremental_generation_skips_unchanged_module_and_marks_manual_case(self):
+        parser = load_script("parse_openapi")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = root / "contracts" / "openapi.json"
+            module_map = root / "contracts" / "module-map.yaml"
+            output = root / "contracts" / "modules"
+            spec.parent.mkdir(parents=True)
+            document = {
+                "openapi": "3.0.0",
+                "paths": {"/ac": {"get": {
+                    "operationId": "listByPage",
+                    "tags": ["AC"],
+                    "responses": {"200": {}},
+                }}},
+            }
+            spec.write_text(json.dumps(document), encoding="utf-8")
+            module_map.write_text(json.dumps({"modules": [{"id": "ac", "name": "AC", "directory": "AC", "swagger_tags": ["AC"]}]}), encoding="utf-8")
+            manifest = parser.extract(spec, document)
+            parser.write_partitioned(manifest, module_map, output, seed_cases=True)
+            second = parser.write_partitioned(manifest, module_map, output, seed_cases=True, incremental=True)
+            self.assertEqual(second["changed_modules"], [])
+            self.assertEqual(second["skipped_modules"], ["ac"])
+            cases_path = output / "AC" / "cases.yaml"
+            cases = parser.load_document(cases_path)
+            cases["cases"][0]["description"] = "人工调整后的业务说明"
+            cases_path.write_text(parser.render_manifest(cases, cases_path), encoding="utf-8")
+            third = parser.write_partitioned(manifest, module_map, output, seed_cases=True, incremental=True)
+            self.assertIn(cases["cases"][0]["id"], third["manual_review_cases"])
+            preserved = parser.load_document(cases_path)["cases"][0]
+            self.assertEqual(preserved["description"], "人工调整后的业务说明")
+            self.assertTrue(preserved["manual_review"])
+            self.assertTrue((root / "contracts" / "generation-state.yaml").is_file())
+            self.assertTrue((root / "contracts" / "qa-lock.yaml").is_file())
+
+    def test_source_scanner_marks_business_errors_and_required_headers_for_coverage(self):
+        scanner = load_script("analyze_source_logic")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "AcController.java").write_text(
+                '@RequestHeader("operatorInfo") String operatorInfo;\n'
+                'if (groupInUse) throw new BusinessException("143000");\n',
+                encoding="utf-8",
+            )
+            result = scanner.scan([root])
+        required = [item for item in result["candidates"] if item.get("coverage_required")]
+        self.assertTrue(any(item.get("required_header") == "operatorInfo" for item in required))
+        self.assertTrue(any("143000" in item.get("expected_business_codes", []) for item in required))
+
+    def test_source_enhancement_seeds_required_header_and_business_error_drafts(self):
+        scanner = load_script("analyze_source_logic")
+        parser = load_script("parse_openapi")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            (source / "AcController.java").write_text(
+                '@RequestHeader("operatorInfo") String operatorInfo;\n'
+                'if (groupInUse) throw new BusinessException("143000");\n',
+                encoding="utf-8",
+            )
+            contracts = root / "qa" / "contracts"
+            module = contracts / "modules" / "AC"
+            module.mkdir(parents=True)
+            endpoint = {
+                "id": "AC_DELETE",
+                "method": "DELETE",
+                "path": "/v0/admin/ac/{id}",
+                "operation_id": "deleteAc",
+                "tags": ["AC"],
+                "responses": {"200": {}, "400": {}},
+            }
+            endpoint["scenario_matrix"] = parser.inferred_scenario_matrix(endpoint)
+            (module / "endpoints.yaml").write_text(
+                yaml.safe_dump({
+                    "version": 1,
+                    "module": "ac",
+                    "name": "AC",
+                    "swagger_tag": "AC",
+                    "endpoints": [endpoint],
+                }, sort_keys=False, allow_unicode=True),
+                encoding="utf-8",
+            )
+            (module / "cases.yaml").write_text(
+                yaml.safe_dump({"version": 1, "module": "ac", "swagger_tag": "AC", "cases": []}),
+                encoding="utf-8",
+            )
+            (module / "logic.yaml").write_text(
+                yaml.safe_dump({"version": 1, "module": "ac", "swagger_tag": "AC", "logic": []}),
+                encoding="utf-8",
+            )
+            result = scanner.scan([source])
+            self.assertEqual(scanner.apply_candidates(result, contracts), [])
+            cases = parser.load_document(module / "cases.yaml")["cases"]
+            header_case = next(case for case in cases if case["id"].endswith("MISSING_OPERATORINFO"))
+            self.assertEqual(header_case["request"]["omit_common_headers"], ["operatorInfo"])
+            self.assertTrue(any(case.get("expected", {}).get("business_code") == "143000" for case in cases))
+            updated_endpoint = parser.load_document(module / "endpoints.yaml")["endpoints"][0]
+            self.assertTrue(updated_endpoint["scenario_matrix"]["authentication"]["applicable"])
+            self.assertTrue(updated_endpoint["scenario_matrix"]["business_error"]["applicable"])
+            logic = parser.load_document(module / "logic.yaml")["logic"]
+            self.assertTrue(all(item.get("case_ids") for item in logic))
+
+    def test_legacy_execution_config_is_migrated_to_environment_headers(self):
+        execution_config = load_script("execution_config")
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = Path(directory) / "qa"
+            execution = qa_root / "execution"
+            environments = execution / "environments"
+            environments.mkdir(parents=True)
+            (execution / "config.yaml").write_text(
+                "active_environment: local\n"
+                "auth:\n"
+                "  mode: bearer\n"
+                "  token_env: AUTH_TOKEN\n"
+                "custom_headers:\n"
+                "  operatorInfo:\n"
+                "    env: OPERATOR_INFO\n",
+                encoding="utf-8",
+            )
+            (environments / "local.bru").write_text(
+                "vars {\n  BASE_URL: http://localhost\n  AUTH_TOKEN: token\n  OPERATOR_INFO: operator\n}\n",
+                encoding="utf-8",
+            )
+            execution_config.initialize_execution_layout(qa_root)
+            self.assertEqual(
+                execution_config.load_execution_config(execution / "config.yaml"),
+                {"active_environment": "local", "sign": "disabled"},
+            )
+            environment = execution_config.load_bruno_environment_document(environments / "local.bru")
+            self.assertEqual(environment["headers"]["Authorization"], "Bearer {{AUTH_TOKEN}}")
+            self.assertEqual(environment["headers"]["operatorInfo"], "{{OPERATOR_INFO}}")
+
+    def test_shared_cli_mode_keeps_asset_only_layout(self):
+        execution_config = load_script("execution_config")
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = Path(directory) / "qa"
+            execution_config.initialize_execution_layout(qa_root, local_scripts=False)
+            self.assertFalse((qa_root / "scripts").exists())
+            self.assertIn("tooling: shared-cli", (qa_root / "qa.yaml").read_text(encoding="utf-8"))
+            self.assertIn("mno-bruno-qa run", (qa_root / "execution" / "run.bat").read_text(encoding="utf-8"))
+            self.assertIn("mno-bruno-qa run", (qa_root / "execution" / "run.sh").read_text(encoding="utf-8"))
+
+    def test_public_cli_routes_help_to_the_subcommand(self):
+        completed = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "mno_bruno_qa.py"), "generate", "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        self.assertEqual(completed.returncode, 0)
+        self.assertIn("--incremental", completed.stdout)
+        self.assertIn("--shared-cli", completed.stdout)
+        run_help = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "mno_bruno_qa.py"), "run", "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        self.assertEqual(run_help.returncode, 0)
+        self.assertIn("--confirm-destructive", run_help.stdout)
+
+    def test_qa_lock_accepts_yaml_openapi(self):
+        qa_lock = load_script("qa_lock")
+        with tempfile.TemporaryDirectory() as directory:
+            contracts = Path(directory)
+            openapi = contracts / "openapi.yaml"
+            openapi.write_text("openapi: 3.0.0\npaths: {}\n", encoding="utf-8")
+            digest = hashlib.sha256(openapi.read_bytes()).hexdigest()
+            state = {
+                "openapi_sha256": digest,
+                "modules": {},
+                "cases": {},
+            }
+            (contracts / "generation-state.yaml").write_text(
+                yaml.safe_dump(state, sort_keys=False),
+                encoding="utf-8",
+            )
+            qa_lock.write(contracts)
+            self.assertEqual(qa_lock.check(contracts), [])
+
+    def test_qa_lock_detects_case_asset_drift(self):
+        qa_lock = load_script("qa_lock")
+        with tempfile.TemporaryDirectory() as directory:
+            contracts = Path(directory)
+            module = contracts / "modules" / "things"
+            module.mkdir(parents=True)
+            case = {"id": "THING_OK", "endpoint_id": "THING", "title": "查询事物成功"}
+            cases_path = module / "cases.yaml"
+            cases_path.write_text(
+                yaml.safe_dump({"module": "things", "cases": [case]}, sort_keys=False, allow_unicode=True),
+                encoding="utf-8",
+            )
+            (contracts / "generation-state.yaml").write_text(
+                yaml.safe_dump({"openapi_sha256": None, "modules": {}, "cases": {}}, sort_keys=False),
+                encoding="utf-8",
+            )
+            qa_lock.refresh_generation_state_cases(contracts)
+            qa_lock.write(contracts)
+            self.assertEqual(qa_lock.check(contracts), [])
+            case["title"] = "人工修改后的查询事物成功"
+            cases_path.write_text(
+                yaml.safe_dump({"module": "things", "cases": [case]}, sort_keys=False, allow_unicode=True),
+                encoding="utf-8",
+            )
+            self.assertTrue(any("case fingerprints" in error for error in qa_lock.check(contracts)))
 
 
 if __name__ == "__main__":

@@ -109,7 +109,7 @@ def display_case_file(
     return Path(f"{case_sequence(case, position):02d}-{stem}.bru")
 
 
-def request_url(endpoint: dict[str, Any], request: dict[str, Any], base_env: str = "BASE_URL") -> str:
+def request_url(endpoint: dict[str, Any], request: dict[str, Any], base_env: str = "baseUrl") -> str:
     path = str(request.get("path") or endpoint.get("path") or "/")
     path = re.sub(r"(?<!\{)\{([^{}]+)\}(?!\})", lambda match: "{{" + match.group(1) + "}}", path)
     query = request.get("query")
@@ -317,7 +317,7 @@ def render_case(
 ) -> str:
     request = case.get("request") if isinstance(case.get("request"), dict) else {}
     method = str(endpoint.get("method", "GET")).lower()
-    base_env = "BASE_URL"
+    base_env = "baseUrl"
     title = str(case.get("title") or case.get("display_name") or case.get("name") or endpoint.get("summary") or case.get("id"))
     description = str(
         case.get("description")
@@ -332,11 +332,14 @@ def render_case(
             request["content_type"] = inferred_content_type
     kind = body_kind(request, body)
     sequence = sequence if sequence is not None else case.get("sequence", case.get("seq", 1))
+    risk = str(case.get("risk") or ("read-only" if method.upper() in {"GET", "HEAD", "OPTIONS"} else "isolated-write"))
+    tags = list(dict.fromkeys([risk, *[str(tag) for tag in case.get("_execution_tags", [])]]))
     lines = [
         "meta {",
         f"  name: {case.get('id')}",
         "  type: http",
         f"  seq: {sequence}",
+        f"  tags: [{', '.join(tags)}]",
         "}",
         "",
         f"{method} {{",
@@ -466,6 +469,50 @@ def ensure_request_script(content: str, case: dict[str, Any]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def ensure_execution_tags(content: str, tags: list[str]) -> str:
+    meta = re.search(r"(?ms)^\s*meta\s*\{(.*?)^\s*\}", content)
+    if meta is None:
+        raise ValueError("business Bruno request has no meta block")
+    line = f"  tags: [{', '.join(tags)}]"
+    block = meta.group(0)
+    if re.search(r"(?m)^\s*tags:\s*.*$", block):
+        updated = re.sub(r"(?m)^\s*tags:\s*.*$", line, block, count=1)
+    else:
+        updated = block[:-1].rstrip() + "\n" + line + "\n}"
+    return content[:meta.start()] + updated + content[meta.end():]
+
+
+def case_risk(case: dict[str, Any], endpoint: dict[str, Any]) -> str:
+    declared = str(case.get("risk", "")).strip()
+    if declared:
+        return declared
+    return "read-only" if str(endpoint.get("method", "GET")).upper() in {"GET", "HEAD", "OPTIONS"} else "isolated-write"
+
+
+def execution_plan_tags(
+    cases: list[dict[str, Any]],
+    endpoints: dict[str, dict[str, Any]],
+    plans: dict[str, Any],
+) -> dict[str, list[str]]:
+    result: dict[str, list[str]] = {str(case.get("id")): [] for case in cases if case.get("id")}
+    for plan_name, settings in plans.items():
+        if not isinstance(settings, dict) or not isinstance(settings.get("risks"), list):
+            continue
+        allowed = {str(risk) for risk in settings["risks"]}
+        maximum = settings.get("max_cases_per_module")
+        selected = 0
+        for case in cases:
+            case_id = str(case.get("id", ""))
+            endpoint = endpoints.get(str(case.get("endpoint_id")))
+            if not case_id or endpoint is None or case_risk(case, endpoint) not in allowed:
+                continue
+            if isinstance(maximum, int) and selected >= maximum:
+                continue
+            result[case_id].append(f"plan-{plan_name}")
+            selected += 1
+    return result
+
+
 def contract_signature(content: str) -> str:
     blocks = re.findall(
         r"(?mis)^\s*(?:meta|get|post|put|patch|delete|head|options|trace|headers|body:[^\s{]+|assert)\s*\{.*?^\s*\}",
@@ -515,6 +562,9 @@ def materialize(
         load_execution_config(config_path)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
+    plans_path = config_path.parent / "plans.yaml"
+    plans_document = load_data(plans_path) if plans_path.is_file() else {}
+    plans = plans_document.get("plans", {}) if isinstance(plans_document, dict) else {}
     collection_path = bruno_root / "collection.bru"
     if not collection_path.exists():
         if not dry_run:
@@ -574,7 +624,8 @@ def materialize(
                     )
                 existing_by_id[existing_id] = path
 
-        planned: list[tuple[dict[str, Any], dict[str, Any], Path]] = []
+        plan_tags = execution_plan_tags(cases, endpoint_by_id, plans if isinstance(plans, dict) else {})
+        planned: list[tuple[dict[str, Any], dict[str, Any], Path, list[str]]] = []
         targets: dict[Path, str] = {}
         mappings_changed = False
         for position, case in enumerate(cases, 1):
@@ -617,7 +668,8 @@ def materialize(
                     f"Bruno filename collision: cases {targets[target]} and {case_id} both map to {relative}"
                 )
             targets[target] = case_id
-            planned.append((case, endpoint, target))
+            tags = [case_risk(case, endpoint), *plan_tags.get(case_id, [])]
+            planned.append((case, endpoint, target, tags))
             desired_mapping = relative.as_posix()
             if case.get("bru") != desired_mapping or "bru_file" in case or "file_name" in case:
                 if "bru_file" in case or "file_name" in case:
@@ -634,8 +686,9 @@ def materialize(
                 updated_cases_document["cases"] = cases
                 cases_path.write_text(render_manifest(updated_cases_document, cases_path), encoding="utf-8")
 
-        for case, endpoint, target in planned:
+        for case, endpoint, target, tags in planned:
             case_id = str(case["id"])
+            rendered_case = dict(case, _execution_tags=tags[1:])
             if target.exists():
                 try:
                     existing = target.read_text(encoding="utf-8", errors="strict")
@@ -649,14 +702,14 @@ def materialize(
                     )
                 if check:
                     expected_sequence = int(target.stem.split("-", 1)[0])
-                    expected = render_case(case, endpoint, expected_sequence)
+                    expected = render_case(rendered_case, endpoint, expected_sequence)
                     if (
                         contract_signature(existing) != contract_signature(expected)
-                        or ensure_request_script(existing, case) != existing
+                        or ensure_request_script(ensure_execution_tags(existing, tags), case) != existing
                     ):
                         created.append(target)
                     continue
-                updated = ensure_request_script(existing, case)
+                updated = ensure_request_script(ensure_execution_tags(existing, tags), case)
                 if updated == existing:
                     continue
                 created.append(target)
@@ -667,7 +720,7 @@ def materialize(
             if not dry_run:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target_sequence = int(target.stem.split("-", 1)[0])
-                target.write_text(render_case(case, endpoint, target_sequence), encoding="utf-8")
+                target.write_text(render_case(rendered_case, endpoint, target_sequence), encoding="utf-8")
         if module_bru.is_dir():
             for existing_path in sorted(module_bru.rglob("*.bru")):
                 try:

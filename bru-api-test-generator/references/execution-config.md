@@ -1,86 +1,44 @@
 # Bruno Execution Configuration
 
-`qa/execution/config.yaml` is the only shared runtime configuration. Do not
-recreate `request-auth.yaml`, `request-context.yaml`, or per-request
-authentication scripts.
-
-## Layout
-
-```text
-qa/
-|-- bruno/
-|   |-- bruno.json
-|   |-- collection.bru
-|   `-- <module>/
-|-- contracts/
-|   `-- ...
-|-- execution/
-|   |-- config.yaml
-|   |-- environments/
-|   |   `-- local.bru
-|   |-- run.bat
-|   |-- run.sh
-|   `-- README.md
-`-- scripts/
-    |-- execution_config.py
-    `-- run_bruno.py
-```
-
-Move existing environments from `bruno/environments/` as one directory. Do
-not leave a copy or invent `dev.bru`, `test.bru`, or other environments.
-
-## Schema
+`qa/execution/config.yaml` only selects the active environment and controls the
+signing algorithm. Unknown fields are errors.
 
 ```yaml
-# 当前激活环境；不包含 .bru 后缀。
 active_environment: local
-
-auth:
-  # none | seres-sign | bearer | api-key | cookie
-  mode: none
-
-  # seres-sign:
-  # access_key_env: ACCESS_KEY
-  # secret_key_env: SECRET_KEY
-
-  # bearer:
-  # token_env: ACCESS_TOKEN
-
-  # api-key:
-  # key_env: API_KEY
-
-  # cookie:
-  # cookie_env: SESSION_COOKIE
-
-custom_headers:
-  operatorInfo:
-    # env 是 Bruno 环境变量名；值为空时不发送。
-    env: OPERATOR_INFO
-    # 匹配请求路径，忽略查询参数。
-    paths:
-      - "/v*/admin/**"
-
-  # 非敏感固定值使用 value；value 和 env 不能同时出现。
-  # X-Gray-Traffic:
-  #   value: "true"
-  #   paths:
-  #     - "/v*/internal/**"
+sign: disabled # disabled | seres-sign
 ```
 
-Unknown fields are errors. The configuration intentionally has no `version`:
-Git history, strict validation, and regression tests define the format until a
-real incompatible migration exists.
+Do not put authentication modes, Header/Cookie values, variable selectors, or
+path rules in this file. Existing legacy settings are migrated once into the
+active environment by `mno-bruno-qa init`.
 
-`seres-sign` fixes SHA-256, URL/body/query inputs, millisecond timestamps, and
-the `sign`, `timestamp`, and `accesskey` Header names in `collection.bru`.
-OAuth2 acquisition is an external bootstrap concern; configure the resulting
-token as `bearer`.
+## Environment Format
 
-## Precedence And Exclusions
+Keep environments outside the Bruno collection under
+`qa/execution/environments/`. The skill extends Bruno's environment format with
+one readable `headers {}` block:
 
-The collection-level pre-request script runs before request-level scripts. It
-does not replace a Header already declared by the request. To verify that a
-configured Header is absent, declare:
+```bru
+vars {
+  baseUrl: http://127.0.0.1:9527
+  AUTH_TOKEN: ""
+  SESSION_COOKIE: ""
+  OPERATOR_INFO: ""
+  ACCESS_KEY: ""
+  SECRET_KEY: ""
+}
+
+headers {
+  Authorization: "Bearer {{AUTH_TOKEN}}"
+  Cookie: "{{SESSION_COOKIE}}"
+  operatorInfo: "{{OPERATOR_INFO}}"
+}
+```
+
+Every non-empty KV in `headers` becomes a request Header. Cookie has no special
+case. Values can reference variables from the same environment; an unresolved
+or empty sensitive value is not injected. A request-local Header wins over the
+environment Header. To test a missing common Header, declare:
 
 ```yaml
 request:
@@ -88,19 +46,67 @@ request:
     - operatorInfo
 ```
 
-The materializer emits a request-level `req.deleteHeaders(...)` block. Changing
-authentication or common Headers never requires regenerating all request
-files.
+Bruno does not natively understand this custom block. The CLI parses it,
+resolves references, passes Bruno a temporary environment containing only
+native `vars`, and sends the resolved Header map to the collection-level
+pre-request script. Do not duplicate this logic in request files.
 
-## Execution
+When `sign: seres-sign`, `collection.bru` reads `ACCESS_KEY` and `SECRET_KEY`
+from the active environment. The SHA-256 input, millisecond timestamp, and
+`sign`, `timestamp`, and `accesskey` Header names are fixed. With
+`sign: disabled`, the collection adds no signing Header.
 
-Use `qa/execution/run.bat` on Windows and `qa/execution/run.sh` on Linux or
-macOS. Both default to all modules and accept `--module <id-or-name>`. The
-runner loads the active environment with Bruno `--env-file`, injects only the
-validated runtime structure, stores the raw Bruno report in a temporary
-directory, and normalizes evidence without request/response Headers or bodies.
+## Risk Plans
 
-A module run reports only that module and never updates
-`contracts/version-lock.yaml`. Only a verified full run can advance the lock.
-Bruno GUI does not discover environments outside the collection or read
-`config.yaml`; import an environment manually for GUI debugging.
+`qa/execution/plans.yaml` defines reusable scopes:
+
+```yaml
+plans:
+  smoke:
+    risks: [read-only]
+    max_cases_per_module: 3
+  regression:
+    risks: [read-only, isolated-write]
+  full:
+    risks: [read-only, isolated-write, destructive, external-side-effect]
+    require_confirm: true
+```
+
+The default is `read-only`. Confirmations are mandatory:
+
+| Risk | Required flags |
+| --- | --- |
+| `read-only` | none |
+| `isolated-write` | `--confirm-write` |
+| `destructive` | `--confirm-write --confirm-destructive` |
+| `external-side-effect` | `--confirm-external` |
+
+```bat
+qa\execution\run.bat --module ac --risk read-only
+qa\execution\run.bat --module ac --risk isolated-write --confirm-write
+qa\execution\run.bat --module ac --risk destructive --confirm-write --confirm-destructive
+qa\execution\run.bat --module ac --risk external-side-effect --confirm-external
+qa\execution\run.bat --plan smoke
+qa\execution\run.bat --plan regression --confirm-write
+```
+
+Risk and plan tags are materialized into `.bru` metadata and selected through
+Bruno's tag filter. A destructive case outside the selected scope does not
+block a normal read-only run. Module runs never advance global completion or
+`version-lock.yaml`.
+
+## Tooling Modes
+
+The default transition mode stores a synchronized `qa/scripts` bundle. Its
+`README.md` and `scripts-version.yaml` record purpose, skill/script versions,
+source, aggregate SHA, per-file SHA, and synchronization time:
+
+```bash
+mno-bruno-qa scripts sync
+mno-bruno-qa scripts check
+```
+
+For repositories using an installed package, run
+`mno-bruno-qa init --shared-cli`. `qa/qa.yaml` then selects `shared-cli`, the
+launchers call the installed command, and the repository does not need Python
+script copies.

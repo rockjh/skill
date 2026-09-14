@@ -10,12 +10,14 @@ import json
 import re
 import sys
 import unicodedata
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 sys.dont_write_bytecode = True
 
 from execution_config import initialize_execution_layout
+from tool_version import GENERATOR_VERSION
 
 HTTP_METHODS = {
     "get",
@@ -157,6 +159,9 @@ def parameter_summary(parameter: Any) -> dict[str, Any]:
         result["schema"] = parameter["schema"]
     elif "type" in parameter:
         result["type"] = parameter["type"]
+    for key in ("enum", "minimum", "maximum", "minLength", "maxLength", "pattern", "format", "example", "default", "items"):
+        if key in parameter:
+            result[key] = parameter[key]
     return result
 
 
@@ -462,6 +467,131 @@ def markdown_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip()).replace("|", "\\|")
 
 
+def canonical_fingerprint(value: Any) -> str:
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def write_if_changed(path: Path, content: str) -> bool:
+    if path.is_file() and path.read_text(encoding="utf-8", errors="strict") == content:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    return True
+
+
+def chinese_text(value: str) -> bool:
+    return bool(re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", value))
+
+
+def endpoint_subject(endpoint: dict[str, Any]) -> str:
+    tags = endpoint.get("tags") if isinstance(endpoint.get("tags"), list) else []
+    raw = str(endpoint.get("primary_tag") or (tags[0] if tags else "")).strip()
+    raw = re.sub(r"(?i)(?:[-_ ]?(?:controller|api))$", "", raw).strip("-_ ")
+    if raw:
+        return raw.upper() if re.fullmatch(r"[A-Za-z]{1,5}", raw) else raw
+    operation = str(endpoint.get("operation_id") or "")
+    acronyms = re.findall(r"(?<![A-Za-z])([A-Z]{2,6})(?![a-z])", operation)
+    if acronyms:
+        return acronyms[-1]
+    parts = [part for part in str(endpoint.get("path", "")).split("/") if part and not part.startswith("{")]
+    return (parts[-1].replace("-", " ") if parts else "接口")
+
+
+def endpoint_business_action(endpoint: dict[str, Any]) -> str:
+    summary = markdown_text(endpoint.get("summary"))
+    if summary and summary not in {"请求成功", "操作成功", "成功"}:
+        return re.sub(r"(?:成功受理|成功|失败)$", "", summary).strip()
+    operation = str(endpoint.get("operation_id") or "").lower()
+    route = str(endpoint.get("path") or "").lower()
+    method = str(endpoint.get("method") or "GET").upper()
+    subject = endpoint_subject(endpoint)
+    key = operation + " " + route
+    if "import" in key or "upload" in key:
+        return f"导入 {subject} 文件"
+    if "export" in key or "download" in key:
+        return f"导出 {subject} 文件"
+    if ("batch" in key or "bulk" in key) and "delete" in key:
+        return f"批量删除 {subject} 信息"
+    if ("batch" in key or "bulk" in key) and any(word in key for word in ("group", "change", "update")):
+        return f"批量变更 {subject} 分组" if "group" in key else f"批量更新 {subject} 信息"
+    if any(word in key for word in ("listbypage", "page", "pagination")):
+        return f"分页查询 {subject} 信息"
+    verbs = {
+        "GET": "查询",
+        "POST": "新增",
+        "PUT": "更新",
+        "PATCH": "变更",
+        "DELETE": "删除",
+    }
+    return f"{verbs.get(method, '调用')} {subject} 信息"
+
+
+def business_case_title(
+    endpoint: dict[str, Any],
+    scenario: str,
+    detail: str = "",
+    status: int | None = None,
+) -> str:
+    action = endpoint_business_action(endpoint)
+    if scenario == "success":
+        return f"{action}{'成功受理' if status == 202 else '成功'}"
+    if scenario == "validation":
+        return f"{action}失败：{detail}"
+    if scenario == "query":
+        return f"{action}：{detail}"
+    if scenario == "file":
+        return f"{action}失败：{detail}"
+    return f"{action}：{detail or scenario}"
+
+
+def request_body_schema(endpoint: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
+    request_body = endpoint.get("request_body", {}) if isinstance(endpoint.get("request_body"), dict) else {}
+    content = request_body.get("content", {}) if isinstance(request_body.get("content"), dict) else {}
+    media_type = next(iter(content), None)
+    media = content.get(media_type, {}) if media_type else {}
+    schema = media.get("schema", {}) if isinstance(media, dict) and isinstance(media.get("schema"), dict) else {}
+    if not schema and isinstance(request_body.get("schema"), dict):
+        schema = request_body["schema"]
+    return media_type, schema
+
+
+def inferred_scenario_matrix(endpoint: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    parameters = [item for item in endpoint.get("parameters", []) if isinstance(item, dict)]
+    media_type, body_schema = request_body_schema(endpoint)
+    query = [item for item in parameters if item.get("in") == "query"]
+    has_input = bool(parameters or body_schema)
+    properties = body_schema.get("properties", {}) if isinstance(body_schema.get("properties"), dict) else {}
+    file_applicable = media_type == "multipart/form-data" or any(
+        isinstance(value, dict) and value.get("format") == "binary"
+        for value in properties.values()
+    )
+    security = endpoint.get("security")
+    route = str(endpoint.get("path", "")).lower()
+    secured = bool(security) or any(part in route for part in ("/admin", "/manage", "/internal"))
+    permission = endpoint.get("x-permissions") or endpoint.get("x-permission") or endpoint.get("x-roles")
+
+    def decision(applicable: bool, reason: str) -> dict[str, Any]:
+        return {"applicable": applicable, "status": "inferred", "reason": reason}
+
+    return {
+        "success": decision(True, "所有可达接口默认覆盖成功路径"),
+        "authentication": decision(
+            secured,
+            "OpenAPI security 或管理端路径表明需要认证" if secured else "OpenAPI 明确未声明认证且不是管理端路径",
+        ),
+        "authorization": decision(
+            bool(permission) or "/admin" in route,
+            "权限扩展或管理端路径需要权限确认" if bool(permission) or "/admin" in route else "契约未提供角色、租户或数据权限证据",
+        ),
+        "validation": decision(has_input, "根据 required、enum、min/max、pattern 推导" if has_input else "接口无请求参数或请求体"),
+        "business_error": decision(False, "契约阶段未发现源码业务异常；源码增强阶段复核"),
+        "query": decision(bool(query), "根据分页、筛选和排序查询参数推导" if query else "接口无查询参数"),
+        "safety": decision(False, "契约未声明幂等、并发或重复提交语义"),
+        "file": decision(file_applicable, "multipart/form-data 或 binary schema" if file_applicable else "接口不是文件上传或下载"),
+    }
+
+
 def module_business_scope(
     module: dict[str, Any],
     endpoints: list[dict[str, Any]],
@@ -491,13 +621,8 @@ def case_title(case: dict[str, Any], endpoint: dict[str, Any]) -> str:
         value = markdown_text(case.get(key))
         if value:
             return value
-    summary = markdown_text(endpoint.get("summary"))
     scenario = markdown_text(case.get("scenario") or case.get("category"))
-    if summary and scenario:
-        return f"{summary}-{scenario}"
-    if summary:
-        return summary
-    return f"自动化用例 {markdown_text(case.get('id', '未命名'))}"
+    return business_case_title(endpoint, scenario or "success")
 
 
 def case_description(case: dict[str, Any], endpoint: dict[str, Any], title: str) -> str:
@@ -708,7 +833,7 @@ def render_contracts_readme(index: dict[str, Any], modules: dict[str, tuple[dict
 
 
 def seed_contract_cases(endpoint: dict[str, Any]) -> list[dict[str, Any]]:
-    """Seed only scenarios mechanically implied by OpenAPI."""
+    """Create business-readable draft cases that are provable from OpenAPI."""
 
     endpoint_id = str(endpoint.get("id", "ENDPOINT"))
     responses = endpoint.get("responses", {}) if isinstance(endpoint.get("responses"), dict) else {}
@@ -716,26 +841,26 @@ def seed_contract_cases(endpoint: dict[str, Any]) -> list[dict[str, Any]]:
     error_status = next((int(code) for code in responses if str(code) in {"400", "422"}), None)
 
     def schema_value(schema: dict[str, Any], name: str = "value") -> Any:
-        if "example" in schema:
-            return copy.deepcopy(schema["example"])
-        if "default" in schema:
-            return copy.deepcopy(schema["default"])
+        for key in ("example", "default"):
+            if key in schema:
+                return copy.deepcopy(schema[key])
         enum = schema.get("enum")
         if isinstance(enum, list) and enum:
             return copy.deepcopy(enum[0])
         kind = str(schema.get("type", "string")).lower()
         if kind == "integer":
-            return 1
+            return max(int(schema.get("minimum", 1)), 1)
         if kind == "number":
-            return 1.0
+            return max(float(schema.get("minimum", 1)), 1.0)
         if kind == "boolean":
             return True
         if kind == "array":
-            return [schema_value(schema.get("items", {}) if isinstance(schema.get("items"), dict) else {}, name)]
+            items = schema.get("items", {}) if isinstance(schema.get("items"), dict) else {}
+            return [schema_value(items, name)]
         if kind == "object" or isinstance(schema.get("properties"), dict):
-            properties = schema.get("properties", {})
-            required = schema.get("required", [])
-            names = required if isinstance(required, list) and required else list(properties)[:1]
+            properties = schema.get("properties", {}) if isinstance(schema.get("properties"), dict) else {}
+            required = schema.get("required", []) if isinstance(schema.get("required"), list) else []
+            names = required or list(properties)[:1]
             return {
                 str(field): schema_value(properties.get(field, {}) if isinstance(properties.get(field), dict) else {}, str(field))
                 for field in names
@@ -759,23 +884,20 @@ def seed_contract_cases(endpoint: dict[str, Any]) -> list[dict[str, Any]]:
             schema = parameter.get("schema", {}) if isinstance(parameter.get("schema"), dict) else parameter
             set_parameter(success_request, parameter, schema_value(schema, str(parameter.get("name", "parameter"))))
 
-    request_body = endpoint.get("request_body", {}) if isinstance(endpoint.get("request_body"), dict) else {}
-    content = request_body.get("content", {}) if isinstance(request_body.get("content"), dict) else {}
-    media_type = next(iter(content), None)
-    media = content.get(media_type, {}) if media_type else {}
-    body_schema = media.get("schema", {}) if isinstance(media, dict) and isinstance(media.get("schema"), dict) else {}
-    if not body_schema and isinstance(request_body.get("schema"), dict):
-        body_schema = request_body["schema"]
+    media_type, body_schema = request_body_schema(endpoint)
     if body_schema:
         success_request["body_type"] = media_type or "application/json"
         success_request["body"] = schema_value(body_schema, "body")
 
-    def build(suffix: str, title: str, scenario: str, status: int, request: dict[str, Any]) -> dict[str, Any]:
+    def build(suffix: str, scenario: str, detail: str, status: int, request: dict[str, Any]) -> dict[str, Any]:
         return {
             "id": f"{endpoint_id}_{suffix}",
-            "title": title,
+            "title": business_case_title(endpoint, scenario, detail, status),
+            "description": f"验证{endpoint_business_action(endpoint)}的{detail or '正常'}场景。",
             "endpoint_id": endpoint_id,
             "scenario": scenario,
+            "status": "draft",
+            "source": "openapi",
             "review_required": True,
             "risk": "read-only" if str(endpoint.get("method", "GET")).upper() in {"GET", "HEAD", "OPTIONS"} else "isolated-write",
             "request": copy.deepcopy(request),
@@ -783,49 +905,81 @@ def seed_contract_cases(endpoint: dict[str, Any]) -> list[dict[str, Any]]:
             "assertions": [{"path": "$", "exists": True}],
         }
 
-    seeded = [build("SUCCESS", "请求成功", "success", success_status, success_request)] if success_status is not None else []
+    seeded = [build("SUCCESS", "success", "", success_status, success_request)] if success_status is not None else []
     for parameter in parameters:
         name = str(parameter.get("name", "参数"))
-        schema = parameter.get("schema", {}) if isinstance(parameter.get("schema"), dict) else {}
+        schema = parameter.get("schema", {}) if isinstance(parameter.get("schema"), dict) else parameter
         suffix = slugify_tag(name).replace("-", "_").upper()
-        if error_status is not None and parameter.get("required") is True and parameter.get("in") in {"query", "header"}:
+        location = str(parameter.get("in", "query"))
+        if error_status is not None and parameter.get("required") is True and location in {"query", "header"}:
             request = copy.deepcopy(success_request)
-            request.get("query" if parameter.get("in") == "query" else "headers", {}).pop(name, None)
-            seeded.append(build(f"MISSING_{suffix}", f"缺少必填参数{name}", "validation", error_status, request))
-        if error_status is not None and (isinstance(schema.get("enum"), list) or isinstance(parameter.get("enum"), list)):
+            request.get("query" if location == "query" else "headers", {}).pop(name, None)
+            if location == "header":
+                request["omit_common_headers"] = list(dict.fromkeys([
+                    *request.get("omit_common_headers", []),
+                    name,
+                ]))
+            detail = f"缺少必填 Header {name}" if location == "header" else f"缺少必填参数 {name}"
+            seeded.append(build(f"MISSING_{suffix}", "validation", detail, error_status, request))
+        if error_status is not None and isinstance(schema.get("enum"), list):
             request = copy.deepcopy(success_request)
             set_parameter(request, parameter, "__INVALID_ENUM__")
-            seeded.append(build(f"INVALID_{suffix}", f"参数{name}枚举值非法", "validation", error_status, request))
-        if success_status is not None and name.lower() in {"page", "pagenum", "pagesize", "pageindex", "limit", "offset"}:
+            seeded.append(build(f"INVALID_{suffix}", "validation", f"参数 {name} 使用非法枚举值", error_status, request))
+        if error_status is not None and schema.get("pattern"):
             request = copy.deepcopy(success_request)
-            set_parameter(request, parameter, 0)
-            seeded.append(build(f"BOUNDARY_{suffix}", f"分页参数{name}边界值", "query", success_status, request))
-    required_body_fields = body_schema.get("required", []) if isinstance(body_schema.get("required"), list) else []
-    for field in required_body_fields:
+            set_parameter(request, parameter, "__INVALID_PATTERN__")
+            seeded.append(build(f"INVALID_PATTERN_{suffix}", "validation", f"参数 {name} 不符合格式", error_status, request))
+        if name.lower() in {"page", "pagenum", "pagesize", "pageindex", "limit", "offset"}:
+            status = error_status if error_status is not None else success_status
+            if status is not None:
+                request = copy.deepcopy(success_request)
+                minimum = schema.get("minimum")
+                value = minimum - 1 if isinstance(minimum, (int, float)) else 0
+                set_parameter(request, parameter, value)
+                seeded.append(build(f"BOUNDARY_{suffix}", "query", f"分页参数 {name} 取边界值 {value}", status, request))
+
+    properties = body_schema.get("properties", {}) if isinstance(body_schema.get("properties"), dict) else {}
+    required = body_schema.get("required", []) if isinstance(body_schema.get("required"), list) else []
+    for field in required:
         if error_status is None:
             break
-        field_schema = body_schema.get("properties", {}).get(field, {}) if isinstance(body_schema.get("properties"), dict) else {}
-        if media_type == "multipart/form-data" and isinstance(field_schema, dict) and field_schema.get("format") == "binary":
+        field_schema = properties.get(field, {}) if isinstance(properties.get(field), dict) else {}
+        if media_type == "multipart/form-data" and field_schema.get("format") == "binary":
             continue
         request = copy.deepcopy(success_request)
         if isinstance(request.get("body"), dict):
             request["body"].pop(str(field), None)
         suffix = slugify_tag(str(field)).replace("-", "_").upper()
-        seeded.append(build(f"MISSING_BODY_{suffix}", f"缺少必填字段{field}", "validation", error_status, request))
-    properties = body_schema.get("properties", {}) if isinstance(body_schema.get("properties"), dict) else {}
-    required_binary_fields = {
-        str(name)
-        for name, schema in properties.items()
-        if str(name) in {str(field) for field in required_body_fields}
-        and isinstance(schema, dict)
-        and schema.get("format") == "binary"
-    }
-    if error_status is not None and media_type == "multipart/form-data" and required_binary_fields:
-        request = copy.deepcopy(success_request)
-        for name in required_binary_fields:
+        seeded.append(build(f"MISSING_BODY_{suffix}", "validation", f"缺少必填字段 {field}", error_status, request))
+    for field, field_schema in properties.items():
+        if error_status is None or not isinstance(field_schema, dict):
+            continue
+        invalid: Any = None
+        detail = ""
+        if isinstance(field_schema.get("enum"), list):
+            invalid, detail = "__INVALID_ENUM__", f"字段 {field} 使用非法枚举值"
+        elif field_schema.get("pattern"):
+            invalid, detail = "__INVALID_PATTERN__", f"字段 {field} 不符合格式"
+        elif isinstance(field_schema.get("minimum"), (int, float)):
+            invalid, detail = field_schema["minimum"] - 1, f"字段 {field} 小于最小值"
+        elif isinstance(field_schema.get("maximum"), (int, float)):
+            invalid, detail = field_schema["maximum"] + 1, f"字段 {field} 大于最大值"
+        if detail:
+            request = copy.deepcopy(success_request)
             if isinstance(request.get("body"), dict):
+                request["body"][str(field)] = invalid
+            suffix = slugify_tag(str(field)).replace("-", "_").upper()
+            seeded.append(build(f"INVALID_BODY_{suffix}", "validation", detail, error_status, request))
+    binary_fields = [
+        str(name) for name, schema in properties.items()
+        if isinstance(schema, dict) and schema.get("format") == "binary"
+    ]
+    if media_type == "multipart/form-data" and binary_fields and error_status is not None:
+        request = copy.deepcopy(success_request)
+        if isinstance(request.get("body"), dict):
+            for name in binary_fields:
                 request["body"].pop(name, None)
-        seeded.append(build("MISSING_UPLOAD_FILE", "缺少上传文件", "file", error_status, request))
+        seeded.append(build("MISSING_UPLOAD_FILE", "file", "缺少上传文件", error_status, request))
     return seeded
 
 
@@ -834,7 +988,8 @@ def write_partitioned(
     module_map_path: Path,
     output_dir: Path,
     seed_cases: bool = False,
-) -> None:
+    incremental: bool = False,
+) -> dict[str, Any]:
     qa_root = output_dir.parent.parent
     try:
         initialize_execution_layout(qa_root)
@@ -842,6 +997,36 @@ def write_partitioned(
         raise SystemExit(str(exc)) from exc
     module_map = load_document(module_map_path)
     grouped = partition_manifest(manifest, module_map)
+    state_path = output_dir.parent / "generation-state.yaml"
+    previous_state = load_document(state_path) if state_path.is_file() else {}
+    previous_modules = previous_state.get("modules", {}) if isinstance(previous_state, dict) else {}
+    previous_cases = previous_state.get("cases", {}) if isinstance(previous_state, dict) else {}
+    current_endpoint_fingerprints = {
+        str(endpoint["id"]): canonical_fingerprint({
+            key: value for key, value in endpoint.items()
+            if key not in {"case_ids", "cases", "scenario_matrix", "scenarios"}
+        })
+        for endpoint in manifest["endpoints"]
+        if endpoint.get("id")
+    }
+    current_module_fingerprints = {
+        module_id: canonical_fingerprint({
+            str(endpoint.get("id")): current_endpoint_fingerprints.get(str(endpoint.get("id")))
+            for endpoint in endpoints
+        })
+        for module_id, endpoints in grouped.items()
+    }
+    deleted_endpoint_ids = sorted(
+        set(previous_state.get("endpoints", {})) - set(current_endpoint_fingerprints)
+    ) if isinstance(previous_state, dict) and isinstance(previous_state.get("endpoints"), dict) else []
+    summary: dict[str, Any] = {
+        "changed_modules": [],
+        "skipped_modules": [],
+        "new_endpoint_ids": sorted(set(current_endpoint_fingerprints) - set(previous_state.get("endpoints", {})))
+        if isinstance(previous_state, dict) and isinstance(previous_state.get("endpoints"), dict) else sorted(current_endpoint_fingerprints),
+        "deleted_endpoint_ids": deleted_endpoint_ids,
+        "manual_review_cases": [],
+    }
     module_metadata = {
         str(item["id"]): item
         for item in module_map.get("modules", [])
@@ -860,12 +1045,22 @@ def write_partitioned(
         "modules": [],
     }
     readme_modules: dict[str, tuple[dict[str, Any], list[dict[str, Any]], str]] = {}
+    state_cases: dict[str, dict[str, Any]] = {}
     for module_id, endpoints in sorted(grouped.items()):
         module = module_metadata[module_id]
         module_dir = output_dir / module_directory(module, module_id)
         module_dir.mkdir(parents=True, exist_ok=True)
         tag = module_tag(module)
         endpoints_path = module_dir / "endpoints.yaml"
+        previous_module = previous_modules.get(module_id, {}) if isinstance(previous_modules, dict) else {}
+        module_unchanged = bool(
+            incremental
+            and previous_state.get("generator_version") == GENERATOR_VERSION
+            and isinstance(previous_module, dict)
+            and previous_module.get("contract_fingerprint") == current_module_fingerprints[module_id]
+            and endpoints_path.is_file()
+        )
+        summary["skipped_modules" if module_unchanged else "changed_modules"].append(module_id)
         existing_endpoints_document = load_document(endpoints_path) if endpoints_path.is_file() else {}
         existing_endpoints = existing_endpoints_document.get("endpoints", []) if isinstance(existing_endpoints_document, dict) else []
         existing_by_id = {
@@ -878,6 +1073,8 @@ def write_partitioned(
             for key in ("case_ids", "cases", "scenario_matrix", "scenarios"):
                 if key in previous:
                     endpoint[key] = previous[key]
+            if "scenario_matrix" not in endpoint and "scenarios" not in endpoint:
+                endpoint["scenario_matrix"] = inferred_scenario_matrix(endpoint)
         module_manifest = {
             "version": 1,
             "module": module_id,
@@ -887,10 +1084,8 @@ def write_partitioned(
             "source": manifest["source"],
             "endpoints": endpoints,
         }
-        endpoints_path.write_text(
-            render_manifest(module_manifest, endpoints_path),
-            encoding="utf-8",
-        )
+        if not module_unchanged:
+            write_if_changed(endpoints_path, render_manifest(module_manifest, endpoints_path))
         generated_artifacts = {
             "cases.yaml": {"version": 1, "module": module_id, "swagger_tag": tag, "cases": []},
             "logic.yaml": {"version": 1, "module": module_id, "swagger_tag": tag, "logic": []},
@@ -927,12 +1122,27 @@ def write_partitioned(
         }
         for filename, payload in generated_artifacts.items():
             target = module_dir / filename
-            if filename in {"parameters.yaml", "definitions.yaml", "responses.yaml"} or not target.exists():
-                target.write_text(render_manifest(payload, target), encoding="utf-8")
+            if not module_unchanged and (filename in {"parameters.yaml", "definitions.yaml", "responses.yaml"} or not target.exists()):
+                write_if_changed(target, render_manifest(payload, target))
         cases_path = module_dir / "cases.yaml"
         cases_document = load_document(cases_path) if cases_path.is_file() else {}
         cases = cases_document.get("cases", []) if isinstance(cases_document, dict) else []
         cases = [item for item in cases if isinstance(item, dict)] if isinstance(cases, list) else []
+        for case in cases:
+            case_id = str(case.get("id", ""))
+            previous_case = previous_cases.get(case_id, {}) if isinstance(previous_cases, dict) else {}
+            current_case_fingerprint = canonical_fingerprint({
+                key: value for key, value in case.items()
+                if key not in {"bru", "bru_file", "file_name", "manual_review"}
+            })
+            if (
+                incremental
+                and isinstance(previous_case, dict)
+                and previous_case.get("fingerprint")
+                and previous_case.get("fingerprint") != current_case_fingerprint
+            ):
+                case["manual_review"] = True
+                summary["manual_review_cases"].append(case_id)
         if seed_cases:
             existing_case_ids = {str(case.get("id")) for case in cases if case.get("id")}
             for endpoint in endpoints:
@@ -946,14 +1156,54 @@ def write_partitioned(
                 ]))
             cases_document = dict(cases_document) if isinstance(cases_document, dict) else {}
             cases_document.update({"version": 1, "module": module_id, "swagger_tag": tag, "cases": cases})
-            cases_path.write_text(render_manifest(cases_document, cases_path), encoding="utf-8")
+            write_if_changed(cases_path, render_manifest(cases_document, cases_path))
             module_manifest["endpoints"] = endpoints
-            endpoints_path.write_text(render_manifest(module_manifest, endpoints_path), encoding="utf-8")
+            write_if_changed(endpoints_path, render_manifest(module_manifest, endpoints_path))
+        for case in cases:
+            case_id = str(case.get("id", ""))
+            if case_id:
+                state_cases[case_id] = {
+                    "module": module_id,
+                    "endpoint_id": str(case.get("endpoint_id", "")),
+                    "fingerprint": canonical_fingerprint({
+                        key: value for key, value in case.items()
+                        if key not in {"bru", "bru_file", "file_name", "manual_review"}
+                    }),
+                    "manual_review": case.get("manual_review") is True,
+                }
+        logic_path = module_dir / "logic.yaml"
+        logic_document = load_document(logic_path) if logic_path.is_file() else {}
+        logic_items = logic_document.get("logic", []) if isinstance(logic_document, dict) else []
+        logic_items = [item for item in logic_items if isinstance(item, dict)] if isinstance(logic_items, list) else []
+        linked_case_ids = {
+            str(case_id)
+            for item in logic_items
+            for case_id in (item.get("case_ids", []) if isinstance(item.get("case_ids"), list) else [])
+        }
+        for case in cases:
+            case_id = str(case.get("id", ""))
+            if case_id in linked_case_ids or case.get("source") != "openapi" or case.get("scenario") not in {"success", "validation", "query", "file"}:
+                continue
+            expected = case.get("expected", {}) if isinstance(case.get("expected"), dict) else {}
+            logic_items.append({
+                "id": f"{case_id}_CONTRACT_DRAFT",
+                "status": "draft",
+                "source": "openapi",
+                "source_symbol": f"{case.get('endpoint_id')} ({case.get('scenario')})",
+                "condition": str(case.get("description") or case.get("title") or case.get("scenario")),
+                "expected_http_status": expected.get("http_status"),
+                "expected_business_code": expected.get("business_code"),
+                "case_ids": [case_id],
+            })
+        updated_logic = dict(logic_document) if isinstance(logic_document, dict) else {}
+        updated_logic.update({"version": 1, "module": module_id, "swagger_tag": tag, "logic": logic_items})
+        if not module_unchanged:
+            write_if_changed(logic_path, render_manifest(updated_logic, logic_path))
         index["generated_cases"] += len(cases)
         cases_md = module_dir / "CASES.md"
         existing_cases_md = cases_md.read_text(encoding="utf-8", errors="strict") if cases_md.is_file() else ""
         updated_cases_md = update_module_document(existing_cases_md, module, endpoints, cases, manifest)
-        if updated_cases_md != existing_cases_md:
+        if not module_unchanged and updated_cases_md != existing_cases_md:
             cases_md.write_text(updated_cases_md, encoding="utf-8")
         scope = module_business_scope(module, endpoints, manifest)
         readme_modules[module_id] = (module, endpoints, scope)
@@ -1002,14 +1252,58 @@ def write_partitioned(
     security_path = output_dir.parent / "security-profile.yaml"
     if not security_path.exists():
         security_path.write_text(render_manifest(security_profile, security_path), encoding="utf-8")
-    (output_dir.parent / "index.yaml").write_text(
-        render_manifest(index, output_dir.parent / "index.yaml"),
-        encoding="utf-8",
+    index_path = output_dir.parent / "index.yaml"
+    readme_path = output_dir.parent / "README.md"
+    write_if_changed(index_path, render_manifest(index, index_path))
+    write_if_changed(readme_path, render_contracts_readme(index, readme_modules))
+
+    changed = bool(
+        summary["changed_modules"]
+        or summary["new_endpoint_ids"]
+        or summary["deleted_endpoint_ids"]
+        or summary["manual_review_cases"]
+        or previous_state.get("generator_version") != GENERATOR_VERSION
     )
-    (output_dir.parent / "README.md").write_text(
-        render_contracts_readme(index, readme_modules),
-        encoding="utf-8",
+    generated_at = (
+        datetime.now(timezone.utc).isoformat()
+        if changed or not previous_state.get("last_generated_at")
+        else previous_state["last_generated_at"]
     )
+    generation_state = {
+        "version": 1,
+        "generator_version": GENERATOR_VERSION,
+        "openapi_sha256": manifest.get("source", {}).get("sha256"),
+        "last_generated_at": generated_at,
+        "endpoints": {
+            endpoint_id: {"fingerprint": fingerprint}
+            for endpoint_id, fingerprint in sorted(current_endpoint_fingerprints.items())
+        },
+        "modules": {
+            module_id: {
+                "contract_fingerprint": current_module_fingerprints[module_id],
+                "endpoint_ids": [str(endpoint.get("id")) for endpoint in grouped[module_id]],
+            }
+            for module_id in sorted(grouped)
+        },
+        "cases": dict(sorted(state_cases.items())),
+        "deleted_endpoint_ids": deleted_endpoint_ids,
+        "manual_review_cases": sorted(set(summary["manual_review_cases"])),
+    }
+    write_if_changed(state_path, render_manifest(generation_state, state_path))
+    qa_lock_path = output_dir.parent / "qa-lock.yaml"
+    qa_lock = {
+        "version": 1,
+        "openapi_sha256": generation_state["openapi_sha256"],
+        "module_fingerprints": {
+            key: value["contract_fingerprint"] for key, value in generation_state["modules"].items()
+        },
+        "case_fingerprints": {
+            key: value["fingerprint"] for key, value in generation_state["cases"].items()
+        },
+        "generation_state_fingerprint": canonical_fingerprint(generation_state),
+    }
+    write_if_changed(qa_lock_path, render_manifest(qa_lock, qa_lock_path))
+    return summary
 
 
 def render_manifest(manifest: dict[str, Any], output: Path | None) -> str:
@@ -1030,6 +1324,7 @@ def main() -> int:
     parser.add_argument("--write-module-map", type=Path, help="write a one-module-per-Tag map for review")
     parser.add_argument("--output-dir", type=Path, help="write one endpoint manifest per module")
     parser.add_argument("--seed-cases", action="store_true", help="seed review-required cases implied directly by OpenAPI")
+    parser.add_argument("--incremental", action="store_true", help="skip unchanged modules and preserve manually changed cases")
     args = parser.parse_args()
 
     if not args.spec.is_file():
@@ -1052,9 +1347,16 @@ def main() -> int:
     if args.module_map:
         if not args.module_map.is_file():
             parser.error(f"module map does not exist: {args.module_map}")
-        write_partitioned(manifest, args.module_map, args.output_dir, args.seed_cases)
+        summary = write_partitioned(manifest, args.module_map, args.output_dir, args.seed_cases, args.incremental)
         module_count = len(load_document(args.module_map).get("modules", []))
-        print(f"wrote {len(manifest['endpoints'])} endpoints across {module_count} modules")
+        print(
+            f"processed {len(manifest['endpoints'])} endpoints across {module_count} modules; "
+            f"changed={len(summary['changed_modules'])} skipped={len(summary['skipped_modules'])}"
+        )
+        for endpoint_id in summary["deleted_endpoint_ids"]:
+            print(f"REVIEW: endpoint {endpoint_id} was deleted; remove its registered .bru file after review", file=sys.stderr)
+        for case_id in summary["manual_review_cases"]:
+            print(f"REVIEW: case {case_id} was modified manually and was not overwritten", file=sys.stderr)
         return 0
     rendered = render_manifest(manifest, args.output)
     if args.output:

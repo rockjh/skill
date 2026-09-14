@@ -1,65 +1,65 @@
 # API Case Matrix
 
-Use this matrix to select cases per endpoint. A case is mandatory only when its category applies; record `applicable: false` and a short reason when it does not.
+Generate endpoint decisions from actual contract, configuration, and source
+evidence. Every decision has `status: inferred` until a human changes it to
+`confirmed`. An applicable decision links cases; a non-applicable decision
+contains a concrete reason.
 
-| Category | Typical cases | Applies when |
+| Category | Inference source | Generated coverage |
 | --- | --- | --- |
-| Success | valid create/read/update/delete, empty result | endpoint is reachable and authorized |
-| Authentication | missing token, expired/malformed token | endpoint requires authentication |
-| Authorization | authenticated but wrong role/tenant/data scope | endpoint has authorization or data permission |
-| Validation | missing field, wrong type, invalid format, boundary value | request has parameters or a body |
-| Business error | duplicate, forbidden state transition, missing domain object | implementation exposes a domain rule |
-| Query behavior | pagination edges, sorting/filtering, no-result query | endpoint supports query options |
-| Safety | repeat submission, idempotency, concurrent update | write or state-changing operation has these semantics |
-| File behavior | empty, invalid type, size limit, download content | endpoint uploads or downloads files |
+| `success` | every reachable operation | one distinct success case |
+| `validation` | `required`, `enum`, `min/max`, `pattern`, request schema | missing/invalid/boundary cases |
+| `query` | pagination, filter, sort query parameters | pageNum/pageSize and filter boundaries |
+| `file` | `multipart/form-data`, binary schema | missing file and declared file constraints |
+| `authentication` | OpenAPI security, admin/internal paths, interceptor and audit Header evidence | missing/invalid credential or required Header |
+| `authorization` | permission annotations/extensions, Controller path, role/tenant/data-scope model | authenticated but forbidden cases |
+| `business_error` | service/domain exceptions and project error-code definitions | one case per observable business code |
+| `safety` | idempotency, concurrency, repeat-submission semantics | the declared safety behavior |
 
-For every endpoint, record one decision per category in the module case manifest (or a companion scenario ledger): `applicable: true` must link to one or more case IDs, while `applicable: false` must include a reason. For every applicable case, assert the HTTP status, application/business code when present, and the important response or side effect. Use the actual application's contract; do not impose generic REST status expectations on a project that returns business errors in HTTP 200 responses.
+Example:
 
-Before templating authentication failures across a module, execute one
-representative secured endpoint with no token and one with an invalid token.
-Record the observed transport status and envelope code separately. Some
-applications (including RuoYi-style Ajax responses) return HTTP 200 with a
-business `code: 401`; copying an assumed HTTP 401 expectation creates a suite
-that looks security-aware but fails every request.
+```yaml
+scenario_matrix:
+  success:
+    applicable: true
+    status: inferred
+    reason: 所有可达接口默认覆盖成功路径
+  authentication:
+    applicable: true
+    status: inferred
+    reason: 管理端路径且源码读取必需的 operatorInfo Header
+  business_error:
+    applicable: true
+    status: confirmed
+    reason: DeleteAcGroupService 抛出业务码 143000
+```
 
-If the representative probe is unavailable or returns an unexpected 5xx,
-keep generated authentication cases pending and mark execution blocked; do
-not template guessed status or business-code values across the module.
+Contract generation may seed only observable values defined by OpenAPI. It
+must cover required Header/body fields, illegal enum and pattern values,
+min/max and pagination boundaries, and required upload files when a matching
+error response is declared. It marks all seeds `review_required: true` and all
+contract logic `draft`.
 
-The minimum contract-driven decisions are: success for every reachable operation; authentication for secured operations; validation for operations with parameters or request bodies; query behavior for list/search operations with filters, pagination, or sorting; and file behavior for multipart/upload/download operations. Authorization, business-error, safety, and boundary cases are required whenever source/configuration exposes those branches. A decision is not evidence by itself: the linked Bruno file must contain the corresponding request and assertions.
+Source enhancement scans controllers, orchestration/domain services,
+validation, permissions, exception handlers, state and uniqueness checks,
+external-call failures, and error-code definitions. A source candidate is not
+coverage until a reviewed `logic.yaml` entry links a real case. Do not invent
+fixtures, HTTP status, or business envelopes that source/contract evidence does
+not establish; leave the gap explicit.
 
-Do not manufacture cases that have no observable behavior. Explain exclusions in the manifest so the coverage checker can distinguish intentional scope from a missing test.
+Before copying authentication expectations across a module, execute one
+representative missing-credential and one invalid-credential probe. Preserve
+the application's real transport status and response envelope, including
+systems that return HTTP 200 with a business error code.
 
-For object-valued query parameters, verify the target framework's binding
-before writing the URL. For example, a Spring `@ModelAttribute UserQuery`
-usually needs `?userName=admin&pageNum=1&pageSize=10`, not
-`?user={{user}}`; the latter is one scalar string and commonly produces HTTP
-400. Record the chosen serialization in the case or endpoint manifest.
+For object-valued query parameters, verify framework binding and emit flattened
+fields or a documented supported serialization. Never send a whole object as
+an unexplained scalar variable.
 
 ## Module Flow
 
-For a module or endpoint explicitly marked `flow_required: true` (or with a
-non-empty `flow_kind`), add a separate ordered flow in `flows.yaml`:
-
-```yaml
-- id: USER_CRUD_FLOW
-  module: user
-  steps:
-    - operation: create
-      case_id: USER_CREATE_OK
-      capture: user_id
-    - operation: update
-      case_id: USER_UPDATE_OK
-      uses: user_id
-    - operation: query
-      case_id: USER_QUERY_AFTER_UPDATE
-      uses: user_id
-    - operation: delete
-      case_id: USER_DELETE_OK
-      uses: user_id
-    - operation: query
-      case_id: USER_QUERY_AFTER_DELETE
-      assert_absent: user_id
-```
-
-The default order is create -> update -> query -> delete -> query. If an operation is not exposed by the module, omit that step and record the missing capability and reason. The flow must use the same captured record and must remain deterministic even when other cases run before it.
+Only a module or endpoint explicitly marked `flow_required: true` or with a
+non-empty `flow_kind` needs an ordered flow. Capture and reuse the same record
+through create/update/query/delete/post-delete query. If the API lacks a step,
+record that capability gap; do not invent an endpoint. HTTP method alone never
+implies CRUD flow coverage.

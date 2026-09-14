@@ -115,6 +115,7 @@ CASE_DOCS_START = "<!-- AUTO_CASES_START -->"
 CASE_DOCS_END = "<!-- AUTO_CASES_END -->"
 CHINESE_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 BUSINESS_FILE_RE = re.compile(r"^\d{2,}-.+\.bru$", re.IGNORECASE)
+GENERIC_CASE_TITLES = {"请求成功", "操作成功", "成功", "请求失败", "参数校验失败"}
 
 
 def is_business_request(path: Path, root: Path) -> bool:
@@ -163,6 +164,14 @@ def bru_meta_sequence(content: str) -> int | None:
         return None
     match = re.search(r"(?m)^\s*seq:\s*(\d+)\s*$", block.group(1))
     return int(match.group(1)) if match else None
+
+
+def bru_meta_tags(content: str) -> set[str]:
+    block = re.search(r"(?ms)^\s*meta\s*\{(.*?)^\s*\}", content)
+    if block is None:
+        return set()
+    match = re.search(r"(?m)^\s*tags:\s*\[([^]]*)\]\s*$", block.group(1))
+    return {item.strip() for item in match.group(1).split(",") if item.strip()} if match else set()
 
 
 def is_http_request_content(content: str) -> bool:
@@ -757,6 +766,19 @@ def bruno_body(content: str, kind: str) -> str | None:
     return None
 
 
+def parse_json_body(value: Any, source: str) -> Any:
+    """Parse JSON strictly so malformed Bruno bodies are never reported as missing fields."""
+
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"{source} is invalid JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}"
+        ) from exc
+
+
 def bruno_headers(content: str) -> dict[str, str]:
     match = re.search(r"(?mis)^\s*headers\s*\{(.*?)^\s*\}", content)
     if match is None:
@@ -771,17 +793,7 @@ def bruno_headers(content: str) -> dict[str, str]:
 
 def normalized_body(value: Any, kind: str, rendered: bool = False) -> Any:
     if kind == "json":
-        if rendered:
-            try:
-                return json.loads(str(value))
-            except json.JSONDecodeError:
-                return str(value).strip()
-        if isinstance(value, str):
-            try:
-                return json.loads(value)
-            except json.JSONDecodeError:
-                return value.strip()
-        return value
+        return parse_json_body(str(value), "Bruno body") if rendered else parse_json_body(value, "manifest request.body")
     if kind in {"form-urlencoded", "multipart-form", "file"}:
         if rendered:
             pairs = {}
@@ -845,9 +857,9 @@ def case_files(
             contents[path] = content
     for path, content in contents.items():
         if re.search(r"\burl:\s+https?://(?!\{\{)", content, re.IGNORECASE):
-            errors.append(f"Bruno file {path} hard-codes a URL; use the BASE_URL environment variable")
-        if not re.search(r"\burl:\s*\{\{BASE_URL\}\}(?:/|\?|\s|$)", content):
-            errors.append(f"Bruno file {path} does not use the BASE_URL environment variable")
+            errors.append(f"Bruno file {path} hard-codes a URL; use the baseUrl environment variable")
+        if not re.search(r"\burl:\s*\{\{(?:baseUrl|BASE_URL)\}\}(?:/|\?|\s|$)", content):
+            errors.append(f"Bruno file {path} does not use the baseUrl environment variable")
     covered: set[str] = set()
     used_paths: set[Path] = set()
     case_paths: dict[str, Path] = {}
@@ -917,6 +929,9 @@ def case_files(
             )
         endpoint = (endpoints or {}).get(str(case.get("endpoint_id")))
         if endpoint:
+            risk = case_risk(case, endpoint)
+            if risk not in bru_meta_tags(contents[matched]):
+                errors.append(f"case {case_id} Bruno meta.tags is missing risk {risk}")
             actual_request = bruno_request(contents[matched])
             expected_method = str(endpoint.get("method", "GET")).upper()
             expected_path = str((case.get("request") or {}).get("path") or endpoint.get("path") or "/")
@@ -993,24 +1008,36 @@ def case_files(
                     errors.append(
                         f"case {case_id} Bruno body type is {actual_request.get('body_type')}, expected {expected_body_type}"
                     )
-            # Reconcile what this case declares. Negative cases intentionally
-            # omit OpenAPI-required fields, so the schema cannot define the
-            # fields that must appear in every generated request.
-            required_body_fields = set(body) if isinstance(body, dict) else set()
-            if required_body_fields:
-                body_blocks = "\n".join(re.findall(r"(?mis)^\s*body:[^\s{]+\s*\{(.*?)^\s*\}", contents[matched]))
-                for key in required_body_fields:
-                    if not re.search(rf"(?:\"{re.escape(str(key))}\"|^\s*{re.escape(str(key))}\s*:)", body_blocks, re.MULTILINE):
-                        errors.append(f"case {case_id} Bruno body is missing request field {key}")
             actual_kind = str(actual_request.get("body_type", "none"))
             if actual_kind != "none":
                 actual_body = bruno_body(contents[matched], actual_kind)
-                if actual_body is None or normalized_body(actual_body, actual_kind, True) != normalized_body(body, actual_kind):
-                    errors.append(f"case {case_id} Bruno body content does not match manifest request")
+                if actual_body is None:
+                    errors.append(f"case {case_id} Bruno body:{actual_kind} block is missing or unterminated")
+                else:
+                    try:
+                        rendered_body = normalized_body(actual_body, actual_kind, True)
+                        manifest_body = normalized_body(body, actual_kind)
+                    except ValueError as exc:
+                        errors.append(f"case {case_id} {exc}")
+                    else:
+                        if rendered_body != manifest_body:
+                            errors.append(f"case {case_id} Bruno body content does not match manifest request")
+                        if isinstance(manifest_body, dict) and isinstance(rendered_body, dict):
+                            for key in manifest_body:
+                                if key not in rendered_body:
+                                    errors.append(f"case {case_id} Bruno body is missing request field {key}")
                 if actual_kind == "graphql" and isinstance(body, dict) and body.get("variables") is not None:
                     actual_variables = bruno_body(contents[matched], "graphql:vars")
-                    if actual_variables is None or normalized_body(actual_variables, "json", True) != body.get("variables"):
-                        errors.append(f"case {case_id} Bruno GraphQL variables do not match manifest request")
+                    if actual_variables is None:
+                        errors.append(f"case {case_id} Bruno GraphQL variables block is missing or unterminated")
+                    else:
+                        try:
+                            variables = normalized_body(actual_variables, "json", True)
+                        except ValueError as exc:
+                            errors.append(f"case {case_id} GraphQL variables {exc}")
+                        else:
+                            if variables != body.get("variables"):
+                                errors.append(f"case {case_id} Bruno GraphQL variables do not match manifest request")
         if "assert {" not in contents[matched]:
             errors.append(f"case {case_id} Bruno file has no assert block: {matched}")
         covered.add(case_id)
@@ -1092,7 +1119,7 @@ def collection_runtime_errors(bru_root: Path, request_roots: list[Path] | None =
                 "req.setHeader",
                 "req.getPath",
                 'value === ""',
-                "globMatches(pattern, requestPath)",
+                "runtimeConfig.headers",
                 "CryptoJS.SHA256(signText)",
                 'setCommonHeader("sign"',
                 'setCommonHeader("timestamp"',
@@ -1191,6 +1218,7 @@ def check_module(
     strict_bru_modules: bool = False,
     bru_module_name: str | None = None,
     selected_risks: set[str] | None = None,
+    selected_case_ids: set[str] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     errors: list[str] = []
     endpoints_doc = load_data(module_dir / "endpoints.yaml")
@@ -1287,6 +1315,11 @@ def check_module(
     for case in cases:
         if not str(case.get("endpoint_id", "")).strip():
             errors.append(f"case {case.get('id')} has no endpoint_id")
+        title = str(case.get("title", "")).strip()
+        if not title or not CHINESE_RE.search(title):
+            errors.append(f"case {case.get('id')} must declare a Chinese business title")
+        elif title in GENERIC_CASE_TITLES:
+            errors.append(f"case {case.get('id')} uses generic title {title!r}; include the endpoint business action")
         expected = case.get("expected") if isinstance(case.get("expected"), dict) else {}
         if expected.get("http_status") is None:
             errors.append(f"case {case.get('id')} has no expected.http_status")
@@ -1334,6 +1367,11 @@ def check_module(
                 inapplicable = [item for item in decisions if item.get("applicable") is False]
                 if not applicable and not inapplicable:
                     errors.append(f"endpoint {endpoint.get('id')} has invalid scenario decision for {category}")
+                for decision in decisions:
+                    if decision.get("status") not in {"inferred", "confirmed"}:
+                        errors.append(
+                            f"endpoint {endpoint.get('id')} scenario {category} must have status inferred or confirmed"
+                        )
                 if inapplicable and any(not str(item.get("reason", "")).strip() for item in inapplicable):
                     errors.append(f"endpoint {endpoint.get('id')} scenario {category}=false has no reason")
                 if applicable and not any(case_covers_scenario(case, category) for case in endpoint_case_objects):
@@ -1398,9 +1436,22 @@ def check_module(
             errors.append(f"logic {logic.get('id')} Swagger tag does not match module {module_id}")
         if not logic.get("case_ids"):
             errors.append(f"logic {logic.get('id')} has no linked case_ids")
+        if not str(logic.get("source_symbol") or logic.get("source") or "").strip():
+            errors.append(f"logic {logic.get('id')} has no source_symbol")
+        if not str(logic.get("condition", "")).strip():
+            errors.append(f"logic {logic.get('id')} has no observable condition")
         for case_id in logic.get("case_ids", []):
             if case_id not in case_ids:
                 errors.append(f"logic {logic.get('id')} references unknown case {case_id}")
+        expected_business_code = logic.get("expected_business_code")
+        if expected_business_code is not None and not any(
+            str((cases_by_id.get(str(case_id), {}).get("expected") or {}).get("business_code"))
+            == str(expected_business_code)
+            for case_id in logic.get("case_ids", [])
+        ):
+            errors.append(
+                f"logic {logic.get('id')} business code {expected_business_code} has no matching case expectation"
+            )
 
     flow_items = first_list(flows_doc, "flows") or (flows_doc if isinstance(flows_doc, list) else [])
     requires_ordered_flow = flow_required(endpoints_doc, endpoints)
@@ -1450,8 +1501,12 @@ def check_module(
             case_id for case_id, case in cases_by_id.items()
             if str(case.get("endpoint_id")) not in approved_excluded_endpoint_ids
             and (
-                not selected_risks
-                or case_risk(case, next((item for item in endpoints if item.get("id") == case.get("endpoint_id")), None)) in selected_risks
+                case_id in selected_case_ids
+                if selected_case_ids is not None
+                else (
+                    not selected_risks
+                    or case_risk(case, next((item for item in endpoints if item.get("id") == case.get("endpoint_id")), None)) in selected_risks
+                )
             )
         }
         errors.extend(f"case {case_id} was not executed" for case_id in sorted(required_case_ids - executed))
@@ -1461,11 +1516,15 @@ def check_module(
             if all(
                 step.get("case_id") in cases_by_id
                 and (
-                    not selected_risks
-                    or case_risk(
-                        cases_by_id[step["case_id"]],
-                        next((item for item in endpoints if item.get("id") == cases_by_id[step["case_id"]].get("endpoint_id")), None),
-                    ) in selected_risks
+                    step.get("case_id") in selected_case_ids
+                    if selected_case_ids is not None
+                    else (
+                        not selected_risks
+                        or case_risk(
+                            cases_by_id[step["case_id"]],
+                            next((item for item in endpoints if item.get("id") == cases_by_id[step["case_id"]].get("endpoint_id")), None),
+                        ) in selected_risks
+                    )
                 )
                 for step in flow.get("steps", [])
                 if isinstance(step, dict)
@@ -1600,10 +1659,29 @@ def main() -> int:
     )
     parser.add_argument("--module", help="check one module id, display name, Tag, or directory")
     parser.add_argument("--risk", action="append", choices=sorted(RISK_CLASSES), help="execution risk class; defaults to read-only")
+    parser.add_argument("--plan", help="execution plan from qa/execution/plans.yaml")
     parser.add_argument("--allow-dangerous", action="store_true", help="explicitly allow destructive or external-side-effect evidence")
     parser.add_argument("--json", action="store_true", dest="as_json")
     args = parser.parse_args()
-    selected_risks = set(args.risk or ["read-only"])
+    if args.plan and args.risk:
+        parser.error("--plan and --risk cannot be combined")
+    plan_max_cases: int | None = None
+    if args.plan:
+        plans_path = args.contracts_root.parent / "execution" / "plans.yaml"
+        plans_document = load_data(plans_path)
+        plans = plans_document.get("plans", {}) if isinstance(plans_document, dict) else {}
+        plan = plans.get(args.plan) if isinstance(plans, dict) else None
+        if not isinstance(plan, dict):
+            parser.error(f"unknown execution plan: {args.plan}")
+        plan_risks = plan.get("risks")
+        if not isinstance(plan_risks, list) or not plan_risks or any(str(risk) not in RISK_CLASSES for risk in plan_risks):
+            parser.error(f"execution plan {args.plan} has invalid risks")
+        selected_risks = {str(risk) for risk in plan_risks}
+        plan_max_cases = plan.get("max_cases_per_module")
+        if plan_max_cases is not None and (not isinstance(plan_max_cases, int) or plan_max_cases < 1):
+            parser.error(f"execution plan {args.plan} max_cases_per_module must be a positive integer")
+    else:
+        selected_risks = set(args.risk or ["read-only"])
     if selected_risks & {"destructive", "external-side-effect"} and not args.allow_dangerous:
         parser.error("destructive and external-side-effect scopes require --allow-dangerous")
 
@@ -1700,8 +1778,10 @@ def main() -> int:
     all_case_ids: dict[str, str] = {}
     all_case_fingerprints: dict[str, str] = {}
     required_case_ids_global: set[str] = set()
+    selected_case_ids_by_module: dict[str, set[str]] = {}
     all_flow_ids: dict[str, str] = {}
     all_logic_ids: dict[str, str] = {}
+    source_candidate_links: set[str] = set()
     offline_inventory_count: int | None = None
     contract_provenance_unverified = False
     for module_id, module_dir in modules:
@@ -1729,6 +1809,17 @@ def main() -> int:
                 for item in module_exclusions
                 if item.get("endpoint_id") and is_approved_exclusion(item)
             }
+            eligible_case_ids = [
+                str(case.get("id"))
+                for case in module_cases
+                if case.get("id")
+                and str(case.get("endpoint_id")) not in approved_endpoint_ids
+                and case_risk(case, endpoint_lookup.get(str(case.get("endpoint_id")))) in selected_risks
+            ]
+            if plan_max_cases is not None:
+                eligible_case_ids = eligible_case_ids[:plan_max_cases]
+            selected_case_ids_by_module[module_id] = set(eligible_case_ids)
+            required_case_ids_global.update(eligible_case_ids)
             for case in module_cases:
                 case_id = str(case.get("id", ""))
                 if not case_id:
@@ -1744,11 +1835,6 @@ def main() -> int:
                         f"cases {previous_fingerprint} and {case_id} duplicate endpoint/scenario/request/assertions"
                     )
                 all_case_fingerprints[fingerprint] = case_id
-                if (
-                    str(case.get("endpoint_id")) not in approved_endpoint_ids
-                    and case_risk(case, endpoint_lookup.get(str(case.get("endpoint_id")))) in selected_risks
-                ):
-                    required_case_ids_global.add(case_id)
         flow_path = module_dir / "flows.yaml"
         if flow_path.is_file():
             flow_doc = load_data(flow_path)
@@ -1767,9 +1853,19 @@ def main() -> int:
                     errors.append(f"logic id {logic_id} is duplicated in modules {all_logic_ids[logic_id]} and {module_id}")
                 if logic_id:
                     all_logic_ids[logic_id] = module_id
+                if logic.get("source_candidate_id"):
+                    source_candidate_links.add(str(logic["source_candidate_id"]))
 
     if not args.module:
         errors.extend(validate_cross_module_flows(args.contracts_root, all_case_ids))
+        candidates_path = args.contracts_root / "source-logic-candidates.yaml"
+        if candidates_path.is_file():
+            candidates = first_list(load_data(candidates_path), "candidates")
+            for candidate in candidates:
+                if candidate.get("coverage_required") is True and str(candidate.get("id")) not in source_candidate_links:
+                    errors.append(
+                        f"source logic candidate {candidate.get('id')} has no logic.yaml entry or linked case"
+                    )
 
     endpoint_ids = [str(endpoint.get("id", "")) for _, endpoint in endpoint_records]
     duplicate_endpoint_ids = sorted({item for item in endpoint_ids if item and endpoint_ids.count(item) > 1})
@@ -1896,6 +1992,7 @@ def main() -> int:
             strict_bru_modules=(args.contracts_root / "modules").is_dir(),
             bru_module_name=module_dir.name,
             selected_risks=selected_risks,
+            selected_case_ids=selected_case_ids_by_module.get(module_id, set()),
         )
         module_reports[module_id] = report
         for key in totals:
@@ -1954,6 +2051,7 @@ def main() -> int:
         "ok": completion_ok,
         "contract_provenance_unverified": contract_provenance_unverified,
         "execution_scope": sorted(selected_risks),
+        "execution_plan": args.plan,
         "module_scope": args.module,
         "openapi_sha256": openapi_sha256,
         "by_tag": {

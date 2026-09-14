@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mno-bruno-qa"
+version = "2.0.0"
+description = "Reusable Bruno API QA generation and execution CLI"
+requires-python = ">=3.10"
+dependencies = ["PyYAML>=6"]
+
+[project.scripts]
+mno-bruno-qa = "mno_bruno_qa:main"
+
+[tool.setuptools]
+package-dir = {"" = "scripts"}
+py-modules = [
+  "analyze_java_logic",
+  "analyze_source_logic",
+  "check_api_coverage",
+  "check_artifact_safety",
+  "check_version_compatibility",
+  "execution_config",
+  "fetch_local_openapi",
+  "manifest_io",
+  "materialize_missing_bru",
+  "mno_bruno_qa",
+  "normalize_bruno_report",
+  "parse_openapi",
+  "qa_lock",
+  "run_bruno",
+  "runtime_preflight",
+  "scripts_manager",
+  "tool_version",
+  "validate_flow_execution",
+]

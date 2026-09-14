@@ -4,7 +4,10 @@ Use module manifests as the source of truth. The global index is generated from 
 
 ## Version Lock
 
-Keep version-lock.yaml at the contracts root. It records the business Git commit against which the Bruno collection was reviewed and executed. A stale lock is not a passing state; classify the changed files, adapt affected modules when needed, then advance the lock.
+Keep `version-lock.yaml` and `qa-lock.yaml` at the contracts root. The first
+records the non-empty business Git commit and a digest excluding `qa/**`; the
+second records OpenAPI, module, case, and generation-state fingerprints. A
+stale lock is not a passing state.
 
     version: 1
     business:
@@ -17,6 +20,22 @@ The generated global index should also record `generation_status` (`draft`,
 `runnable`, `verified`, or `blocked`), the offline contract SHA, inventory
 counts, blocked-module count, and `execution_config_file`. `draft` is an
 expected intermediate state, not completion evidence.
+
+`generation-state.yaml` is the incremental generator ledger:
+
+```yaml
+version: 1
+generator_version: 2.0.0
+openapi_sha256: ...
+last_generated_at: ...
+endpoints: {}
+modules: {}
+cases: {}
+deleted_endpoint_ids: []
+manual_review_cases: []
+```
+
+See [incremental-generation.md](incremental-generation.md) for update rules.
 
 ## module-map.yaml
 
@@ -70,22 +89,12 @@ than read from a global mutable manifest.
 
 ## execution/config.yaml
 
-This is the only shared runtime configuration. It selects the external Bruno
-environment, authentication mode, and path-scoped common Headers. It has no
-format-version field. The parser rejects unknown fields and incompatible
-authentication settings.
-
-The five authentication modes are `none`, `seres-sign`, `bearer`, `api-key`,
-and `cookie`. Values ending in `_env` name Bruno environment variables; they
-never contain credentials. OAuth2 token acquisition stays in an external
-bootstrap and the resulting token is consumed through `bearer`. SERES signing
-uses fixed SHA-256 inputs and fixed `sign`, `timestamp`, and `accesskey` Header
-names.
-
-Common Headers accept exactly one of `env` or `value`, plus optional path
-patterns. An empty environment-backed value is not sent. Request-local Headers
-have priority. A negative case can remove configured Headers after collection
-injection with:
+This file contains only `active_environment` and `sign`. The parser rejects all
+authentication, Header/Cookie, token/key selector, path rule, and unknown
+fields. Common Headers live in the active environment's independent
+`headers {}` KV block. The CLI resolves its `{{VAR}}` references and injects
+every non-empty value from `collection.bru`; request-local Headers have
+priority. A negative case can remove a configured Header with:
 
 ```yaml
 request:
@@ -93,9 +102,8 @@ request:
     - operatorInfo
 ```
 
-See [execution-config.md](execution-config.md) for the schema and generated
-template. `BASE_URL`, credential variables, and token variables are read only
-from `execution/environments/<active_environment>.bru`.
+See [execution-config.md](execution-config.md) for the schema, Header format,
+signing behavior, risk plans, and script/shared-CLI modes.
 
 ## Request and response payloads
 
@@ -128,10 +136,10 @@ Cases link back to an endpoint and optionally to source logic. Assertions must i
         endpoint_id: USER_CREATE
         risk: isolated-write
         scenarios:
-          success: {applicable: true}
-          authentication: {applicable: true}
-          validation: {applicable: true}
-          authorization: {applicable: false, reason: "endpoint has no role or tenant guard"}
+          success: {applicable: true, status: confirmed}
+          authentication: {applicable: true, status: inferred}
+          validation: {applicable: true, status: inferred}
+          authorization: {applicable: false, status: confirmed, reason: "endpoint has no role or tenant guard"}
         logic_ids:
           - USER_CREATE_NORMAL_LOGIC
         bru: 01-创建用户成功.bru
@@ -217,14 +225,14 @@ instead of repeating it on every case:
         method: POST
         path: /system/user
         scenario_matrix:
-          success: {applicable: true}
-          authentication: {applicable: true}
-          authorization: {applicable: false, reason: "no role/tenant guard"}
-          validation: {applicable: true}
-          business_error: {applicable: true}
-          query: {applicable: false, reason: "not a query operation"}
-          safety: {applicable: false, reason: "no idempotency contract"}
-          file: {applicable: false, reason: "not a file operation"}
+          success: {applicable: true, status: inferred, reason: "reachable operation"}
+          authentication: {applicable: true, status: inferred, reason: "OpenAPI security"}
+          authorization: {applicable: false, status: inferred, reason: "no role/tenant guard"}
+          validation: {applicable: true, status: inferred, reason: "required request fields"}
+          business_error: {applicable: true, status: confirmed, reason: "source business error"}
+          query: {applicable: false, status: inferred, reason: "not a query operation"}
+          safety: {applicable: false, status: inferred, reason: "no idempotency contract"}
+          file: {applicable: false, status: inferred, reason: "not a file operation"}
 ```
 
 Run the coverage checker with `--require-scenarios` at the completion gate;
@@ -232,17 +240,30 @@ it accepts either this endpoint-level form or per-case `scenarios` entries.
 
 ## Module logic.yaml
 
+Contract generation first writes `status: draft` entries for OpenAPI-provable
+success, validation, query, and file behavior. Source enhancement then adds
+reviewable source-backed entries. Every entry must name a real source symbol or
+contract source, describe an observable condition, declare expected HTTP and
+business results when known, and link at least one existing case. Every
+coverage-required source candidate and business error code without a linked
+case is a checker error.
+
     version: 1
     module: system-user
     logic:
       - id: USER_CREATE_NORMAL_LOGIC
-        source: SysUserService.insertUser
+        status: confirmed
+        source_symbol: SysUserService.insertUser
         condition: username is unique and required data is valid
+        expected_http_status: 200
         case_ids:
           - USER_CREATE_OK
       - id: USER_CREATE_DUPLICATE_LOGIC
-        source: SysUserService.insertUser
+        status: confirmed
+        source_symbol: SysUserService.insertUser
         condition: username already exists
+        expected_http_status: 200
+        expected_business_code: 601
         case_ids:
           - USER_CREATE_DUPLICATE
 
@@ -312,6 +333,6 @@ Generate this file; do not hand-edit it:
         endpoint_count: 12
         case_count: 48
 
-The global checker compares the union of module endpoints with the offline Swagger inventory and verifies that every endpoint, logic path, case, and flow is accounted for.
+The global checker compares the union of module endpoints with the offline Swagger inventory and verifies that every endpoint, logic path, source candidate, case, and flow is accounted for. JSON request bodies are extracted as complete brace-balanced blocks, parsed with `json.loads()`, and compared structurally; malformed JSON reports its parse location.
 
 The checker should also reject duplicate IDs, duplicate case-to-file mappings, unregistered Bruno files, unknown case endpoint references, and missing scenario decisions when strict matrix validation is enabled. Pass the saved offline document explicitly (`--openapi contracts/openapi.json`) so a manifest cannot validate against itself.

@@ -193,13 +193,14 @@ def main() -> int:
             if not static_ok:
                 static_failures.append("static coverage results did not pass")
     base_url: str | None = None
-    if environment_values.get("BASE_URL"):
+    base_url_value = environment_values.get("baseUrl") or environment_values.get("BASE_URL")
+    if base_url_value:
         try:
-            base_url = validate_base_url(environment_values["BASE_URL"])
+            base_url = validate_base_url(base_url_value)
         except argparse.ArgumentTypeError as exc:
-            execution_failures.append(f"Bruno environment variable BASE_URL has an invalid base URL: {exc}")
+            execution_failures.append(f"Bruno environment variable baseUrl has an invalid base URL: {exc}")
     if not base_url:
-        execution_failures.append("base URL is missing; configure BASE_URL in the active Bruno environment")
+        execution_failures.append("base URL is missing; configure baseUrl in the active Bruno environment")
     if args.timeout <= 0:
         execution_failures.append("timeout must be positive")
 

@@ -114,6 +114,18 @@ def git(repo: Path, *args: str) -> str:
         raise SystemExit(f"git {' '.join(args)} failed in {repo}: {exc.output.strip()}") from exc
 
 
+def current_git_commit(repo: Path) -> str:
+    commit = git(repo, "rev-parse", "HEAD")
+    if not commit:
+        raise SystemExit(f"git rev-parse HEAD returned an empty commit in {repo}")
+    return commit
+
+
+def is_qa_path(path: str) -> bool:
+    normalized = path.replace("\\", "/").lstrip("./")
+    return normalized == "qa" or normalized.startswith("qa/")
+
+
 def git_available(repo: Path) -> bool:
     try:
         subprocess.run(
@@ -138,13 +150,13 @@ def changed_files(repo: Path, old_sha: str, current_sha: str) -> list[str]:
 
 
 def dirty_files(repo: Path) -> list[str]:
-    """Return tracked worktree paths that are not represented by HEAD."""
+    """Return business worktree paths that are not represented by HEAD."""
 
     try:
         # Do not use git(), whose strip() would remove the leading porcelain
         # status column and shift the path by one character.
         raw = subprocess.check_output(
-            ["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=no"],
+            ["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=all"],
             text=True,
             encoding="utf-8",
             errors="strict",
@@ -161,7 +173,8 @@ def dirty_files(repo: Path) -> list[str]:
         # observable file that needs impact classification.
         if " -> " in value:
             value = value.rsplit(" -> ", 1)[-1]
-        paths.append(value)
+        if not is_qa_path(value):
+            paths.append(value)
     return paths
 
 
@@ -208,6 +221,22 @@ def classify(paths: list[str], rules: dict[str, Any]) -> str:
     return "non-api"
 
 
+def change_classes(paths: list[str], rules: dict[str, Any]) -> dict[str, list[str]]:
+    ignored = [*DEFAULT_IGNORE_PATTERNS, *rules.get("ignore_patterns", [])]
+    api_patterns = rules.get("api_patterns", DEFAULT_API_PATTERNS)
+    groups = {"business_code": [], "qa_assets": [], "unrelated": []}
+    for path in paths:
+        if is_qa_path(path):
+            groups["qa_assets"].append(path)
+        elif any(fnmatch.fnmatch(path, pattern) for pattern in ignored):
+            groups["unrelated"].append(path)
+        elif any(fnmatch.fnmatch(path, pattern) for pattern in api_patterns):
+            groups["business_code"].append(path)
+        else:
+            groups["unrelated"].append(path)
+    return groups
+
+
 def dump_lock(path: Path, lock: dict[str, Any]) -> None:
     try:
         import yaml  # type: ignore[import-not-found]
@@ -251,7 +280,7 @@ def main() -> int:
             return 3
         digest = source_digest(args.business_repo)
         has_git = git_available(args.business_repo)
-        current_sha = git(args.business_repo, "rev-parse", "HEAD") if has_git else f"filesystem:{digest[:16]}"
+        current_sha = current_git_commit(args.business_repo) if has_git else f"filesystem:{digest[:16]}"
         current_ref = git(args.business_repo, "symbolic-ref", "--short", "-q", "HEAD") or "detached" if has_git else "filesystem"
         initialized_at = datetime.now(timezone.utc).isoformat()
         lock = {
@@ -302,7 +331,7 @@ def main() -> int:
     has_git = git_available(args.business_repo)
     current_digest = source_digest(args.business_repo)
     if has_git:
-        current_sha = git(args.business_repo, "rev-parse", "HEAD")
+        current_sha = current_git_commit(args.business_repo)
         current_ref = git(args.business_repo, "symbolic-ref", "--short", "-q", "HEAD") or "detached"
         dirty = dirty_files(args.business_repo)
     else:
@@ -385,7 +414,8 @@ def main() -> int:
         return 2
 
     if has_git and not str(locked_sha).startswith("filesystem:"):
-        paths = changed_files(args.business_repo, str(locked_sha), current_sha)
+        all_paths = changed_files(args.business_repo, str(locked_sha), current_sha)
+        paths = [path for path in all_paths if not is_qa_path(path)]
     else:
         paths = ["<filesystem source digest changed>"]
     rules = load_data(args.rules) if args.rules else {}
@@ -396,7 +426,12 @@ def main() -> int:
     # collection; classifying the placeholder as non-api would make the lock
     # advance without knowing what changed.
     impact = "api-impact" if not has_git else classify(paths, rules)
-    report.update({"status": "stale", "impact": impact, "changed_files": paths})
+    report.update({
+        "status": "stale",
+        "impact": impact,
+        "changed_files": paths,
+        "change_classes": change_classes(paths, rules),
+    })
 
     if args.write:
         if impact == "api-impact" and not args.tests_adapted:

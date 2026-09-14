@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Load, validate, and materialize the shared Bruno execution configuration."""
+"""Load the minimal QA config and the extended Bruno environment format."""
 
 from __future__ import annotations
 
@@ -13,62 +13,53 @@ from typing import Any
 
 sys.dont_write_bytecode = True
 
-
 RUNTIME_CONFIG_ENV = "__QA_EXECUTION_CONFIG"
 COLLECTION_MARKER = "bru-api-test-generator: runtime-config"
 COLLECTION_END_MARKER = "bru-api-test-generator: runtime-config-end"
-AUTH_MODES = {"none", "seres-sign", "bearer", "api-key", "cookie"}
-ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+SIGN_MODES = {"disabled", "seres-sign"}
+SIGN_ENV_NAMES = ("ACCESS_KEY", "SECRET_KEY")
 ENVIRONMENT_FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 HEADER_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+VARIABLE_RE = re.compile(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}")
 
-
-DEFAULT_CONFIG_TEMPLATE = """# 当前激活环境。
-# 这里填写环境名称，不包含 .bru 后缀。
-# local 对应 environments/local.bru。
-active_environment: local
-
-auth:
-  # 请求认证模式，可选值：
-  # none：不添加认证信息，适用于默认本地访问。
-  # seres-sign：使用 SERES Sign 签名。
-  # bearer：添加 Authorization: Bearer <token>。
-  # api-key：添加 X-API-Key。
-  # cookie：添加 Cookie。
-  mode: none
-
-  # mode 为 seres-sign 时取消下面两行注释。
-  # 配置值是 Bruno 环境变量名，不是真实密钥。
-  # access_key_env: ACCESS_KEY
-  # secret_key_env: SECRET_KEY
-
-  # mode 为 bearer 时配置令牌对应的环境变量名。
-  # token_env: ACCESS_TOKEN
-
-  # mode 为 api-key 时配置 API Key 对应的环境变量名。
-  # key_env: API_KEY
-
-  # mode 为 cookie 时配置完整 Cookie 对应的环境变量名。
-  # cookie_env: SESSION_COOKIE
-
-custom_headers:
-  # 节点名称就是实际发送的 HTTP Header 名称。
-  operatorInfo:
-    # env 表示从当前 Bruno 环境读取值。
-    # local.bru 中该值为空时，不发送这个 Header。
-    env: OPERATOR_INFO
-
-    # 只向匹配的请求路径注入，匹配时忽略查询参数。
-    paths:
-      - "/v*/admin/**"
-
-  # 非敏感固定值使用 value；value 和 env 不能同时配置。
-  # X-Gray-Traffic:
-  #   value: "true"
-  #   paths:
-  #     - "/v*/internal/**"
+DEFAULT_CONFIG_TEMPLATE = """active_environment: local
+sign: disabled
 """
 
+DEFAULT_ENVIRONMENT_TEMPLATE = """vars {
+  baseUrl: http://127.0.0.1:9527
+  AUTH_TOKEN: ""
+  SESSION_COOKIE: ""
+  ACCESS_KEY: ""
+  SECRET_KEY: ""
+}
+
+headers {
+  Authorization: "Bearer {{AUTH_TOKEN}}"
+  Cookie: "{{SESSION_COOKIE}}"
+}
+"""
+
+DEFAULT_PLANS_TEMPLATE = """plans:
+  smoke:
+    risks:
+      - read-only
+    max_cases_per_module: 3
+
+  regression:
+    risks:
+      - read-only
+      - isolated-write
+
+  full:
+    risks:
+      - read-only
+      - isolated-write
+      - destructive
+      - external-side-effect
+    require_confirm: true
+"""
 
 BRUNO_JSON_TEMPLATE = {
     "version": "1",
@@ -77,50 +68,49 @@ BRUNO_JSON_TEMPLATE = {
     "ignore": ["node_modules", ".git"],
 }
 
-
 RUN_BAT_TEMPLATE = r"""@echo off
 setlocal
-
-rem 默认执行全部模块。
-rem 执行指定模块示例：qa\execution\run.bat --module "车辆管理"
-python "%~dp0..\scripts\run_bruno.py" %*
+python "%~dp0..\scripts\mno_bruno_qa.py" run --qa-root "%~dp0.." %*
 exit /b %errorlevel%
 """
 
-
 RUN_SH_TEMPLATE = """#!/usr/bin/env sh
 set -eu
-
-# 默认执行全部模块。
-# 执行指定模块示例：./qa/execution/run.sh --module "车辆管理"
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-exec python3 "$SCRIPT_DIR/../scripts/run_bruno.py" "$@"
+exec python3 "$SCRIPT_DIR/../scripts/mno_bruno_qa.py" run --qa-root "$SCRIPT_DIR/.." "$@"
 """
 
+SHARED_RUN_BAT_TEMPLATE = r"""@echo off
+setlocal
+mno-bruno-qa run --qa-root "%~dp0.." %*
+exit /b %errorlevel%
+"""
 
-EXECUTION_README_TEMPLATE = r"""# Bruno 执行入口
+SHARED_RUN_SH_TEMPLATE = """#!/usr/bin/env sh
+set -eu
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec mno-bruno-qa run --qa-root "$SCRIPT_DIR/.." "$@"
+"""
 
-`config.yaml` 是唯一公共运行配置。环境文件独立放在 `environments/`，认证和公共 Header 由 `../bruno/collection.bru` 在运行时统一注入。
+EXECUTION_README_TEMPLATE = """# Bruno 执行入口
 
-Windows：
+`config.yaml` 只选择环境并控制 SERES 签名；公共 Header 在当前环境文件的
+`headers {}` 块中维护，由 `collection.bru` 统一注入，请求自身 Header 优先。
 
 ```bat
-qa\execution\run.bat
-qa\execution\run.bat --module "车辆管理"
+qa\\execution\\run.bat --module ac --risk read-only
+qa\\execution\\run.bat --module ac --risk isolated-write --confirm-write
+qa\\execution\\run.bat --plan smoke
 ```
-
-Linux/macOS：
 
 ```sh
-./qa/execution/run.sh
-./qa/execution/run.sh --module "车辆管理"
+./qa/execution/run.sh --module ac --risk read-only
+./qa/execution/run.sh --plan regression --confirm-write
 ```
 
-模块运行只报告该模块结果且不会更新 `contracts/version-lock.yaml`。完整运行通过全部校验后才允许更新版本锁。
-
-Bruno GUI 不会自动发现集合外的环境文件。GUI 调试时需要手工导入 `environments/*.bru`，且 GUI 不会自动读取 `config.yaml`；标准执行方式是本目录的 BAT/SH 入口。
+默认只执行 `read-only`。写入、破坏性操作和外部副作用分别需要对应确认参数。
+模块运行只报告该模块，不更新 `contracts/version-lock.yaml`。
 """
-
 
 COLLECTION_TEMPLATE = f'''auth {{
   mode: none
@@ -143,17 +133,14 @@ script:pre-request {{
     return value;
   }};
 
-  const auth = runtimeConfig.auth;
-  if (auth.mode === "bearer") {{
-    setCommonHeader("Authorization", `Bearer ${{requireEnv(auth.token_env)}}`);
-  }} else if (auth.mode === "api-key") {{
-    setCommonHeader("X-API-Key", requireEnv(auth.key_env));
-  }} else if (auth.mode === "cookie") {{
-    setCommonHeader("Cookie", requireEnv(auth.cookie_env));
-  }} else if (auth.mode === "seres-sign") {{
+  Object.entries(runtimeConfig.headers || {{}}).forEach(([name, value]) => {{
+    setCommonHeader(name, value);
+  }});
+
+  if (runtimeConfig.sign === "seres-sign") {{
     const CryptoJS = require("crypto-js");
-    const secretKey = requireEnv(auth.secret_key_env);
-    const accessKey = requireEnv(auth.access_key_env);
+    const accessKey = requireEnv("ACCESS_KEY");
+    const secretKey = requireEnv("SECRET_KEY");
     const requestPath = req.getPath() || "/";
     const queryString = req.getQueryString() || "";
     const params = {{}};
@@ -187,41 +174,6 @@ script:pre-request {{
     setCommonHeader("timestamp", params.timestamp);
     setCommonHeader("accesskey", accessKey);
   }}
-
-  const requestPath = (req.getPath() || "/").split("?", 1)[0];
-  const globMatches = (pattern, value) => {{
-    let patternIndex = 0;
-    let valueIndex = 0;
-    let starPattern = -1;
-    let starValue = -1;
-    let starAllowsSlash = false;
-    while (valueIndex < value.length) {{
-      if (patternIndex < pattern.length && (pattern[patternIndex] === "?" || pattern[patternIndex] === value[valueIndex])) {{
-        patternIndex += 1;
-        valueIndex += 1;
-      }} else if (patternIndex < pattern.length && pattern[patternIndex] === "*") {{
-        starAllowsSlash = pattern[patternIndex + 1] === "*";
-        patternIndex += starAllowsSlash ? 2 : 1;
-        starPattern = patternIndex;
-        starValue = valueIndex;
-      }} else if (starPattern >= 0 && (starAllowsSlash || value[starValue] !== "/")) {{
-        starValue += 1;
-        valueIndex = starValue;
-        patternIndex = starPattern;
-      }} else {{
-        return false;
-      }}
-    }}
-    while (patternIndex < pattern.length && pattern[patternIndex] === "*") patternIndex += 1;
-    return patternIndex === pattern.length;
-  }};
-  Object.entries(runtimeConfig.custom_headers || {{}}).forEach(([name, settings]) => {{
-    if (settings.paths && !settings.paths.some((pattern) => globMatches(pattern, requestPath))) return;
-    const value = Object.prototype.hasOwnProperty.call(settings, "env")
-      ? bru.getEnvVar(settings.env)
-      : settings.value;
-    setCommonHeader(name, value);
-  }});
   // {COLLECTION_END_MARKER}
 }}
 '''
@@ -233,83 +185,23 @@ def _reject_unknown(document: dict[str, Any], allowed: set[str], location: str) 
         raise ValueError(f"{location} contains unsupported field(s): {', '.join(unknown)}")
 
 
-def _environment_name(value: Any, location: str) -> str:
-    if not isinstance(value, str) or not ENV_NAME_RE.fullmatch(value.strip()):
-        raise ValueError(f"{location} must name a Bruno environment variable")
-    return value.strip()
-
-
-def validate_execution_config(document: Any) -> dict[str, Any]:
+def validate_execution_config(document: Any) -> dict[str, str]:
     if not isinstance(document, dict):
         raise ValueError("execution config must contain an object")
-    _reject_unknown(document, {"active_environment", "auth", "custom_headers"}, "execution config")
-
+    _reject_unknown(document, {"active_environment", "sign"}, "execution config")
     active = document.get("active_environment")
     if not isinstance(active, str) or not active.strip():
         raise ValueError("active_environment must be a non-empty environment name")
     active = active.strip()
     if active.lower().endswith(".bru") or not ENVIRONMENT_FILE_RE.fullmatch(active):
         raise ValueError("active_environment must be a safe file name without a path or .bru suffix")
-
-    auth = document.get("auth")
-    if not isinstance(auth, dict):
-        raise ValueError("auth must contain an object")
-    mode = auth.get("mode")
-    if not isinstance(mode, str) or mode not in AUTH_MODES:
-        raise ValueError("auth.mode must be one of: none, seres-sign, bearer, api-key, cookie")
-    mode_fields = {
-        "none": set(),
-        "seres-sign": {"access_key_env", "secret_key_env"},
-        "bearer": {"token_env"},
-        "api-key": {"key_env"},
-        "cookie": {"cookie_env"},
-    }
-    _reject_unknown(auth, {"mode", *mode_fields[mode]}, "auth")
-    for field in sorted(mode_fields[mode]):
-        if field not in auth:
-            raise ValueError(f"auth.{field} is required when auth.mode is {mode}")
-        _environment_name(auth[field], f"auth.{field}")
-
-    custom_headers = document.get("custom_headers", {})
-    if custom_headers is None:
-        custom_headers = {}
-    if not isinstance(custom_headers, dict):
-        raise ValueError("custom_headers must contain an object")
-    normalized_headers: dict[str, dict[str, Any]] = {}
-    for raw_name, raw_settings in custom_headers.items():
-        if not isinstance(raw_name, str):
-            raise ValueError("custom_headers keys must be HTTP Header names")
-        name = raw_name
-        if not HEADER_NAME_RE.fullmatch(name):
-            raise ValueError(f"custom_headers contains an invalid HTTP Header name: {name!r}")
-        if not isinstance(raw_settings, dict):
-            raise ValueError(f"custom_headers.{name} must contain an object")
-        _reject_unknown(raw_settings, {"env", "value", "paths"}, f"custom_headers.{name}")
-        has_env = "env" in raw_settings
-        has_value = "value" in raw_settings
-        if has_env == has_value:
-            raise ValueError(f"custom_headers.{name} must configure exactly one of env or value")
-        settings = dict(raw_settings)
-        if has_env:
-            settings["env"] = _environment_name(settings["env"], f"custom_headers.{name}.env")
-        elif not isinstance(settings["value"], str) or not settings["value"]:
-            raise ValueError(f"custom_headers.{name}.value must be a non-empty string")
-        paths = settings.get("paths")
-        if paths is not None:
-            if not isinstance(paths, list) or not paths:
-                raise ValueError(f"custom_headers.{name}.paths must be a non-empty list")
-            if any(not isinstance(path, str) or not path.startswith("/") or "?" in path or "#" in path for path in paths):
-                raise ValueError(f"custom_headers.{name}.paths must contain request-path patterns without query strings")
-            settings["paths"] = list(dict.fromkeys(paths))
-        normalized_headers[name] = settings
-    return {
-        "active_environment": active,
-        "auth": {"mode": mode, **{field: auth[field].strip() for field in mode_fields[mode]}},
-        "custom_headers": normalized_headers,
-    }
+    sign = document.get("sign", "disabled")
+    if not isinstance(sign, str) or sign not in SIGN_MODES:
+        raise ValueError("sign must be one of: disabled, seres-sign")
+    return {"active_environment": active, "sign": sign}
 
 
-def load_execution_config(path: Path) -> dict[str, Any]:
+def load_execution_config(path: Path) -> dict[str, str]:
     if not path.is_file():
         raise ValueError(f"execution config does not exist: {path}")
     try:
@@ -317,7 +209,7 @@ def load_execution_config(path: Path) -> dict[str, Any]:
 
         document = yaml.safe_load(path.read_text(encoding="utf-8", errors="strict"))
     except ModuleNotFoundError as exc:
-        raise ValueError("execution config requires the existing PyYAML dependency") from exc
+        raise ValueError("execution config requires PyYAML") from exc
     except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:  # type: ignore[attr-defined]
         raise ValueError(f"cannot parse execution config {path}: {exc}") from exc
     return validate_execution_config(document)
@@ -327,54 +219,91 @@ def environment_file(config_path: Path, config: dict[str, Any]) -> Path:
     return config_path.parent / "environments" / f"{config['active_environment']}.bru"
 
 
-def load_bruno_environment(path: Path) -> dict[str, str]:
+def _unquote(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        return value[1:-1]
+    return value
+
+
+def load_bruno_environment_document(path: Path) -> dict[str, dict[str, str]]:
+    """Parse vars/vars:secret and the skill-owned headers block."""
+
     if not path.is_file():
         raise ValueError(f"Bruno environment does not exist: {path}")
     try:
         lines = path.read_text(encoding="utf-8", errors="strict").splitlines()
     except (OSError, UnicodeDecodeError) as exc:
         raise ValueError(f"cannot read Bruno environment {path}: {exc}") from exc
-    values: dict[str, str] = {}
-    in_vars = False
-    for raw_line in lines:
+    result: dict[str, dict[str, str]] = {"vars": {}, "headers": {}}
+    section: str | None = None
+    for line_no, raw_line in enumerate(lines, start=1):
         line = raw_line.strip()
-        if not in_vars:
-            match = re.match(r"^vars(?::secret)?\s*\{(.*)$", line)
-            if not match:
-                continue
-            in_vars = True
-            line = match.group(1).strip()
-        if "}" in line:
-            line, _ = line.split("}", 1)
-            closes = True
-        else:
-            closes = False
-        if line and not line.startswith(("#", "//", "~")):
-            match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$", line)
+        if not section:
+            match = re.fullmatch(r"(vars(?::secret)?|headers)\s*\{", line)
             if match:
-                value = match.group(2).strip()
-                if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-                    value = value[1:-1]
-                values[match.group(1)] = value
-        if closes:
-            in_vars = False
-    return values
+                section = "headers" if match.group(1) == "headers" else "vars"
+            elif line and not line.startswith(("#", "//", "~")):
+                raise ValueError(f"unsupported environment syntax at {path}:{line_no}: {line}")
+            continue
+        if line == "}":
+            section = None
+            continue
+        if not line or line.startswith(("#", "//", "~")):
+            continue
+        match = re.match(r"^([^:]+):\s*(.*)$", line)
+        if not match:
+            raise ValueError(f"invalid {section} entry at {path}:{line_no}")
+        name = match.group(1).strip()
+        value = _unquote(match.group(2))
+        if section == "vars" and not ENV_NAME_RE.fullmatch(name):
+            raise ValueError(f"invalid environment variable name at {path}:{line_no}: {name!r}")
+        if section == "headers" and not HEADER_NAME_RE.fullmatch(name):
+            raise ValueError(f"invalid HTTP Header name at {path}:{line_no}: {name!r}")
+        result[section][name] = value
+    if section:
+        raise ValueError(f"unterminated {section} block in {path}")
+    return result
+
+
+def load_bruno_environment(path: Path) -> dict[str, str]:
+    """Compatibility helper returning only Bruno variables."""
+
+    return load_bruno_environment_document(path)["vars"]
+
+
+def resolved_environment_headers(document: dict[str, dict[str, str]]) -> dict[str, str]:
+    variables = document["vars"]
+    headers: dict[str, str] = {}
+    for name, template in document["headers"].items():
+        missing = [key for key in VARIABLE_RE.findall(template) if not variables.get(key)]
+        if missing:
+            continue
+        value = VARIABLE_RE.sub(lambda match: variables[match.group(1)], template)
+        if value:
+            headers[name] = value
+    return headers
 
 
 def required_environment_names(config: dict[str, Any]) -> list[str]:
-    auth = config["auth"]
-    fields = {
-        "seres-sign": ("access_key_env", "secret_key_env"),
-        "bearer": ("token_env",),
-        "api-key": ("key_env",),
-        "cookie": ("cookie_env",),
+    return list(SIGN_ENV_NAMES if config["sign"] == "seres-sign" else ())
+
+
+def runtime_payload(config: dict[str, Any], environment: dict[str, dict[str, str]] | None = None) -> str:
+    payload = {
+        "sign": config["sign"],
+        "headers": resolved_environment_headers(environment) if environment else {},
     }
-    return ["BASE_URL", *(auth[field] for field in fields.get(auth["mode"], ()))]
-
-
-def runtime_payload(config: dict[str, Any]) -> str:
-    payload = {"auth": config["auth"], "custom_headers": config["custom_headers"]}
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def render_runtime_environment(document: dict[str, dict[str, str]]) -> str:
+    """Render only native Bruno vars; the custom headers block stays tool-owned."""
+
+    lines = ["vars {"]
+    for name, value in document["vars"].items():
+        lines.append(f"  {name}: {json.dumps(value, ensure_ascii=False)}")
+    return "\n".join([*lines, "}", ""])
 
 
 def _write_if_missing(path: Path, content: str, newline: str = "\n") -> bool:
@@ -385,8 +314,105 @@ def _write_if_missing(path: Path, content: str, newline: str = "\n") -> bool:
     return True
 
 
-def initialize_execution_layout(qa_root: Path) -> list[Path]:
-    """Create the shared runtime files and migrate a legacy environment directory."""
+def migrate_legacy_execution_config(config_path: Path, environments_root: Path) -> list[Path]:
+    """Move legacy auth/custom_headers values into the active environment."""
+
+    if not config_path.is_file():
+        return []
+    try:
+        import yaml  # type: ignore[import-not-found]
+
+        legacy = yaml.safe_load(config_path.read_text(encoding="utf-8", errors="strict"))
+    except ModuleNotFoundError as exc:
+        raise ValueError("legacy config migration requires PyYAML") from exc
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:  # type: ignore[attr-defined]
+        raise ValueError(f"cannot migrate legacy execution config {config_path}: {exc}") from exc
+    if not isinstance(legacy, dict) or not ({"auth", "custom_headers"} & set(legacy)):
+        return []
+    active = str(legacy.get("active_environment") or "local")
+    auth = legacy.get("auth", {}) if isinstance(legacy.get("auth"), dict) else {}
+    mode = str(auth.get("mode") or "none")
+    sign = "seres-sign" if mode == "seres-sign" else "disabled"
+    env_path = environments_root / f"{active}.bru"
+    document = load_bruno_environment_document(env_path) if env_path.is_file() else {"vars": {}, "headers": {}}
+    headers = document["headers"]
+    auth_headers = {
+        "bearer": ("Authorization", f"Bearer {{{{{auth.get('token_env', 'ACCESS_TOKEN')}}}}}"),
+        "api-key": ("X-API-Key", f"{{{{{auth.get('key_env', 'API_KEY')}}}}}"),
+        "cookie": ("Cookie", f"{{{{{auth.get('cookie_env', 'SESSION_COOKIE')}}}}}"),
+    }
+    if mode in auth_headers:
+        name, value = auth_headers[mode]
+        headers.setdefault(name, value)
+    custom = legacy.get("custom_headers", {}) if isinstance(legacy.get("custom_headers"), dict) else {}
+    for name, settings in custom.items():
+        if not isinstance(name, str) or not isinstance(settings, dict):
+            continue
+        if isinstance(settings.get("env"), str):
+            headers.setdefault(name, f"{{{{{settings['env']}}}}}")
+        elif isinstance(settings.get("value"), str):
+            headers.setdefault(name, settings["value"])
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    env_path.write_text(
+        render_runtime_environment(document)
+        + ("headers {\n" + "".join(f"  {name}: {json.dumps(value, ensure_ascii=False)}\n" for name, value in headers.items()) + "}\n" if headers else ""),
+        encoding="utf-8",
+    )
+    config_path.write_text(f"active_environment: {active}\nsign: {sign}\n", encoding="utf-8")
+    return [config_path, env_path]
+
+
+def migrate_legacy_base_url(config_path: Path, environments_root: Path) -> list[Path]:
+    """Rename the old BASE_URL variable to the business-readable baseUrl key."""
+
+    if not config_path.is_file():
+        return []
+    try:
+        import yaml  # type: ignore[import-not-found]
+
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8", errors="strict"))
+    except (ModuleNotFoundError, OSError, UnicodeDecodeError, yaml.YAMLError) as exc:  # type: ignore[attr-defined]
+        raise ValueError(f"cannot migrate base URL variable: {exc}") from exc
+    if not isinstance(config, dict):
+        return []
+    active = str(config.get("active_environment") or "local")
+    env_path = environments_root / f"{active}.bru"
+    if not env_path.is_file():
+        return []
+    document = load_bruno_environment_document(env_path)
+    variables = document["vars"]
+    if "BASE_URL" not in variables or "baseUrl" in variables:
+        return []
+    variables["baseUrl"] = variables.pop("BASE_URL")
+    env_path.write_text(render_runtime_environment(document) + render_headers_block(document), encoding="utf-8")
+    return [env_path]
+
+
+def render_headers_block(document: dict[str, dict[str, str]]) -> str:
+    headers = document.get("headers", {})
+    if not headers:
+        return ""
+    return "headers {\n" + "".join(
+        f"  {name}: {json.dumps(value, ensure_ascii=False)}\n" for name, value in headers.items()
+    ) + "}\n"
+
+
+def _tooling_mode(path: Path, requested_local_scripts: bool | None) -> bool:
+    if requested_local_scripts is not None:
+        return requested_local_scripts
+    if not path.is_file():
+        return True
+    try:
+        import yaml  # type: ignore[import-not-found]
+
+        document = yaml.safe_load(path.read_text(encoding="utf-8", errors="strict"))
+    except (ModuleNotFoundError, OSError, UnicodeDecodeError):
+        return True
+    return not (isinstance(document, dict) and document.get("tooling") == "shared-cli")
+
+
+def initialize_execution_layout(qa_root: Path, local_scripts: bool | None = None) -> list[Path]:
+    """Create reusable execution assets and synchronize the project scripts."""
 
     qa_root = qa_root.resolve()
     contracts_root = qa_root / "contracts"
@@ -395,8 +421,8 @@ def initialize_execution_layout(qa_root: Path) -> list[Path]:
     old_environments = bruno_root / "environments"
     new_environments = execution_root / "environments"
     config_path = execution_root / "config.yaml"
-    if config_path.exists():
-        load_execution_config(config_path)
+    qa_config_path = qa_root / "qa.yaml"
+    local_scripts = _tooling_mode(qa_config_path, local_scripts)
     changed: list[Path] = []
     if old_environments.exists():
         if new_environments.exists():
@@ -409,10 +435,21 @@ def initialize_execution_layout(qa_root: Path) -> list[Path]:
     else:
         new_environments.mkdir(parents=True, exist_ok=True)
 
+    changed.extend(migrate_legacy_execution_config(config_path, new_environments))
+    changed.extend(migrate_legacy_base_url(config_path, new_environments))
+
+    qa_config = f"version: 1\ntooling: {'project-scripts' if local_scripts else 'shared-cli'}\n"
+    if not qa_config_path.is_file() or qa_config_path.read_text(encoding="utf-8", errors="strict") != qa_config:
+        qa_config_path.write_text(qa_config, encoding="utf-8")
+        changed.append(qa_config_path)
+    run_bat_template = RUN_BAT_TEMPLATE if local_scripts else SHARED_RUN_BAT_TEMPLATE
+    run_sh_template = RUN_SH_TEMPLATE if local_scripts else SHARED_RUN_SH_TEMPLATE
     files = (
         (config_path, DEFAULT_CONFIG_TEMPLATE, "\n"),
-        (execution_root / "run.bat", RUN_BAT_TEMPLATE, "\r\n"),
-        (execution_root / "run.sh", RUN_SH_TEMPLATE, "\n"),
+        (new_environments / "local.bru", DEFAULT_ENVIRONMENT_TEMPLATE, "\n"),
+        (execution_root / "plans.yaml", DEFAULT_PLANS_TEMPLATE, "\n"),
+        (execution_root / "run.bat", run_bat_template, "\r\n"),
+        (execution_root / "run.sh", run_sh_template, "\n"),
         (execution_root / "README.md", EXECUTION_README_TEMPLATE, "\n"),
         (bruno_root / "collection.bru", COLLECTION_TEMPLATE, "\n"),
         (bruno_root / "bruno.json", json.dumps(BRUNO_JSON_TEMPLATE, ensure_ascii=False, indent=2) + "\n", "\n"),
@@ -420,13 +457,35 @@ def initialize_execution_layout(qa_root: Path) -> list[Path]:
     for path, content, newline in files:
         if _write_if_missing(path, content, newline):
             changed.append(path)
+    changed.extend(migrate_legacy_base_url(config_path, new_environments))
+    for path, desired, known in (
+        (execution_root / "run.bat", run_bat_template.replace("\n", "\r\n"), {RUN_BAT_TEMPLATE.replace("\n", "\r\n"), SHARED_RUN_BAT_TEMPLATE.replace("\n", "\r\n")}),
+        (execution_root / "run.sh", run_sh_template, {RUN_SH_TEMPLATE, SHARED_RUN_SH_TEMPLATE}),
+    ):
+        current = path.read_text(encoding="utf-8", errors="strict")
+        if current in known and current != desired:
+            path.write_text(desired, encoding="utf-8", newline="")
+            changed.append(path)
+    collection_path = bruno_root / "collection.bru"
+    if collection_path.is_file():
+        current_collection = collection_path.read_text(encoding="utf-8", errors="strict")
+        if COLLECTION_MARKER in current_collection and current_collection != COLLECTION_TEMPLATE:
+            collection_path.write_text(COLLECTION_TEMPLATE, encoding="utf-8")
+            changed.append(collection_path)
     run_sh = execution_root / "run.sh"
-    if run_sh.exists():
-        run_sh.chmod(run_sh.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    run_sh.chmod(run_sh.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    config = load_execution_config(config_path)
+    load_bruno_environment_document(environment_file(config_path, config))
 
-    load_execution_config(config_path)
+    if local_scripts:
+        try:
+            from scripts_manager import sync_scripts
+
+            changed.extend(sync_scripts(qa_root, Path(__file__).resolve().parent))
+        except ImportError:
+            pass
     for obsolete in (contracts_root / "request-auth.yaml", contracts_root / "request-context.yaml"):
         if obsolete.is_file():
             obsolete.unlink()
             changed.append(obsolete)
-    return changed
+    return list(dict.fromkeys(changed))

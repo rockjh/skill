@@ -1,81 +1,51 @@
-# Business-Code Version Management
+# Business And QA Version Management
 
-Keep a module-independent lock file at contracts/version-lock.yaml:
+Keep two independent locks under `qa/contracts`.
 
-    version: 1
-    business:
-      repo: /path/to/business-repository
-      commit: abc123...
-      source_digest: sha256...
-      ref: main
-      updated_at: 2026-09-12T00:00:00+00:00
-      impact_review: api-impact
-      changed_files:
-        - ruoyi-admin/src/main/java/.../SysUserController.java
+`version-lock.yaml` records a non-empty business Git commit and a digest of
+tracked files outside `qa/**`. Its dirty check also excludes `qa/**`, so
+regenerating manifests, Bruno files, or reports does not invalidate business
+compatibility. An empty `git rev-parse HEAD` result is an error and is never
+written.
 
-The commit is the business code version that the Bruno collection was reviewed and executed against. It is not the Git commit of a separate Bruno repository. When Bruno files live in the business repository, the checker also records a digest of tracked files outside `qa/**`; QA-only commits therefore do not invalidate the business compatibility lock. Non-Java repositories use the same digest with cross-language defaults for Go, Python, Node/TypeScript, .NET, Rust, and PHP. A source checkout without Git can use a filesystem digest in draft mode; it has no commit identity, and any changed digest is conservatively treated as API-impacting until a verified review re-baselines it.
+`qa-lock.yaml` records:
 
-The compatibility check also inspects tracked, uncommitted worktree changes.
-An unchanged `HEAD` is not sufficient evidence when a controller, service,
-configuration, or other API-impacting file is dirty; the check returns a dirty
-status and refuses completion until the change is committed/stashed or the
-tests are reviewed against that exact worktree state.
+```yaml
+version: 1
+openapi_sha256: ...
+module_fingerprints: {}
+case_fingerprints: {}
+generation_state_fingerprint: ...
+```
 
-Initialize a repository that has no lock yet with a draft baseline:
+Classify repository changes as:
 
-    python qa/scripts/check_version_compatibility.py \
-      /path/to/business-repository \
-      qa/contracts \
-      --init
+| Class | Examples | Effect |
+| --- | --- | --- |
+| business code | Controller, DTO, Service, errors, validation, security, config, Flyway | review affected API modules |
+| QA assets | `qa/**` contracts, Bruno requests, locks, reports | refresh QA lock; business lock stays current |
+| unrelated | docs, comments, formatting, unrelated assets | record review; no case rewrite unless behavior changed |
 
-Initialization records the current commit or filesystem digest with
-`baseline_status: draft`; it is not execution evidence and cannot produce a
-verified lock.
+Initialize and gate the business lock:
 
-Use:
+```bash
+python qa/scripts/check_version_compatibility.py APP qa/contracts --init
+python qa/scripts/check_version_compatibility.py APP qa/contracts --phase before-generate
+python qa/scripts/check_version_compatibility.py APP qa/contracts --phase before-execute
+python qa/scripts/check_version_compatibility.py APP qa/contracts --phase complete \
+  --completion-report execution-evidence.coverage.json --write --tests-adapted
+```
 
-    python qa/scripts/check_version_compatibility.py \
-      /path/to/business-repository \
-      qa/contracts \
-      --rules qa/contracts/impact-rules.yaml \
-      --phase before-generate
+Initialization is `draft`, not execution evidence. A completion write requires
+`status: verified` and `completion_ok: true`. API-impacting changes also require
+`--tests-adapted`. A checkout without Git uses a filesystem digest in draft
+mode and cannot fabricate a commit identity.
 
-Run the same check with `--phase before-execute` immediately before Bruno
-execution; a stale API-impacting source or dirty tracked business file blocks
-execution evidence.
+`impact-rules.yaml` can narrow repository-specific business patterns, but keep
+Controller, DTO, Service, error-code, security, configuration, migration, and
+exception/serialization paths conservative. The checker reports the three
+change classes separately where Git path evidence is available.
 
-Exit meanings:
-
-- 0: lock is current, or it was updated successfully.
-- 2: lock is stale but no API-impacting file was detected; review it and advance only after the verified completion gate.
-- 3: lock is stale and API-impacting, or the lock is invalid.
-
-After adapting and executing affected tests:
-
-    python qa/scripts/check_version_compatibility.py \
-      /path/to/business-repository \
-      qa/contracts \
-      --rules qa/contracts/impact-rules.yaml \
-      --write \
-      --tests-adapted \
-      --phase complete \
-      --completion-report execution-evidence.coverage.json
-
-`--write` is refused unless the supplied coverage report has
-`status: verified` and `completion_ok: true`. This keeps a stale or partially
-executed collection from advancing the lock, including for non-API changes.
-
-impact-rules.yaml may override api_patterns and ignore_patterns for the repository. Keep the rules conservative: classify a file as API-impacting when in doubt, then let the module review prove that no test change is needed.
-
-Example override:
-
-    api_patterns:
-      - "**/controller/**"
-      - "**/service/**"
-      - "**/dto/**"
-      - "**/exception/**"
-      - "**/resources/application*.yml"
-      - "**/resources/application*.yaml"
-    ignore_patterns:
-      - "**/target/**"
-      - "**/*.md"
+Refresh `qa-lock.yaml` only from the current `generation-state.yaml`; `check`
+and `reconcile` reject a lock whose OpenAPI, module, case, or generation-state
+fingerprint differs.

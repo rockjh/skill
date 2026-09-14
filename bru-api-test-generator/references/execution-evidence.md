@@ -1,95 +1,64 @@
 # Bruno Execution Evidence
 
-Static manifests prove intent; CI must also publish a small normalized JSON evidence file so flow order, captures, and cleanup can be checked independently of Bruno CLI report formats.
+Static manifests prove intent; normalized execution evidence proves results.
+The checker reports independent gates:
 
-The coverage checker reports two independent gates:
+- `static_ok`: OpenAPI, manifests, UTF-8, Bruno registration, complete JSON
+  bodies, request structure, exact assertions, scenario decisions, QA lock, and
+  source-logic links reconcile.
+- `completion_ok`: every case in the selected risk scope executed and passed,
+  required flow cleanup passed, and no pending exclusion remains.
 
-- `static_ok` means manifests, UTF-8 text, Bruno registration, assertions, and
-  the offline OpenAPI inventory reconcile.
-- `completion_ok` means every required case was executed and passed, flow
-  cleanup was verified, and no pending exclusion remains. The status is
-  `draft` without execution evidence, `runnable` after a passed runtime
-  preflight, `verified` only after completion, and `blocked` for any failure.
+States are `draft`, `runnable`, `verified`, or `blocked`. Inventory counts are
+kept separate from generated, executed, passed, happy-path, and verified-flow
+counts. A static draft is never reported as verified.
 
-The JSON report also separates `inventory_endpoints`, `endpoints_with_cases`,
-`excluded_endpoints`, `generated_cases`, `executed_cases`, `passed_cases`,
-`happy_path_endpoints`, and `verified_flows`; do not summarize inventory as
-coverage. `pending_success_endpoints` identifies reachable operations that
-still lack a dedicated success case; `blocked_modules` identifies module-local
-failures. A report with
-`contract_provenance_unverified: true` cannot reach `verified`.
-
-Example `execution-evidence.json`:
+The runner stores the raw Bruno report in a temporary directory, derives pass
+status from every assertion/test observation, and writes only normalized,
+redacted evidence. Bruno's top-level request status alone is insufficient.
 
 ```json
 {
-  "executed": ["USER_CREATE_OK", "USER_UPDATE_OK", "USER_QUERY_AFTER_UPDATE", "USER_DELETE_OK", "USER_QUERY_AFTER_DELETE"],
-  "passed": ["USER_CREATE_OK", "USER_UPDATE_OK", "USER_QUERY_AFTER_UPDATE", "USER_DELETE_OK", "USER_QUERY_AFTER_DELETE"],
+  "executed": ["USER_CREATE_OK", "USER_DELETE_OK"],
+  "passed": ["USER_CREATE_OK", "USER_DELETE_OK"],
   "flows": {
     "USER_CRUD_FLOW": {
       "status": "passed",
       "cleanup_verified": true,
       "steps": [
-        {"case_id": "USER_CREATE_OK", "status": "passed", "captures": ["user_id"], "used_captures": []},
-        {"case_id": "USER_UPDATE_OK", "status": "passed", "captures": [], "used_captures": ["user_id"]},
-        {"case_id": "USER_QUERY_AFTER_UPDATE", "status": "passed", "captures": [], "used_captures": ["user_id"]},
-        {"case_id": "USER_DELETE_OK", "status": "passed", "captures": [], "used_captures": ["user_id"]},
-        {"case_id": "USER_QUERY_AFTER_DELETE", "status": "passed", "captures": [], "used_captures": ["user_id"], "asserted_absent": true}
+        {"case_id": "USER_CREATE_OK", "status": "passed", "captures": ["user_id"]},
+        {"case_id": "USER_DELETE_OK", "status": "passed", "used_captures": ["user_id"]}
       ]
     }
   }
 }
 ```
 
-The project-local runner translates the installed Bruno report into this shape.
-The exact Bruno CLI output format is version-dependent, so keep this normalized
-contract stable and review the adapter with the collection.
-
-Use the platform entry point:
-
-```bat
-qa\execution\run.bat
-qa\execution\run.bat --module "车辆管理"
-```
+Use the platform launchers or shared CLI:
 
 ```bash
-./qa/execution/run.sh
-./qa/execution/run.sh --module "车辆管理"
+mno-bruno-qa run --plan smoke
+mno-bruno-qa run --plan regression --confirm-write
+mno-bruno-qa run --module ac --risk read-only
+mno-bruno-qa reconcile --results execution-evidence.json \
+  --preflight-results preflight.json
 ```
 
-Both launchers call `run_bruno.py`, which validates `execution/config.yaml`,
-loads `execution/environments/<active_environment>.bru` through `--env-file`,
-runs static coverage and runtime preflight, invokes Bruno, normalizes the
-temporary raw report, and reconciles execution evidence. The internal
-preflight requires at least one representative route; without a successful
-probe `execution_ready` remains false.
+The runner validates the business version, project script version or shared
+CLI mode, QA lock, minimal execution config, active environment, risk
+confirmations, offline OpenAPI fingerprint, Bruno CLI, and a representative
+route before execution. Module evidence remains module-local and never updates
+the global business lock.
 
-The coverage checker accepts either the normalized object above or a raw Bruno
-JSON report. When given a raw report it derives `passed` from every
-`assertionResults[].status` and `testResults[].status`; do not use Bruno's
-top-level request status alone, because Bruno can report `status: pass` while
-an inline assertion failed. For an isolated module report, pass that module's
-contracts directory to the checker and run OpenAPI reconciliation separately
-from the global contracts root.
+Every newly generated request uses `{{baseUrl}}` (legacy `{{BASE_URL}}` remains
+readable). The CLI parses environment
+`headers {}`, resolves its variables, and injects the resulting map through
+`collection.bru`; request-local Headers win. Signing is disabled unless
+`config.yaml` selects `seres-sign`, which reads `ACCESS_KEY` and `SECRET_KEY`
+from the environment.
 
-Evidence is environment- and business-SHA-specific. Raw Bruno reports remain
-in a temporary directory and omit all Headers and bodies. Keep only normalized,
-redacted evidence with the SHA, environment name, executed/passed case IDs,
-and flow capture names. A module run reports only that module, must not be
-presented as global evidence, and cannot update `version-lock.yaml`.
-
-Every generated request uses `{{BASE_URL}}`; authentication and common Headers
-are injected once by `collection.bru` from the validated runtime payload. The
-default `auth.mode: none` adds no authentication Header. `seres-sign` reads its
-two configured credential variables from the selected Bruno environment and
-uses fixed SHA-256 behavior plus fixed `sign`, `timestamp`, and `accesskey`
-Header names. Bearer, API-key, and cookie modes read their configured variable.
-OAuth2 bootstrap publishes a token consumed as bearer. Keep all sensitive
-values in the environment; never place them in config, manifests, reports, or
-request files.
-
-Before committing the normalized report, run:
+Before committing evidence, run:
 
 ```bash
-python scripts/check_artifact_safety.py qa/bruno qa/contracts
+python qa/scripts/check_artifact_safety.py qa/bruno qa/contracts
 ```

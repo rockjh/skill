@@ -16,19 +16,16 @@ sys.dont_write_bytecode = True
 from execution_config import (
     RUNTIME_CONFIG_ENV,
     environment_file,
+    load_bruno_environment_document,
     load_execution_config,
+    render_runtime_environment,
     runtime_payload,
 )
 from manifest_io import first_list, load_data
+from qa_lock import check as check_qa_lock
 
 
-RISK_ARGUMENTS = [
-    "--risk", "read-only",
-    "--risk", "isolated-write",
-    "--risk", "destructive",
-    "--risk", "external-side-effect",
-    "--allow-dangerous",
-]
+RISK_CLASSES = {"read-only", "isolated-write", "destructive", "external-side-effect"}
 
 
 def module_directory(contracts_root: Path, requested: str) -> str:
@@ -82,6 +79,8 @@ def coverage_command(
     openapi: Path,
     config_path: Path,
     module: str | None,
+    risks: set[str],
+    plan_name: str | None = None,
     results: Path | None = None,
     preflight: Path | None = None,
 ) -> list[str]:
@@ -94,9 +93,15 @@ def coverage_command(
         "--require-scenarios",
         "--require-auth",
         "--execution-config", str(config_path),
-        *RISK_ARGUMENTS,
         "--json",
     ]
+    if plan_name:
+        command.extend(["--plan", plan_name])
+    else:
+        for risk in sorted(risks):
+            command.extend(["--risk", risk])
+    if risks & {"destructive", "external-side-effect"}:
+        command.append("--allow-dangerous")
     if module:
         command.extend(["--module", module])
     if results:
@@ -104,6 +109,52 @@ def coverage_command(
     if preflight:
         command.extend(["--preflight-results", str(preflight)])
     return command
+
+
+def execution_scope(
+    plans_path: Path,
+    plan_name: str | None,
+    requested_risks: list[str] | None,
+) -> tuple[set[str], str | None, dict[str, Any]]:
+    if plan_name and requested_risks:
+        raise ValueError("--plan and --risk cannot be combined")
+    if not plan_name:
+        return set(requested_risks or ["read-only"]), None, {}
+    document = load_data(plans_path)
+    plans = document.get("plans", {}) if isinstance(document, dict) else {}
+    plan = plans.get(plan_name) if isinstance(plans, dict) else None
+    if not isinstance(plan, dict):
+        raise ValueError(f"unknown execution plan: {plan_name}")
+    risks = plan.get("risks")
+    if not isinstance(risks, list) or not risks or any(str(risk) not in RISK_CLASSES for risk in risks):
+        raise ValueError(f"execution plan {plan_name} has invalid risks")
+    maximum = plan.get("max_cases_per_module")
+    if maximum is not None and (not isinstance(maximum, int) or maximum < 1):
+        raise ValueError(f"execution plan {plan_name} max_cases_per_module must be a positive integer")
+    return {str(risk) for risk in risks}, plan_name, plan
+
+
+def confirmation_error(
+    risks: set[str],
+    plan: dict[str, Any],
+    confirm_write: bool,
+    confirm_destructive: bool,
+    confirm_external: bool,
+) -> str | None:
+    if "isolated-write" in risks and not confirm_write:
+        return "isolated-write execution requires --confirm-write"
+    if "destructive" in risks and (not confirm_write or not confirm_destructive):
+        return "destructive execution requires --confirm-write and --confirm-destructive"
+    if "external-side-effect" in risks and not confirm_external:
+        return "external-side-effect execution requires --confirm-external"
+    if plan.get("require_confirm") is True:
+        if (risks & {"isolated-write", "destructive"}) and not confirm_write:
+            return "this plan requires --confirm-write"
+        if "destructive" in risks and not confirm_destructive:
+            return "this plan requires --confirm-destructive"
+        if "external-side-effect" in risks and not confirm_external:
+            return "this plan requires --confirm-external"
+    return None
 
 
 def run_json(command: list[str], output: Path, cwd: Path | None = None) -> tuple[int, dict[str, Any] | None]:
@@ -119,22 +170,42 @@ def run_json(command: list[str], output: Path, cwd: Path | None = None) -> tuple
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--qa-root", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--module", help="module id, display name, OpenAPI Tag, or directory")
+    parser.add_argument("--risk", action="append", choices=sorted(RISK_CLASSES), help="risk class; defaults to read-only")
+    parser.add_argument("--plan", help="plan name from qa/execution/plans.yaml")
+    parser.add_argument("--confirm-write", action="store_true")
+    parser.add_argument("--confirm-destructive", action="store_true")
+    parser.add_argument("--confirm-external", action="store_true")
     parser.add_argument("--bruno-cli", default="bru", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     scripts_root = Path(__file__).resolve().parent
-    qa_root = scripts_root.parent
+    qa_root = (args.qa_root or scripts_root.parent).resolve()
     app_root = qa_root.parent
     contracts_root = qa_root / "contracts"
     bruno_root = qa_root / "bruno"
     config_path = qa_root / "execution" / "config.yaml"
-    openapi = contracts_root / "openapi.json"
+    openapi = next(
+        (path for path in (contracts_root / "openapi.json", contracts_root / "openapi.yaml", contracts_root / "openapi.yml") if path.is_file()),
+        contracts_root / "openapi.json",
+    )
     try:
         config = load_execution_config(config_path)
         env_path = environment_file(config_path, config)
-        if not env_path.is_file():
-            raise ValueError(f"Bruno environment does not exist: {env_path}")
+        environment = load_bruno_environment_document(env_path)
+        risks, plan_name, plan = execution_scope(
+            qa_root / "execution" / "plans.yaml", args.plan, args.risk
+        )
+        confirmation = confirmation_error(
+            risks,
+            plan,
+            args.confirm_write,
+            args.confirm_destructive,
+            args.confirm_external,
+        )
+        if confirmation:
+            raise ValueError(confirmation)
         selected_directory = module_directory(contracts_root, args.module) if args.module else None
     except (OSError, ValueError, SystemExit) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -144,6 +215,12 @@ def main() -> int:
     if route is None:
         scope = args.module or "all modules"
         print(f"ERROR: no read-only representative route is available for {scope}", file=sys.stderr)
+        return 2
+
+    qa_lock_errors = check_qa_lock(contracts_root)
+    if qa_lock_errors:
+        for error in qa_lock_errors:
+            print(f"ERROR: {error}", file=sys.stderr)
         return 2
 
     version_check = subprocess.run(
@@ -175,6 +252,8 @@ def main() -> int:
                 openapi,
                 config_path,
                 args.module,
+                risks,
+                plan_name,
             ),
             static_path,
         )
@@ -200,12 +279,15 @@ def main() -> int:
             print("ERROR: runtime preflight failed", file=sys.stderr)
             return preflight_code
 
+        runtime_env_path = temporary / "runtime-environment.bru"
+        runtime_env_path.write_text(render_runtime_environment(environment), encoding="utf-8")
         bruno_command = ["run"]
         if selected_directory:
             bruno_command.append(selected_directory)
         bruno_command.extend([
-            "--env-file", str(env_path),
-            "--env-var", f"{RUNTIME_CONFIG_ENV}={runtime_payload(config)}",
+            "--env-file", str(runtime_env_path),
+            "--env-var", f"{RUNTIME_CONFIG_ENV}={runtime_payload(config, environment)}",
+            "--tags", f"plan-{plan_name}" if plan_name else ",".join(sorted(risks)),
             "--reporter-json", str(raw_report),
             "--reporter-skip-all-headers",
             "--reporter-skip-body",
@@ -253,6 +335,8 @@ def main() -> int:
                 openapi,
                 config_path,
                 args.module,
+                risks,
+                plan_name,
                 evidence_path,
                 preflight_path,
             ),
@@ -262,7 +346,8 @@ def main() -> int:
             scope = f"module {args.module}" if args.module else "all modules"
             print(
                 f"scope={scope} environment={config['active_environment']} status={coverage_report.get('status')} "
-                f"executed={coverage_report.get('executed_cases', 0)} passed={coverage_report.get('passed_cases', 0)}"
+                f"risks={','.join(sorted(risks))} executed={coverage_report.get('executed_cases', 0)} "
+                f"passed={coverage_report.get('passed_cases', 0)}"
             )
         if bruno_result.returncode:
             print(
