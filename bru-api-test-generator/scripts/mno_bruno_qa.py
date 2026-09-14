@@ -280,6 +280,12 @@ def scripts_command(argv: list[str]) -> int:
     parser.add_argument("action", choices=("sync", "check"))
     qa_root_argument(parser)
     args = parser.parse_args(argv)
+    if shared_cli_mode(args.qa_root):
+        if args.action == "sync":
+            print("shared-cli is active; no project-local scripts need synchronization")
+        else:
+            print("shared-cli is active; installed mno-bruno-qa provides the scripts")
+        return 0
     if args.action == "sync":
         changed = sync_scripts(args.qa_root, SCRIPTS_ROOT)
         print(f"synchronized {len(changed)} file(s)")

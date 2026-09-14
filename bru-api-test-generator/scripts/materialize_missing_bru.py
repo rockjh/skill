@@ -493,8 +493,10 @@ def execution_plan_tags(
     cases: list[dict[str, Any]],
     endpoints: dict[str, dict[str, Any]],
     plans: dict[str, Any],
+    excluded_endpoint_ids: set[str] | None = None,
 ) -> dict[str, list[str]]:
     result: dict[str, list[str]] = {str(case.get("id")): [] for case in cases if case.get("id")}
+    excluded_endpoint_ids = excluded_endpoint_ids or set()
     for plan_name, settings in plans.items():
         if not isinstance(settings, dict) or not isinstance(settings.get("risks"), list):
             continue
@@ -504,7 +506,12 @@ def execution_plan_tags(
         for case in cases:
             case_id = str(case.get("id", ""))
             endpoint = endpoints.get(str(case.get("endpoint_id")))
-            if not case_id or endpoint is None or case_risk(case, endpoint) not in allowed:
+            if (
+                not case_id
+                or endpoint is None
+                or str(case.get("endpoint_id")) in excluded_endpoint_ids
+                or case_risk(case, endpoint) not in allowed
+            ):
                 continue
             if isinstance(maximum, int) and selected >= maximum:
                 continue
@@ -624,7 +631,20 @@ def materialize(
                     )
                 existing_by_id[existing_id] = path
 
-        plan_tags = execution_plan_tags(cases, endpoint_by_id, plans if isinstance(plans, dict) else {})
+        exclusions_document = load_data(module_dir / "exclusions.yaml") if (module_dir / "exclusions.yaml").is_file() else {}
+        excluded_endpoint_ids = {
+            str(item.get("endpoint_id"))
+            for item in first_list(exclusions_document, "exclusions")
+            if item.get("endpoint_id")
+            and str(item.get("status", "approved")).strip().lower() == "approved"
+            and str(item.get("reason", "")).strip()
+        }
+        plan_tags = execution_plan_tags(
+            cases,
+            endpoint_by_id,
+            plans if isinstance(plans, dict) else {},
+            excluded_endpoint_ids,
+        )
         planned: list[tuple[dict[str, Any], dict[str, Any], Path, list[str]]] = []
         targets: dict[Path, str] = {}
         mappings_changed = False

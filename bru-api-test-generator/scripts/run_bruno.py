@@ -56,10 +56,15 @@ def module_directory(contracts_root: Path, requested: str) -> str:
     raise ValueError(f"unknown module: {requested}")
 
 
-def representative_route(contracts_root: Path, module: str | None) -> tuple[str, str] | None:
+def representative_route(
+    contracts_root: Path,
+    module: str | None,
+    risks: set[str] | None = None,
+) -> tuple[str, str] | None:
     modules_root = contracts_root / "modules"
     directories = [modules_root / module] if module else sorted(path for path in modules_root.iterdir() if path.is_dir())
     candidates: list[tuple[str, str]] = []
+    fallback: list[tuple[str, str]] = []
     for directory in directories:
         endpoint_path = directory / "endpoints.yaml"
         if not endpoint_path.is_file():
@@ -67,9 +72,19 @@ def representative_route(contracts_root: Path, module: str | None) -> tuple[str,
         for endpoint in first_list(load_data(endpoint_path), "endpoints"):
             method = str(endpoint.get("method", "")).upper()
             path = str(endpoint.get("path", ""))
-            if method in {"GET", "HEAD"} and path.startswith("/") and "{" not in path:
+            if not path.startswith("/") or "{" in path:
+                continue
+            if method in {"GET", "HEAD"}:
                 candidates.append((method, path))
-    return candidates[0] if candidates else None
+            elif method in {"POST", "PUT", "PATCH", "DELETE"}:
+                fallback.append((method, path))
+    if candidates:
+        return candidates[0]
+    # A write-only module can still be explicitly executed after confirmation.
+    # Keep the default read-only scope blocked when no safe probe exists.
+    if risks and risks != {"read-only"}:
+        return fallback[0] if fallback else None
+    return None
 
 
 def coverage_command(
@@ -211,7 +226,7 @@ def main() -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
-    route = representative_route(contracts_root, selected_directory)
+    route = representative_route(contracts_root, selected_directory, risks)
     if route is None:
         scope = args.module or "all modules"
         print(f"ERROR: no read-only representative route is available for {scope}", file=sys.stderr)

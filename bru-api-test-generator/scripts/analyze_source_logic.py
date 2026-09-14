@@ -61,7 +61,11 @@ BUSINESS_EXCEPTION_RE = re.compile(
     re.IGNORECASE,
 )
 ERROR_CODE_RE = re.compile(r"(?<!\d)([1-9]\d{4,8})(?!\d)")
-REQUIRED_HEADER_RE = re.compile(r"(?:RequestHeader|getHeader)[^\n]*?(operatorInfo|[A-Za-z][A-Za-z0-9-]*Info)", re.IGNORECASE)
+REQUIRED_HEADER_RE = re.compile(
+    r"(?:RequestHeader|getHeader|get_header|headers?\.get|headers?\s*\[|requireHeader|require_header|(?:req|request)\.get)"
+    r"[^\n]*?(operatorInfo|[A-Za-z][A-Za-z0-9-]*Info)",
+    re.IGNORECASE,
+)
 AUTHORIZATION_RE = re.compile(r"(?:PreAuthorize|RequiresPermissions|Secured|permission|hasRole|hasAuthority)", re.IGNORECASE)
 
 
@@ -90,10 +94,10 @@ def scan(roots: list[Path], include_patterns: list[str] | None = None) -> dict[s
                 continue
             for line_no, line in enumerate(lines, start=1):
                 evidence = " ".join(line.strip().split())[:300]
-                if ENTRYPOINT_RE.search(line):
-                    kind = "normal_entrypoint"
-                elif REQUIRED_HEADER_RE.search(line):
+                if REQUIRED_HEADER_RE.search(line):
                     kind = "required_header"
+                elif ENTRYPOINT_RE.search(line):
+                    kind = "normal_entrypoint"
                 elif AUTHORIZATION_RE.search(line):
                     kind = "authorization"
                 elif BRANCH_RE.search(line):
@@ -200,7 +204,10 @@ def apply_candidates(result: dict[str, Any], contracts_root: Path) -> list[str]:
             responses = endpoint.get("responses", {}) if isinstance(endpoint.get("responses"), dict) else {}
             error_status = next(
                 (int(status) for status in responses if str(status) in {"400", "401", "403", "422"}),
-                400 if "RequestHeader" in str(candidate.get("evidence", "")) else None,
+                # Header guards commonly use either framework annotations or
+                # request accessors. Keep the generated case reviewable when
+                # the contract omits an explicit client-error response.
+                400,
             )
             if error_status is not None:
                 header_id = re.sub(r"[^A-Za-z0-9]+", "_", required_header).strip("_").upper()

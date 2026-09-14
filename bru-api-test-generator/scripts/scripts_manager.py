@@ -126,11 +126,13 @@ def check_scripts(qa_root: Path, source_root: Path) -> list[str]:
     except ValueError as exc:
         errors.append(str(exc))
         current = {}
-    for field in ("skill_version", "scripts_version", "source_repository", "scripts_sha256"):
+    for field in ("skill_version", "scripts_version", "source_repository", "scripts_sha256", "files"):
         if current.get(field) != expected.get(field):
             errors.append(
                 f"qa/scripts/scripts-version.yaml {field} is {current.get(field)!r}, expected {expected.get(field)!r}"
             )
+    if not isinstance(current.get("synchronized_at"), str) or not current.get("synchronized_at", "").strip():
+        errors.append("qa/scripts/scripts-version.yaml synchronized_at is missing")
     return errors
 
 

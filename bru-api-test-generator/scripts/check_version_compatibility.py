@@ -25,14 +25,23 @@ DEFAULT_API_PATTERNS = [
     "*Service.java",
     "**/dto/**",
     "**/domain/**",
+    "**/validation/**",
+    "**/security/**",
+    "**/error/**",
     "**/exception/**",
     "*Exception.java",
+    "*ErrorCode.java",
+    "**/*ErrorCode.*",
     "**/config/**",
     "**/resources/application*.yml",
     "**/resources/application*.yaml",
     "**/resources/application*.properties",
     "**/swagger*",
     "**/openapi*",
+    "**/db/migration/**",
+    "**/flyway/**",
+    "**/*.sql",
+    "*.sql",
     "**/pom.xml",
     "pom.xml",
     # Conservative cross-language defaults. Projects can narrow these with
@@ -353,12 +362,41 @@ def main() -> int:
         "current_source_digest": current_digest,
     }
     if locked_digest and locked_digest == current_digest:
+        if dirty:
+            rules = load_data(args.rules) if args.rules else {}
+            if not isinstance(rules, dict):
+                raise SystemExit("impact rules must contain an object")
+            ignore_patterns = [*DEFAULT_IGNORE_PATTERNS, *rules.get("ignore_patterns", [])]
+            business_dirty = [
+                path for path in dirty
+                if not any(fnmatch.fnmatch(path, pattern) for pattern in ignore_patterns)
+            ]
+            if business_dirty:
+                impact = classify(business_dirty, rules)
+                report.update({
+                    "status": "dirty",
+                    "impact": impact,
+                    "changed_files": business_dirty,
+                    "change_classes": change_classes(dirty, rules),
+                })
+                message = "business repository has untracked or modified files not represented by the locked source digest"
+                if args.as_json:
+                    print(json.dumps({**report, "error": message}, ensure_ascii=True, indent=2))
+                else:
+                    print(f"ERROR: {message}")
+                    print(f"impact: {impact}")
+                    for path in business_dirty:
+                        print(f"dirty: {path}")
+                return 3 if impact == "api-impact" else 2
         report["status"] = "current"
         report["source_digest_match"] = True
+        if dirty:
+            report["qa_dirty_files"] = dirty
         if args.as_json:
             print(json.dumps(report, ensure_ascii=True, indent=2))
         else:
-            print(f"version lock source digest is current: {current_digest}")
+            suffix = " (only ignored QA files are dirty)" if dirty else ""
+            print(f"version lock source digest is current: {current_digest}{suffix}")
         return 0
     if locked_sha == current_sha:
         if dirty:
@@ -430,7 +468,7 @@ def main() -> int:
         "status": "stale",
         "impact": impact,
         "changed_files": paths,
-        "change_classes": change_classes(paths, rules),
+        "change_classes": change_classes(all_paths if has_git else paths, rules),
     })
 
     if args.write:
