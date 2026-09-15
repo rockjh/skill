@@ -1,74 +1,121 @@
 # Scenario Artifact Policy
 
-Each Chinese-named directory under `scenarios/` owns one complete business journey. A reviewer should be able to understand, collect, run, and maintain it without consulting a global scenario list.
+Each Chinese-named directory under `scenarios/` owns one complete business journey. A reviewer should be able to understand, collect, run, and maintain it without a global scenario list.
 
 ## Required layout
 
 ```text
 scenarios/<中文业务名称>/
   场景定义.yaml
-  场景说明.md
+  业务数据.yaml
   业务流程图.md
-  自动化测试流程图.md
-  版本变更记录.md
   test_<中文业务名称>.py
 ```
 
-The directory, Markdown artifact names, and pytest business-name suffix are Chinese. Technical directories and configuration remain English. The stable ID appears only in `场景定义.yaml` and a pytest marker, for example:
+Add `自动化测试流程图.md` only when executable orchestration materially differs from the business flow. For a long scenario, add only the scenario-owned modules that improve readability:
+
+```text
+步骤.py    场景动作编排
+断言.py    场景专属业务断言
+清理.py    场景专属幂等清理
+```
+
+Do not generate `场景说明.md`, `版本变更记录.md`, placeholder modules, or a global manifest. Put the former scenario explanation into the introduction of `业务流程图.md`; keep source commits and anchors in `场景定义.yaml`, with history provided by Git.
+
+When migrating an existing scenario, first preserve its useful purpose, preconditions, and outcome text in the business-diagram introduction, then delete `场景说明.md`. Move the reviewed source baseline and anchors into `source`, then delete `版本变更记录.md`; Git retains its prior contents. Delete an existing automated-test diagram only when it adds no material orchestration beyond the updated business diagram.
+
+The stable ID appears only in `场景定义.yaml` and exactly one pytest marker:
 
 ```python
+"""编排实名双运营商续订业务场景。"""
+
 import pytest
 
 
 @pytest.mark.scenario_id("MNO_REALNAME_DUAL_OPERATOR_RENEWAL")
-def test_实名后开通双运营商套餐并验证跨月续订(...):
-    ...
+def test_实名双运营商续订(scenario_context):
+    """验证实名、双运营商履约、阈值续订和跨月续订。"""
+    run_preflight(scenario_context)
+
+    try:
+        # 1. 发送实名通知，确保车卡具备履约前置状态。
+        send_dual_real_name(scenario_context)
+
+        # 2. 开通可售订单，等待移动和联通原子订单均成功。
+        order = activate_and_wait_fulfillment(scenario_context)
+        assert_dual_operator_fulfillment(order)
+    finally:
+        # 断言失败时仍通过业务接口执行幂等清理。
+        cleanup_salable_order(scenario_context)
 ```
 
-Do not copy the stable ID into the directory, filename suffix, test function name, headings, logs, or a global manifest. Human-facing scenario artifacts use the business name.
-
-Scenario-owned payloads, expected data, SQL mappings, message mappings, snapshots, and one-off helpers stay inside the scenario directory and use clear Chinese business names. Shared modules contain only reusable transport clients, generic integration adapters, signing, and scope-safe fixtures; they accept configuration and mappings rather than embedding business rules.
-
-## Scenario explanation
-
-`场景说明.md` records the purpose, actor, preconditions, business rules, observable outcomes, environment prerequisites, run command, correlation keys, and cleanup. It may describe `pending_environment` inputs, but must not substitute placeholders for source-confirmed contracts.
+Do not copy the stable ID into the directory, filename suffix, function name, headings, logs, or another index.
 
 ## Business flow diagram
 
-`业务流程图.md` contains only real business actors, systems/services, business messages/actions, and state transitions. It must not include pytest, fixtures, test runners, Kafka consumers used only for observation, database observers, polling mechanics, or test cleanup implementation.
+`业务流程图.md` starts with a short business statement and a concise numbered list of key steps. Then use an RCP-style Mermaid `sequenceDiagram`:
+
+````markdown
+# 实名双运营商续订
+
+本图验证实名登记成功后，系统按策略开通移动大包和联通周期套餐，并验证阈值续订、移动达量取消和跨月周期订购。
+
+关键步骤：
+
+1. 发送双运营商实名通知。
+2. 开通可售订单并等待履约。
+3. 触发双运营商 2G 阈值。
+4. 核对 Kafka 与数据库证据。
+5. 进入第二个月验证周期订购。
+
+```mermaid
+%%{init: {"sequence": {"actorMargin": 180, "diagramMarginX": 40, "wrap": true}}}%%
+sequenceDiagram
+    autonumber
+    participant P1 as 软件可售
+    participant P2 as mno-traffic
+    participant P3 as Traffic数据库
+    participant P4 as mno-operator
+    participant P5 as 运营商Mock
+
+    P1->>P2: 开通可售订单
+    P2->>P3: 创建可售订单和原子订单
+    P2->>P4: 发布履约通知
+    P4->>P5: 开通移动/联通套餐
+    alt 双运营商开通成功
+        P5-->>P4: 返回开通成功
+        P4-->>P2: 返回履约成功
+        P2->>P3: 更新原子订单为成功
+    else 任一运营商开通失败
+        P5-->>P4: 返回失败，业务错误码 OPERATOR_ACTIVATE_FAILED
+        P4-->>P2: 返回履约失败
+        P2->>P3: 更新原子订单为失败
+    end
+```
+````
+
+Diagram rules:
+
+- Use `sequenceDiagram`, never `flowchart LR` or `flowchart TD`.
+- Arrange participants horizontally and business progression vertically.
+- Use Chinese business names or explicit service names for participants.
+- Use `alt` and `else` for real source-confirmed branches.
+- Include the source-confirmed business error code in every modeled failure branch. Do not invent one; use `contract_blocked` when the required code cannot be established.
+- Put only business actors, calls, messages, and state changes in the business diagram. Exclude pytest, fixtures, observer setup, polling implementation, and code-level details.
 
 ## Automated test flow diagram
 
-`自动化测试流程图.md` documents the executable orchestration and must show, when applicable:
+Create `自动化测试流程图.md` only when the test adds meaningful orchestration such as pre-subscription, offset capture, multi-observer reconciliation, time control, or non-trivial cleanup that the business diagram should not show. It also uses `sequenceDiagram` and may show the test runner, observer, and cleanup lifecycle, but uses business actions rather than Python function names.
 
-1. load the selected environment and run preflight;
-2. create a unique Kafka consumer group and subscribe before the business request;
-3. record the starting offset, then invoke the public business API;
-4. validate HTTP and application-level response fields;
-5. consume by order ID or atomic order ID to prove the message was published;
-6. poll the database with the same correlation key to prove processing and persistence;
-7. compare correlated Kafka and database fields;
-8. run API cleanup, close the consumer, and restore scenario configuration.
+When the distinction is small, omit this file; do not duplicate the business diagram under another heading.
 
-Kafka publication evidence and database processing/persistence evidence are separate checkpoints. One cannot substitute for the other.
+## Data and Python ownership
 
-The two diagrams may use Mermaid, but they must model distinct audiences and never be duplicates with renamed headings. Update both whenever an affected source change alters their respective flow.
+- `业务数据.yaml` owns static business inputs and environment placeholders.
+- `common/builders/` owns reusable payload construction.
+- `common/repositories/` owns reusable read-only SQL and row mapping.
+- `common/assertions/` owns reusable protocol and cross-system assertions.
+- Scenario modules own scenario-specific actions, assertions, mappings, and cleanup.
+- `test_*.py` owns only readable orchestration and guaranteed cleanup.
 
-## Version change record
-
-`版本变更记录.md` is append-oriented and records, per review:
-
-- review time and repository;
-- previous and current commit;
-- branch and dirty state;
-- changed and inspected files, including relevant dirty-file SHA-256 values;
-- affected source anchors and caller/contract traversal;
-- impact decision and rationale;
-- actual changes to the definition, pytest, diagrams, data, or cleanup;
-- `last_reviewed_commit` and `generated_from_commit` after the decision.
-
-A no-impact review still records the evidence and `last_reviewed_commit` update. Do not rewrite history merely to make the file appear current.
-
-## Generated Python
-
-Use Chinese comments/docstrings where they clarify business intent, fixture ownership, correlation, bounded polling, restoration, or cleanup. Avoid comments on trivial assignments. Keep source identifiers, protocol fields, configuration keys, and reusable technical modules in their source-defined language.
+Every Python module, class, and function has a concise Chinese docstring. Add Chinese comments before business branches, asynchronous waits, and cleanup when intent is not self-evident. Keep protocol fields and source identifiers unchanged.

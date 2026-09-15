@@ -41,6 +41,8 @@ This is suffix-secret SHA-256, not HMAC. Do not URL-encode or JSON-normalize the
 ## Python adapter
 
 ```python
+"""按 Seres 源码契约生成并应用请求签名。"""
+
 from __future__ import annotations
 
 import hashlib
@@ -52,6 +54,7 @@ RESERVED_HEADERS = {"sign", "timestamp", "accesskey"}
 
 
 def _query_text(value: object) -> str:
+    """将查询参数转换为签名契约要求的文本。"""
     if value is None:
         return "null"
     if isinstance(value, bool):

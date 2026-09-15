@@ -1,118 +1,133 @@
 # Python E2E Workflow Contract
 
-The unit of planning and maintenance is one scenario directory. There is no global machine-readable scenario inventory. `E2E_PLAN.md` contains only project-level strategy, environment/configuration conventions, commands, batch notes, and explicit project-wide constraints.
+The unit of planning, generation, and maintenance is one scenario directory. `E2E_PLAN.md` may contain project-wide strategy, configuration conventions, commands, and constraints, but never a scenario inventory.
 
 ## Scenario definition
 
-Each `scenarios/<中文业务名称>/场景定义.yaml` is the authoritative contract for that scenario. Use source-confirmed names and omit optional sections that do not apply.
+Each `scenarios/<中文业务名称>/场景定义.yaml` is the authoritative contract for that scenario. Use only these top-level sections: `meta`, `preconditions`, `integrations`, `steps`, `cleanup`, and `source`.
 
 ```yaml
-id: MNO_REALNAME_DUAL_OPERATOR_RENEWAL
-name: 实名后开通双运营商套餐并验证跨月续订
-execution_status: pending_environment
+meta:
+  id: MNO_REALNAME_DUAL_OPERATOR_RENEWAL
+  name: 实名后双运营商套餐阈值与跨月续订
+  status: pending_environment
+  actor: 已实名车主
 
-actor: 已实名车主
 preconditions:
-  - 车辆与车主关系有效
-  - 双运营商套餐可售
+  - 测试车辆存在移动与联通有效车卡关系
+  - 移动20GB大包和联通周期套餐可唯一匹配
+  - 环境支持第二个月时间控制
 
-services:
-  - mno-traffic
-  - mno-operator
-
-interfaces:
-  - service: mno-traffic
-    kind: http
-    name: SoftwareSaleSubscriptionController
-
-integration_dependencies:
-  - kind: kafka
-    required: true
-  - kind: mysql
-    required: true
+integrations:
+  http:
+    - mno-traffic
+    - mno-operator
+  kafka: true
+  mysql: true
+  redis: false
+  emq: false
 
 steps:
-  - 开通双运营商套餐
-  - 推进并验证跨月续订
+  - id: real_name
+    action: send_real_name_notification
+    data_ref: 业务数据.yaml#/real_name
+    expect:
+      - real_name_persisted
 
-checkpoints:
-  - id: subscription_accepted
-    owner_service: mno-traffic
-    observable: http_application_result
-    correlation: order_id
-  - id: fulfillment_published
-    owner_service: mno-traffic
-    observable: kafka_message
-    correlation: atomic_order_id
-  - id: fulfillment_persisted
-    owner_service: mno-operator
-    observable: mysql_row
-    correlation: atomic_order_id
+  - id: activate
+    action: activate_salable_plan
+    data_ref: 业务数据.yaml#/activate
+    expect:
+      - mobile_atom_success
+      - unicom_atom_success
 
-expected_outcomes:
-  - 两个运营商套餐均成功续订
+  - id: threshold
+    action: send_dual_operator_threshold
+    data_ref: 业务数据.yaml#/threshold
+    expect:
+      - kafka_reminder_published
+      - mysql_reminder_persisted
+
+  - id: next_month
+    action: advance_to_next_month
+    expect:
+      - dual_operator_renewal_created
 
 cleanup:
-  - 通过业务 API 删除测试数据
-  - 关闭场景独立 Kafka consumer
-  - 恢复场景修改过的配置
+  strategy: api
+  actions:
+    - unsubscribe_salable_order
 
-source_versions:
-  - repository: mno-traffic
-    path: ../mno-traffic
-    generated_from_commit: 500832c542f12fced10a92bedd8225e64f635abd
-    last_reviewed_commit: 500832c542f12fced10a92bedd8225e64f635abd
-    branch: develop
-    dirty: false
-    source_anchors:
+source:
+  - repo: mno-traffic
+    commit: 61604f3dd84cea56cc29732faea2dbd727a6e906
+    anchors:
       - SoftwareSaleSubscriptionController
-      - RealNameController
       - OperatorThresholdFulfillmentService
-      - SalablePlanFulfillmentReceiver
-  - repository: mno-operator
-    path: ../mno-operator
-    generated_from_commit: 3023bfb40db540376b6a9dbd2be73b5e5a8d006a
-    last_reviewed_commit: 3023bfb40db540376b6a9dbd2be73b5e5a8d006a
-    branch: develop
-    dirty: false
-    source_anchors:
-      - <source-confirmed-mno-operator-anchor>
+
+  - repo: mno-operator
+    commit: 16640b8fb5dd10c7d1e94eed16b3e35a3cb09077
+    anchors:
+      - OperatorBusinessOperatorApplication
 ```
 
-For a relevant dirty working tree, also record each relevant staged, unstaged, or untracked file and its SHA-256. `generated_from_commit` is the committed source basis for the current test; `dirty: true` plus file hashes records the additional uncommitted basis.
+Rules:
 
-Allowed execution states include:
+- `meta.id` is stable and appears outside this file only in exactly one pytest marker.
+- `meta.status` is `ready`, `pending_environment`, or `contract_blocked`.
+- `integrations.http` lists required service clients. Each component boolean is explicit; `true` means required and `false` means unused.
+- Every step owns its action, optional data reference, and expected business outcomes. Do not split them into top-level `steps`, `checkpoints`, and `expected_outcomes`.
+- `data_ref` is a local JSON Pointer into `业务数据.yaml`. It must not point to secrets or environment connection data.
+- Actions and expectations are stable business symbols, not endpoint paths, error-code catalogs, URLs, or prose.
+- `cleanup.actions` contains source-confirmed, idempotent business cleanup actions. Generated code must guarantee them with `finally`, pytest finalizers, or an equivalent context manager.
+- Each source entry keeps only the repository name, exact commit, and high-value anchors. Git history is the change log.
+- Omit unsupported optional explanation fields instead of filling them with placeholders.
 
-- `ready`: required runtime configuration passed preflight.
-- `pending_environment`: code is complete/collectable, but runtime endpoints, credentials, test identifiers, or integration access are missing.
-- `contract_blocked`: an interface, message/schema contract, or business rule cannot be established from source.
+## Business data
 
-Do not use `pending_environment` to defer code generation. Do not use `contract_blocked` for missing runtime values.
+Keep static business inputs separate from Python orchestration:
+
+```yaml
+real_name:
+  carrier: 1
+  customer_type: 1
+  oper_type: 1
+
+activate:
+  plan_id: ${MNO_TEST_REALNAME_SALABLE_PLAN_ID}
+
+threshold:
+  mobile_usage_mb: 2048
+  mobile_total_usage_mb: 20480
+  unicom_percent: 100
+```
+
+Unresolved placeholders remain inert during import and collection. Resolve them only during preflight. Do not store generated order numbers, secrets, endpoints, credentials, or mutable runtime results in this file.
 
 ## Generation gates
 
-1. Source discovery identifies the public entrypoint, downstream boundaries, correlation keys, assertions, cleanup, and source anchors.
-2. The scenario definition and both diagrams are written before or with the generated test.
+1. Source discovery establishes the public entrypoint, business steps, correlation keys, assertions, cleanup, and source anchors.
+2. `场景定义.yaml`, `业务数据.yaml`, and `业务流程图.md` exist before or with the generated test.
 3. Missing environment values do not block complete code generation or collection.
-4. `pytest --collect-only` passes before claiming the scenario is generated.
-5. Real execution runs non-destructive preflight before any business request or seed write.
-6. When runtime configuration exists, focused execution verifies the business response, required downstream evidence, cleanup, and restoration.
-7. Incremental updates pass the per-scenario source impact gate in `version-sync-policy.md`.
+4. `pytest --collect-only` succeeds before claiming the scenario is generated.
+5. Runtime execution performs non-destructive preflight before business side effects.
+6. When an environment exists, focused execution verifies application responses, downstream evidence, field-level reconciliation, and cleanup.
+7. Incremental updates pass the source-impact gate in [version-sync-policy.md](version-sync-policy.md).
 
 ## Reconciliation
 
-`scripts/check_scenarios.py` scans `scenarios/*/场景定义.yaml`; it must not read or generate a registry. At minimum it checks:
+`scripts/check_scenarios.py` discovers `scenarios/*/场景定义.yaml` directly and checks at minimum:
 
-- the directory and business artifact names follow the Chinese naming boundary;
-- the stable ID exists only in the definition and exactly one pytest marker;
-- the test and both diagrams exist;
-- dependency declarations do not contain endpoints, credentials, or `enabled` duplicates;
-- source repositories include both commit fields, dirty state, and source anchors;
-- dirty relevant files include SHA-256 values;
-- every discovered definition maps to its sibling test and there are no duplicate IDs.
+- only the compact top-level schema is used and all required fields have valid types;
+- every definition has sibling `业务数据.yaml`, `业务流程图.md`, and `test_<中文业务名称>.py`;
+- `自动化测试流程图.md` is optional, but any scenario diagram uses Mermaid `sequenceDiagram`, never `flowchart`; real branches use `alt`/`else` and failure branches include source-confirmed business error codes;
+- the stable ID appears only in the definition and exactly one pytest marker, with no duplicate IDs;
+- source entries have `repo`, a full commit hash, and non-empty anchors;
+- test files contain no hardcoded VIN, ICCID, order number, plan/package ID, payload block, or SQL statement;
+- Python modules, classes, and functions contain Chinese docstrings;
+- Kafka, MySQL, Redis, and EMQ imports/fixtures agree with `integrations`;
+- every scenario has guaranteed cleanup using `finally` or an equivalent pytest finalizer/context manager.
 
-`scripts/check_source_versions.py` scans the same definitions and reports each scenario independently as `unchanged`, `no_relevant_change`, `affected`, `full_rediscovery_required`, or `dirty_review_required`. It does not update files unless the user requested an update.
+`scripts/check_source_versions.py` reads the same definitions and emits an independent source-impact result per scenario/repository. Neither script reads, creates, or updates a global registry.
 
-## Unknowns and exclusions
-
-Keep scenario-specific unknowns and exclusion reasons in that scenario's definition or explanation. If a requested business rule cannot be observed, identify the missing contract, permission, or test hook. Never replace a required Kafka/database outcome with an HTTP-only assertion merely to make execution pass.
+Static checks should parse YAML and Python with real parsers where possible. Heuristic checks for sensitive literals and SQL must report the exact file and line and allow narrowly documented false-positive suppressions.

@@ -1,66 +1,157 @@
 # Cross-Service Integration Policy
 
-Read this reference when a scenario crosses a service boundary or uses Kafka, MySQL, EMQ/EMQX, Redis, XXL-JOB, or another observable component.
+Read this reference when a scenario crosses a service boundary or uses Kafka, MySQL, Redis, EMQ/EMQX, XXL-JOB, or another observable component.
 
 ## Boundaries
 
-Keep three concerns separate:
+Keep these concerns separate:
 
-1. transport clients call public business interfaces;
-2. generic component adapters observe source-confirmed topics, rows, keys, or jobs;
-3. scenario tests express business actions, mappings, correlation, assertions, and cleanup.
+1. `common/clients/` calls public business interfaces.
+2. `common/builders/` builds reusable source-confirmed payloads.
+3. `common/repositories/` owns read-only SQL and maps rows into stable records.
+4. `common/integrations/` provides generic component adapters.
+5. `common/fixtures/` owns adapter lifecycle and scenario isolation.
+6. `common/assertions/` compares protocol, message, and persistence evidence.
+7. Scenario modules express business actions, mappings, scenario-only assertions, and cleanup.
 
-Reusable adapters live under `common/integrations/` and accept environment configuration plus scenario mappings. Do not embed topic names, tables, business rules, or secrets in a generic adapter. Reuse an approved pinned dependency; do not add a client implicitly.
+Generic modules accept environment configuration and scenario mappings. Do not embed business topic names, table names, credentials, or environment addresses in them. Reuse an approved pinned dependency; do not add an integration client silently.
 
-Shared integration capability is configured once in `config/common.yaml`. Connection details live in the selected `config/environments/<profile>.yaml`. A scenario only declares that it needs a component and whether the dependency is required or optional. Effective use requires both a shared `enabled: true` capability and a scenario dependency declaration.
+Shared integration capability is configured in `config/common.yaml`. Connection details live only in `config/environments/<profile>.yaml`. A scenario declares `true` or `false` for Kafka, MySQL, Redis, and EMQ under `integrations`. Instantiate and preflight only components declared `true`.
 
-No integration connection, client construction, or health check occurs during pytest collection. Required runtime access is validated during preflight immediately before business side effects. A missing required component produces `pending_environment` and a preflight failure, not `skip` and not an HTTP-only fallback. A source-unknown contract produces `contract_blocked`.
+No adapter construction, connection, subscription, or health check occurs during module import or pytest collection. Missing required runtime access produces `pending_environment` and a preflight failure, never a skip or weaker fallback.
 
-## Kafka publication evidence
+## Kafka and database evidence
 
-For a scenario that must prove a Kafka publication:
+For Kafka publication evidence:
 
-1. create a unique scenario consumer group before the business action;
-2. subscribe to the exact source-confirmed topic and wait until assignment is ready;
-3. record partition starting offsets after assignment;
-4. invoke the public business API;
-5. consume only from the bounded starting-offset/time window;
-6. filter by the source-confirmed order ID, atomic order ID, trace ID, or equivalent key;
-7. assert key headers, schema/version, and business payload fields;
-8. close the consumer in teardown even after failures.
+1. Create a unique consumer group and subscribe to the exact source-confirmed topic before the business request.
+2. Wait for partition assignment and capture starting offsets.
+3. Invoke the public business action.
+4. Consume only from the bounded starting-offset/time window.
+5. Match with source-confirmed keys such as `orderNo`, `taskId`, `orderId`, atomic order ID, or `iccid`.
+6. Assert topic, key, relevant headers, schema/version, and business payload fields.
+7. Close the consumer even after a failure.
 
-Subscribing after the business request creates a race and is not acceptable evidence. An unrelated message, a broad topic match, or merely knowing that producer code exists does not prove publication.
+For database evidence, use a repository method with a parameterized, read-only query. Poll by the same correlation key with a bounded deadline and report the last observed row. Assert ownership, state, meaningful columns, and relationships.
 
-## Database processing evidence
+Kafka proves publication; the database proves downstream processing and persistence. When both are declared, assert them independently and then compare every shared source-confirmed field. Define an explicit field map when names differ, normalize only source-confirmed representation differences, and report field name, Kafka value, and database value on mismatch. A broad topic match, a row found by time range alone, or equality of correlation IDs alone is insufficient.
 
-Use read-only correlated queries where possible. Poll with a bounded deadline and assert the row state, ownership, meaningful columns, and relationships. When Kafka drives the write, use the same correlation key used for the message assertion.
+## Redis
 
-Kafka and database evidence prove different facts:
+When any scenario declares `integrations.redis: true`, provide these reusable modules:
 
-- Kafka proves the expected message was published.
-- The database proves downstream processing completed and persisted its result.
+```text
+common/integrations/redis.py
+common/fixtures/redis_observer.py
+```
 
-Assert both independently when the scenario requires both, then compare source-confirmed fields across the message and row. Do not let either checkpoint stand in for the other.
+Expose the minimum read-oriented contract:
 
-Direct database setup or cleanup is allowed only when the business API cannot perform it and a dedicated test boundary is approved. Never truncate, broadly delete, or mutate production/shared data.
+```python
+"""提供只读 Redis 业务证据观察能力。"""
+
+
+class RedisObserver:
+    """读取并等待场景声明的 Redis 证据。"""
+
+    def get_json(self, key: str) -> dict | None:
+        """读取并解码 JSON 值。"""
+        ...
+
+    def exists(self, key: str) -> bool:
+        """判断指定键是否存在。"""
+        ...
+
+    def ttl(self, key: str) -> int:
+        """读取指定键的剩余有效期。"""
+        ...
+
+    def hash_get_all(self, key: str) -> dict:
+        """读取并解码哈希字段。"""
+        ...
+
+    def wait_for_key(self, key: str, timeout_seconds: int) -> dict | None:
+        """在限定时间内等待指定键出现。"""
+        ...
+```
+
+Requirements:
+
+- Default to read-only operations and do not expose `flushdb`, wildcard deletion, or business-key cleanup.
+- Redis evidence is secondary when API, Kafka, or database evidence is available.
+- Validate exact key namespace, decoded value, and relevant TTL/version semantics from source.
+- If cleanup of an owned key is required, expose it only through a fixture that enforces the configured test prefix and rejects every other key.
+- Use a bounded monotonic deadline and useful last-state diagnostics for `wait_for_key`.
+- Load endpoints, credentials, database index, TLS, and test-key prefix only from the selected environment profile.
+
+Do not generate these modules as empty scaffolding when Redis is unused.
+
+## EMQ/EMQX
+
+When any scenario declares `integrations.emq: true`, provide:
+
+```text
+common/integrations/emq.py
+common/fixtures/emq_observer.py
+```
+
+Expose these contracts:
+
+```python
+"""提供测试主题发布和 MQTT 业务消息观察能力。"""
+
+from collections.abc import Callable
+
+
+class EmqPublisher:
+    """仅向测试专属主题发布场景消息。"""
+
+    def publish(
+        self,
+        topic: str,
+        payload: dict,
+        qos: int = 1,
+        retain: bool = False,
+    ) -> None:
+        """向通过测试前缀校验的主题发布消息。"""
+        ...
+
+
+class EmqObserver:
+    """订阅并等待与场景关联的 MQTT 消息。"""
+
+    def start(self, topics: list[str]) -> None:
+        """订阅主题并等待订阅就绪。"""
+        ...
+
+    def wait_for_message(
+        self,
+        matcher: Callable[[dict], bool],
+        timeout_seconds: int,
+    ) -> dict | None:
+        """在限定时间内等待匹配的业务消息。"""
+        ...
+
+    def close(self) -> None:
+        """断开连接并释放客户端资源。"""
+        ...
+```
+
+Requirements:
+
+- Build a unique client ID from the run and scenario IDs to avoid session collisions.
+- Subscribe and confirm readiness before the business action.
+- Support configured TLS, account, QoS, retain behavior, and topic prefix.
+- Load broker addresses, credentials, TLS, and topic prefixes only from the selected environment profile.
+- Validate every publisher topic against the configured test-topic prefix. Never default to publishing into a business topic.
+- Match messages with a source-confirmed correlation key and bounded deadline.
+- Disconnect deterministically through a fixture finalizer or context manager.
+
+Do not generate these modules as empty scaffolding when EMQ is unused.
 
 ## Other observers
 
-- **EMQ/EMQX:** subscribe before triggering, use a unique client identity, exact topic/filter, bounded wait, source-confirmed QoS/properties, and deterministic disconnect.
-- **Redis:** assert the exact namespace, value/encoding, TTL/version, or stream semantics; clean only scenario-owned keys and never flush a shared database.
-- **XXL-JOB:** use the approved trigger, correlate arguments and execution records, assert both job outcome and downstream business state, and restore any owned configuration.
+- **XXL-JOB:** use an approved trigger, correlate arguments and execution records, assert both job outcome and downstream state, and restore owned configuration.
+- **Other stores or brokers:** preserve the same rules: preflight, pre-observation setup, exact correlation, bounded wait, useful diagnostics, and deterministic cleanup.
 
-Each observer reports the relevant endpoint identifier, correlation key, bounded deadline, and last observed state with secrets redacted.
-
-## Automated test order
-
-When Kafka and MySQL are both required, preserve this orchestration in code and `自动化测试流程图.md`:
-
-```text
-load environment -> preflight -> create/subscribe consumer -> record offsets
--> invoke API -> assert HTTP/application result -> assert correlated Kafka message
--> poll/assert correlated database row -> compare message and row
--> API cleanup -> close consumer -> restore scenario configuration
-```
-
-Register cleanup handlers as soon as each resource is acquired so later assertion failures cannot bypass cleanup.
+Each observer reports its non-secret endpoint identifier, correlation key, deadline, and last observed state with sensitive values redacted.
