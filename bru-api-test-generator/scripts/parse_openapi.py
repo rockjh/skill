@@ -207,6 +207,12 @@ def extract(path: Path, document: dict[str, Any]) -> dict[str, Any]:
                 "responses": resolve_value(document, operation.get("responses", {})),
                 "security": operation.get("security", document.get("security")),
             }
+            for extension in (
+                "x-permissions", "x-permission", "x-roles", "x-role",
+                "x-idempotent", "x-safety",
+            ):
+                if extension in operation:
+                    endpoint[extension] = resolve_value(document, operation[extension])
             explicit_primary = operation.get("x-primary-tag") or operation.get("primary_tag")
             if isinstance(explicit_primary, str) and explicit_primary.strip():
                 endpoint["primary_tag"] = explicit_primary.strip()
@@ -560,34 +566,56 @@ def inferred_scenario_matrix(endpoint: dict[str, Any]) -> dict[str, dict[str, An
     parameters = [item for item in endpoint.get("parameters", []) if isinstance(item, dict)]
     media_type, body_schema = request_body_schema(endpoint)
     query = [item for item in parameters if item.get("in") == "query"]
-    has_input = bool(parameters or body_schema)
+    validation_applicable = any(
+        parameter.get("required") is True
+        or any(
+            key in (parameter.get("schema") if isinstance(parameter.get("schema"), dict) else parameter)
+            for key in ("enum", "pattern", "minimum", "maximum", "minLength", "maxLength", "format")
+        )
+        for parameter in parameters
+    ) or bool(
+        body_schema.get("required")
+        or any(
+            isinstance(schema, dict)
+            and any(key in schema for key in ("enum", "pattern", "minimum", "maximum", "minLength", "maxLength", "format"))
+            for schema in (
+                body_schema.get("properties", {}).values()
+                if isinstance(body_schema.get("properties"), dict)
+                else []
+            )
+        )
+    ) or bool(media_type and "415" in (endpoint.get("responses") or {}))
     properties = body_schema.get("properties", {}) if isinstance(body_schema.get("properties"), dict) else {}
     file_applicable = media_type == "multipart/form-data" or any(
         isinstance(value, dict) and value.get("format") == "binary"
         for value in properties.values()
     )
     security = endpoint.get("security")
-    route = str(endpoint.get("path", "")).lower()
-    secured = bool(security) or any(part in route for part in ("/admin", "/manage", "/internal"))
-    permission = endpoint.get("x-permissions") or endpoint.get("x-permission") or endpoint.get("x-roles")
-
+    secured = bool(security)
+    permission = (
+        endpoint.get("x-permissions") or endpoint.get("x-permission")
+        or endpoint.get("x-roles") or endpoint.get("x-role")
+    )
     def decision(applicable: bool, reason: str) -> dict[str, Any]:
-        return {"applicable": applicable, "status": "inferred", "reason": reason}
+        return {"applicable": applicable, "status": "inferred" if applicable else "confirmed", "reason": reason}
 
     return {
         "success": decision(True, "所有可达接口默认覆盖成功路径"),
         "authentication": decision(
             secured,
-            "OpenAPI security 或管理端路径表明需要认证" if secured else "OpenAPI 明确未声明认证且不是管理端路径",
+            "OpenAPI security 声明了认证要求" if secured else "OpenAPI 未声明认证；管理端路径或审计 Header 不作为认证证据",
         ),
         "authorization": decision(
-            bool(permission) or "/admin" in route,
-            "权限扩展或管理端路径需要权限确认" if bool(permission) or "/admin" in route else "契约未提供角色、租户或数据权限证据",
+            bool(permission),
+            "OpenAPI 权限或角色扩展声明了授权要求" if permission else "OpenAPI 未声明权限模型；等待源码或探针确认",
         ),
-        "validation": decision(has_input, "根据 required、enum、min/max、pattern 推导" if has_input else "接口无请求参数或请求体"),
+        "validation": decision(validation_applicable, "契约声明了输入校验约束" if validation_applicable else "契约未声明可验证的输入约束"),
         "business_error": decision(False, "契约阶段未发现源码业务异常；源码增强阶段复核"),
         "query": decision(bool(query), "根据分页、筛选和排序查询参数推导" if query else "接口无查询参数"),
-        "safety": decision(False, "契约未声明幂等、并发或重复提交语义"),
+        "safety": decision(
+            bool(endpoint.get("x-idempotent") or endpoint.get("x-safety")),
+            "契约声明了幂等或安全语义" if endpoint.get("x-idempotent") or endpoint.get("x-safety") else "契约未声明幂等、并发或重复提交语义",
+        ),
         "file": decision(file_applicable, "multipart/form-data 或 binary schema" if file_applicable else "接口不是文件上传或下载"),
     }
 
@@ -832,7 +860,11 @@ def render_contracts_readme(index: dict[str, Any], modules: dict[str, tuple[dict
     return "\n".join(lines).rstrip() + "\n"
 
 
-def seed_contract_cases(endpoint: dict[str, Any]) -> list[dict[str, Any]]:
+def seed_contract_cases(
+    endpoint: dict[str, Any],
+    coverage_profile: str = "contract-draft",
+    security_profile: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     """Create business-readable draft cases that are provable from OpenAPI."""
 
     endpoint_id = str(endpoint.get("id", "ENDPOINT"))
@@ -929,6 +961,33 @@ def seed_contract_cases(endpoint: dict[str, Any]) -> list[dict[str, Any]]:
             request = copy.deepcopy(success_request)
             set_parameter(request, parameter, "__INVALID_PATTERN__")
             seeded.append(build(f"INVALID_PATTERN_{suffix}", "validation", f"参数 {name} 不符合格式", error_status, request))
+        for keyword, delta, label in (
+            ("minimum", -1, "小于最小值"),
+            ("maximum", 1, "大于最大值"),
+            ("minLength", -1, "短于最小长度"),
+            ("maxLength", 1, "超过最大长度"),
+        ):
+            boundary = schema.get(keyword)
+            if error_status is None or not isinstance(boundary, (int, float)):
+                continue
+            value: Any = (
+                "x" * max(0, int(boundary) + delta)
+                if keyword.endswith("Length")
+                else boundary + delta
+            )
+            request = copy.deepcopy(success_request)
+            set_parameter(request, parameter, value)
+            seeded.append(build(
+                f"INVALID_{keyword.upper()}_{suffix}", "validation",
+                f"参数 {name} {label}", error_status, request,
+            ))
+        if error_status is not None and schema.get("format"):
+            request = copy.deepcopy(success_request)
+            set_parameter(request, parameter, "__INVALID_FORMAT__")
+            seeded.append(build(
+                f"INVALID_FORMAT_{suffix}", "validation",
+                f"参数 {name} 格式非法", error_status, request,
+            ))
         if name.lower() in {"page", "pagenum", "pagesize", "pageindex", "limit", "offset"}:
             status = error_status if error_status is not None else success_status
             if status is not None:
@@ -964,6 +1023,15 @@ def seed_contract_cases(endpoint: dict[str, Any]) -> list[dict[str, Any]]:
             invalid, detail = field_schema["minimum"] - 1, f"字段 {field} 小于最小值"
         elif isinstance(field_schema.get("maximum"), (int, float)):
             invalid, detail = field_schema["maximum"] + 1, f"字段 {field} 大于最大值"
+        elif isinstance(field_schema.get("minLength"), int):
+            invalid = "x" * max(0, field_schema["minLength"] - 1)
+            detail = f"字段 {field} 短于最小长度"
+        elif isinstance(field_schema.get("maxLength"), int):
+            invalid = "x" * (field_schema["maxLength"] + 1)
+            detail = f"字段 {field} 超过最大长度"
+        elif field_schema.get("format"):
+            invalid = "__INVALID_FORMAT__"
+            detail = f"字段 {field} 格式非法"
         if detail:
             request = copy.deepcopy(success_request)
             if isinstance(request.get("body"), dict):
@@ -980,6 +1048,107 @@ def seed_contract_cases(endpoint: dict[str, Any]) -> list[dict[str, Any]]:
             for name in binary_fields:
                 request["body"].pop(name, None)
         seeded.append(build("MISSING_UPLOAD_FILE", "file", "缺少上传文件", error_status, request))
+    if coverage_profile == "full-matrix":
+        query_parameters = [item for item in parameters if item.get("in") == "query"]
+        paging_names = {"page", "pagenum", "pageindex", "pagesize", "limit", "offset"}
+        ordering_names = {"sort", "orderby", "order"}
+        for parameter in query_parameters:
+            name = str(parameter.get("name", "query"))
+            lowered = name.lower()
+            if lowered in paging_names:
+                continue
+            request = copy.deepcopy(success_request)
+            value = (
+                "__VALID_SORT__"
+                if lowered in ordering_names
+                else schema_value(parameter.get("schema", {}), name)
+            )
+            set_parameter(request, parameter, value)
+            suffix = slugify_tag(name).replace("-", "_").upper()
+            seeded.append(build(
+                f"QUERY_{suffix}", "query", f"查询参数 {name}",
+                success_status or 200, request,
+            ))
+        if len(query_parameters) > 1:
+            request = copy.deepcopy(success_request)
+            for parameter in query_parameters:
+                set_parameter(
+                    request,
+                    parameter,
+                    schema_value(parameter.get("schema", {}), str(parameter.get("name", "query"))),
+                )
+            seeded.append(build("QUERY_COMBINED", "query", "组合查询", success_status or 200, request))
+        filter_parameter = next(
+            (
+                item for item in query_parameters
+                if str(item.get("name", "")).lower() not in paging_names | ordering_names
+                and not (
+                    isinstance(item.get("schema"), dict)
+                    and item["schema"].get("enum")
+                )
+            ),
+            None,
+        )
+        if filter_parameter is not None:
+            request = copy.deepcopy(success_request)
+            set_parameter(request, filter_parameter, "__NO_MATCH__")
+            seeded.append(build("QUERY_EMPTY_RESULT", "query", "查询空结果", success_status or 200, request))
+
+        if media_type and media_type != "multipart/form-data" and "415" in responses:
+            request = copy.deepcopy(success_request)
+            request["body_type"] = "text/plain" if media_type != "text/plain" else "application/json"
+            seeded.append(build("INVALID_CONTENT_TYPE", "validation", "Content-Type 错误", 415, request))
+
+        profile = security_profile or {}
+        auth_profile = profile.get("auth-token", {}) if isinstance(profile, dict) else {}
+        probe = auth_profile.get("probe_result", {}) if isinstance(auth_profile, dict) else {}
+        if endpoint.get("security") and isinstance(probe, dict):
+            auth_cases = (
+                ("NO_TOKEN", "no_token_status", "缺少认证 Token", None),
+                ("INVALID_TOKEN", "invalid_token_status", "认证 Token 非法", "Bearer __INVALID_TOKEN__"),
+            )
+            for suffix, status_key, detail, token in auth_cases:
+                status = probe.get(status_key)
+                if not isinstance(status, int):
+                    continue
+                request = copy.deepcopy(success_request)
+                if token:
+                    request.setdefault("headers", {})["Authorization"] = token
+                else:
+                    request["omit_common_headers"] = ["Authorization"]
+                seeded.append(build(suffix, "authentication", detail, status, request))
+
+        permission = (
+            endpoint.get("x-permissions") or endpoint.get("x-permission")
+            or endpoint.get("x-roles") or endpoint.get("x-role")
+        )
+        if permission and "403" in responses:
+            request = copy.deepcopy(success_request)
+            request.setdefault("headers", {})["Authorization"] = "Bearer {{UNAUTHORIZED_TOKEN}}"
+            seeded.append(build("FORBIDDEN", "authorization", "权限不足", 403, request))
+
+        if binary_fields and error_status is not None:
+            file_schema = properties.get(binary_fields[0], {})
+            constraints = file_schema if isinstance(file_schema, dict) else {}
+            file_cases = (
+                ("EMPTY_UPLOAD_FILE", "上传空文件", "{{EMPTY_UPLOAD_FILE}}", ("minLength", "x-min-size")),
+                ("INVALID_FILE_EXTENSION", "文件扩展名非法", "{{INVALID_EXTENSION_FILE}}", ("x-allowed-extensions",)),
+                ("INVALID_FILE_MIME", "文件 MIME 类型非法", "{{INVALID_MIME_FILE}}", ("contentMediaType", "x-allowed-mime-types")),
+                ("OVERSIZED_UPLOAD_FILE", "文件超过声明大小", "{{OVERSIZED_UPLOAD_FILE}}", ("maxLength", "x-max-size")),
+            )
+            for suffix, detail, value, evidence_keys in file_cases:
+                if not any(key in constraints for key in evidence_keys):
+                    continue
+                request = copy.deepcopy(success_request)
+                if isinstance(request.get("body"), dict):
+                    request["body"][binary_fields[0]] = {"file": value}
+                seeded.append(build(suffix, "file", detail, error_status, request))
+
+        if endpoint.get("x-idempotent") or endpoint.get("x-safety"):
+            seeded.append(build(
+                "SAFETY_REPEAT", "safety", "重复提交",
+                success_status or 200, success_request,
+            ))
     return seeded
 
 
@@ -989,8 +1158,11 @@ def write_partitioned(
     output_dir: Path,
     seed_cases: bool = False,
     incremental: bool = False,
+    coverage_profile: str = "full-matrix",
 ) -> dict[str, Any]:
     qa_root = output_dir.parent.parent
+    if coverage_profile not in {"contract-draft", "full-matrix"}:
+        raise ValueError(f"unsupported coverage profile: {coverage_profile}")
     try:
         initialize_execution_layout(qa_root)
     except ValueError as exc:
@@ -1039,6 +1211,7 @@ def write_partitioned(
         "module_map": str(module_map_path),
         "execution_config_file": str((qa_root / "execution" / "config.yaml")),
         "generation_status": "draft",
+        "coverage_profile": coverage_profile,
         "inventory_endpoints": len(manifest["endpoints"]),
         "generated_cases": 0,
         "blocked_modules": 0,
@@ -1056,6 +1229,7 @@ def write_partitioned(
         module_unchanged = bool(
             incremental
             and previous_state.get("generator_version") == GENERATOR_VERSION
+            and previous_state.get("coverage_profile") == coverage_profile
             and isinstance(previous_module, dict)
             and previous_module.get("contract_fingerprint") == current_module_fingerprints[module_id]
             and endpoints_path.is_file()
@@ -1146,7 +1320,9 @@ def write_partitioned(
         if seed_cases:
             existing_case_ids = {str(case.get("id")) for case in cases if case.get("id")}
             for endpoint in endpoints:
-                for seeded in seed_contract_cases(endpoint):
+                security_path = output_dir.parent / "security-profile.yaml"
+                security_profile = load_document(security_path) if security_path.is_file() else {}
+                for seeded in seed_contract_cases(endpoint, coverage_profile, security_profile):
                     if seeded["id"] not in existing_case_ids:
                         cases.append(seeded)
                         existing_case_ids.add(seeded["id"])
@@ -1228,26 +1404,28 @@ def write_partitioned(
         )
     security_profile = {
         "version": 1,
-        "status": "inferred",
         "source": manifest["source"],
-        "profiles": [
-            {
-                "id": "openapi-default",
-                "source": "openapi",
-                "security": sorted(
-                    {
-                        canonical
-                        for endpoint in manifest["endpoints"]
-                        for canonical in (
-                            [json.dumps(endpoint.get("security"), ensure_ascii=True, sort_keys=True)]
-                            if endpoint.get("security") is not None
-                            else []
-                        )
-                    }
-                ),
-                "requires_runtime_confirmation": True,
-            }
-        ],
+        "admin-operator-context": {
+            "type": "audit-context",
+            "header": "operatorInfo",
+            "status": "probe-required",
+        },
+        "auth-token": {
+            "type": "authentication",
+            "header": "Authorization",
+            "status": "probe-required",
+            "security": sorted(
+                {
+                    canonical
+                    for endpoint in manifest["endpoints"]
+                    for canonical in (
+                        [json.dumps(endpoint.get("security"), ensure_ascii=True, sort_keys=True)]
+                        if endpoint.get("security") is not None
+                        else []
+                    )
+                }
+            ),
+        },
     }
     security_path = output_dir.parent / "security-profile.yaml"
     if not security_path.exists():
@@ -1263,6 +1441,7 @@ def write_partitioned(
         or summary["deleted_endpoint_ids"]
         or summary["manual_review_cases"]
         or previous_state.get("generator_version") != GENERATOR_VERSION
+        or previous_state.get("coverage_profile") != coverage_profile
     )
     generated_at = (
         datetime.now(timezone.utc).isoformat()
@@ -1272,6 +1451,7 @@ def write_partitioned(
     generation_state = {
         "version": 1,
         "generator_version": GENERATOR_VERSION,
+        "coverage_profile": coverage_profile,
         "openapi_sha256": manifest.get("source", {}).get("sha256"),
         "last_generated_at": generated_at,
         "endpoints": {
@@ -1325,6 +1505,7 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, help="write one endpoint manifest per module")
     parser.add_argument("--seed-cases", action="store_true", help="seed review-required cases implied directly by OpenAPI")
     parser.add_argument("--incremental", action="store_true", help="skip unchanged modules and preserve manually changed cases")
+    parser.add_argument("--coverage-profile", choices=("contract-draft", "full-matrix"), default="full-matrix")
     args = parser.parse_args()
 
     if not args.spec.is_file():
@@ -1347,7 +1528,14 @@ def main() -> int:
     if args.module_map:
         if not args.module_map.is_file():
             parser.error(f"module map does not exist: {args.module_map}")
-        summary = write_partitioned(manifest, args.module_map, args.output_dir, args.seed_cases, args.incremental)
+        summary = write_partitioned(
+            manifest,
+            args.module_map,
+            args.output_dir,
+            args.seed_cases,
+            args.incremental,
+            args.coverage_profile,
+        )
         module_count = len(load_document(args.module_map).get("modules", []))
         print(
             f"processed {len(manifest['endpoints'])} endpoints across {module_count} modules; "

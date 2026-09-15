@@ -21,6 +21,7 @@ sys.dont_write_bytecode = True
 
 from manifest_io import first_list, load_data
 from parse_openapi import business_case_title
+from analyze_java_logic import scan as scan_java_logic
 
 
 LANGUAGE_BY_SUFFIX = {
@@ -75,16 +76,25 @@ def candidate_id(kind: str, path: Path, line_no: int, evidence: str) -> str:
 
 
 def scan(roots: list[Path], include_patterns: list[str] | None = None) -> dict[str, Any]:
-    candidates: list[dict[str, Any]] = []
+    java_result = scan_java_logic(roots)
+    candidates: list[dict[str, Any]] = [
+        item for item in java_result.get("candidates", [])
+        if not include_patterns
+        or any(
+            fnmatch.fnmatchcase(Path(str(item.get("file", ""))).as_posix(), pattern)
+            or fnmatch.fnmatchcase(Path(str(item.get("file", ""))).name, pattern)
+            for pattern in include_patterns
+        )
+    ]
     seen: set[tuple[str, str, str]] = set()
-    languages: set[str] = set()
+    languages: set[str] = {"java"} if candidates else set()
     for root in roots:
         for path in sorted(root.rglob("*")):
-            if not path.is_file() or path.suffix.lower() not in LANGUAGE_BY_SUFFIX:
+            if not path.is_file() or path.suffix.lower() not in LANGUAGE_BY_SUFFIX or path.suffix.lower() == ".java":
                 continue
             if include_patterns and not any(fnmatch.fnmatchcase(path.as_posix(), pattern) or fnmatch.fnmatchcase(path.name, pattern) for pattern in include_patterns):
                 continue
-            if any(part in {".git", "target", "build", "node_modules", "vendor", ".venv", "venv"} for part in path.parts):
+            if any(part.lower() in {".git", "qa", "target", "build", "node_modules", "vendor", ".venv", "venv", "test", "tests"} for part in path.parts):
                 continue
             language = LANGUAGE_BY_SUFFIX[path.suffix.lower()]
             languages.add(language)
@@ -158,39 +168,62 @@ def apply_candidates(result: dict[str, Any], contracts_root: Path) -> list[str]:
         if endpoints_path.is_file():
             document = load_data(endpoints_path)
             modules.append((module_dir, document, first_list(document, "endpoints")))
+    endpoint_records = [
+        (module_dir, document, endpoint)
+        for module_dir, document, endpoints in modules
+        for endpoint in endpoints
+    ]
+    security_path = contracts_root / "security-profile.yaml"
+    security_profile = load_data(security_path) if security_path.is_file() else {}
     unresolved: list[str] = []
     for candidate in result.get("candidates", []):
         if not isinstance(candidate, dict) or candidate.get("coverage_required") is not True:
             continue
         haystack = _normalized(f"{candidate.get('file', '')} {candidate.get('evidence', '')}")
-        matches = []
-        for module_dir, document, endpoints in modules:
-            names = {
-                module_dir.name,
-                str(document.get("module", "")),
-                str(document.get("name", "")),
-                str(document.get("swagger_tag", "")),
-            }
-            if any(_normalized(name) and _normalized(name) in haystack for name in names):
-                matches.append((module_dir, document, endpoints))
-        if len(matches) != 1 and len(modules) == 1:
-            matches = modules
-        if len(matches) != 1:
-            unresolved.append(str(candidate.get("id")))
-            continue
-        module_dir, document, endpoints = matches[0]
-        endpoint = next((
-            item for item in endpoints
-            if any(
-                token and token in haystack
-                for token in (
-                    _normalized(str(item.get("operation_id", ""))),
-                    _normalized(str(item.get("path", ""))),
+        operation_hints = {
+            _normalized(str(value))
+            for value in candidate.get("endpoint_operation_ids", [])
+            if str(value).strip()
+        }
+        endpoint_matches = [
+            (module_dir, document, endpoint)
+            for module_dir, document, endpoint in endpoint_records
+            if (
+                _normalized(str(endpoint.get("operation_id", ""))) in operation_hints
+                if operation_hints
+                else any(
+                    token and token in haystack
+                    for token in (
+                        _normalized(str(endpoint.get("operation_id", ""))),
+                        _normalized(str(endpoint.get("path", ""))),
+                    )
                 )
             )
-        ), None)
-        if endpoint is None and len(endpoints) == 1:
-            endpoint = endpoints[0]
+        ]
+        if not endpoint_matches and len(endpoint_records) == 1:
+            endpoint_matches = endpoint_records
+        if len(endpoint_matches) != 1:
+            unresolved.append(str(candidate.get("id")))
+            continue
+        module_dir, document, endpoint = endpoint_matches[0]
+        source_scenario = {
+            "validation": "validation",
+            "authorization": "authorization",
+            "business_exception": "business_error",
+            "observable_branch": "business_error",
+        }.get(str(candidate.get("kind")))
+        if source_scenario:
+            matrix = endpoint.get("scenario_matrix") if isinstance(endpoint.get("scenario_matrix"), dict) else {}
+            matrix[source_scenario] = {
+                "applicable": True,
+                "status": "inferred",
+                "reason": f"API 可达源码存在 {candidate.get('kind')} 证据",
+            }
+            endpoint["scenario_matrix"] = matrix
+            Path(module_dir / "endpoints.yaml").write_text(
+                yaml.safe_dump(document, allow_unicode=True, sort_keys=False),
+                encoding="utf-8",
+            )
         logic_path = module_dir / "logic.yaml"
         logic_document = load_data(logic_path) if logic_path.is_file() else {}
         items = first_list(logic_document, "logic")
@@ -202,27 +235,51 @@ def apply_candidates(result: dict[str, Any], contracts_root: Path) -> list[str]:
         required_header = candidate.get("required_header")
         if endpoint is not None and isinstance(required_header, str):
             responses = endpoint.get("responses", {}) if isinstance(endpoint.get("responses"), dict) else {}
-            error_status = next(
-                (int(status) for status in responses if str(status) in {"400", "401", "403", "422"}),
-                # Header guards commonly use either framework annotations or
-                # request accessors. Keep the generated case reviewable when
-                # the contract omits an explicit client-error response.
-                400,
+            header_profile = next(
+                (
+                    value for value in security_profile.values()
+                    if isinstance(value, dict)
+                    and str(value.get("header", "")).casefold() == required_header.casefold()
+                ),
+                {},
             )
+            probe = header_profile.get("probe_result", {}) if isinstance(header_profile, dict) else {}
+            error_status = probe.get("missing_header_status") if isinstance(probe, dict) else None
+            if error_status is None and required_header.casefold() == "authorization":
+                error_status = probe.get("no_token_status") if isinstance(probe, dict) else None
+            if error_status == 200 and header_profile.get("type") == "audit-context":
+                matrix = endpoint.get("scenario_matrix") if isinstance(endpoint.get("scenario_matrix"), dict) else {}
+                matrix["authentication"] = {
+                    "applicable": False,
+                    "status": "confirmed",
+                    "reason": str(probe.get("reason") or f"{required_header} is audit context, not authentication"),
+                }
+                endpoint["scenario_matrix"] = matrix
+                Path(module_dir / "endpoints.yaml").write_text(
+                    yaml.safe_dump(document, allow_unicode=True, sort_keys=False),
+                    encoding="utf-8",
+                )
+                candidate["coverage_required"] = False
+                candidate["resolution"] = "confirmed-not-applicable"
+                continue
+            if not isinstance(error_status, int):
+                unresolved.append(str(candidate.get("id")))
+                continue
             if error_status is not None:
+                scenario = "authentication" if header_profile.get("type") == "authentication" else "validation"
                 header_id = re.sub(r"[^A-Za-z0-9]+", "_", required_header).strip("_").upper()
                 case_id = f"{endpoint['id']}_MISSING_{header_id}"
                 cases_path = module_dir / "cases.yaml"
                 cases_document = load_data(cases_path) if cases_path.is_file() else {}
                 cases = first_list(cases_document, "cases")
                 if not any(str(item.get("id")) == case_id for item in cases):
-                    title = business_case_title(endpoint, "validation", f"缺少 {required_header} Header")
+                    title = business_case_title(endpoint, scenario, f"缺少 {required_header} Header")
                     cases.append({
                         "id": case_id,
                         "title": title,
                         "description": f"验证缺少必需的 {required_header} Header 时请求被明确拒绝。",
                         "endpoint_id": endpoint["id"],
-                        "scenario": "authentication",
+                        "scenario": scenario,
                         "review_required": True,
                         "status": "draft",
                         "risk": "read-only" if str(endpoint.get("method", "GET")).upper() in {"GET", "HEAD", "OPTIONS"} else "isolated-write",
@@ -242,10 +299,10 @@ def apply_candidates(result: dict[str, Any], contracts_root: Path) -> list[str]:
                 linked_case_ids.append(case_id)
                 endpoint["case_ids"] = list(dict.fromkeys([*endpoint.get("case_ids", []), case_id]))
                 matrix = endpoint.get("scenario_matrix") if isinstance(endpoint.get("scenario_matrix"), dict) else {}
-                matrix["authentication"] = {
+                matrix[scenario] = {
                     "applicable": True,
                     "status": "inferred",
-                    "reason": f"源码要求 {required_header} Header",
+                    "reason": f"源码要求 {required_header} Header；探针缺失状态为 {error_status}",
                 }
                 endpoint["scenario_matrix"] = matrix
                 Path(module_dir / "endpoints.yaml").write_text(
@@ -301,6 +358,37 @@ def apply_candidates(result: dict[str, Any], contracts_root: Path) -> list[str]:
                     yaml.safe_dump(document, allow_unicode=True, sort_keys=False),
                     encoding="utf-8",
                 )
+        if not linked_case_ids:
+            scenario = {
+                "validation": "validation",
+                "authorization": "authorization",
+                "required_header": "authentication",
+                "business_exception": "business_error",
+                "observable_branch": "business_error",
+            }.get(str(candidate.get("kind")))
+            cases_path = module_dir / "cases.yaml"
+            cases_document = load_data(cases_path) if cases_path.is_file() else {}
+            cases = first_list(cases_document, "cases")
+            matching_cases = [
+                case for case in cases
+                if str(case.get("endpoint_id")) == str(endpoint.get("id"))
+                and str(case.get("scenario")) == scenario
+            ]
+            if len(matching_cases) == 1:
+                linked_case_ids.append(str(matching_cases[0]["id"]))
+                matching_cases[0]["logic_ids"] = list(dict.fromkeys([
+                    *matching_cases[0].get("logic_ids", []),
+                    logic_id,
+                ]))
+                updated_cases = dict(cases_document) if isinstance(cases_document, dict) else {}
+                updated_cases["cases"] = cases
+                cases_path.write_text(
+                    yaml.safe_dump(updated_cases, allow_unicode=True, sort_keys=False),
+                    encoding="utf-8",
+                )
+        if not linked_case_ids:
+            unresolved.append(str(candidate.get("id")))
+            continue
         items.append({
             "id": logic_id,
             "status": "inferred",
@@ -337,7 +425,14 @@ def main() -> int:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     if args.contracts_root:
-        apply_candidates(result, args.contracts_root)
+        unresolved = apply_candidates(result, args.contracts_root)
+        if unresolved:
+            for candidate_id in unresolved:
+                print(
+                    f"ERROR: source candidate {candidate_id} cannot be uniquely mapped to an endpoint",
+                    file=sys.stderr,
+                )
+            return 2
     print(f"wrote {len(result['candidates'])} cross-language logic candidates to {args.output}")
     return 0
 

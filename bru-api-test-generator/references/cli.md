@@ -12,6 +12,7 @@ Supported commands:
 ```text
 mno-bruno-qa init
 mno-bruno-qa generate
+mno-bruno-qa materialize
 mno-bruno-qa check
 mno-bruno-qa run
 mno-bruno-qa preflight
@@ -27,13 +28,14 @@ time. Run `scripts check` after upgrading the installed skill and `scripts
 sync` to update a project explicitly.
 
 Shared mode is opt-in with `init --shared-cli` or `generate --shared-cli`.
-`qa/qa.yaml` records `tooling: shared-cli`; launchers call the installed
-command and the business repository keeps only Bruno, contracts, execution
-assets, and `qa.yaml`.
+`qa/execution/config.yaml` records `tooling: shared-cli`; launchers call the
+installed command and the business repository keeps only Bruno, contracts,
+and execution assets.
 
 `generate --incremental` updates only affected modules and accepts repeated
 `--source-root` arguments for source enhancement. `check` performs strict
 static reconciliation. `preflight` builds a fresh static report and evaluates
 runtime readiness. `reconcile` requires both normalized results and preflight
-results. `run` performs the complete version, preflight, risk-filtered Bruno,
-normalization, reconciliation, and global completion pipeline.
+results. `run` performs the complete version and QA-lock checks, scope-wide
+risk confirmation, preflight, Bruno execution, normalization, reconciliation,
+and global completion pipeline.

@@ -59,7 +59,6 @@ def module_directory(contracts_root: Path, requested: str) -> str:
 def representative_route(
     contracts_root: Path,
     module: str | None,
-    risks: set[str] | None = None,
 ) -> tuple[str, str] | None:
     modules_root = contracts_root / "modules"
     directories = [modules_root / module] if module else sorted(path for path in modules_root.iterdir() if path.is_dir())
@@ -80,11 +79,7 @@ def representative_route(
                 fallback.append((method, path))
     if candidates:
         return candidates[0]
-    # A write-only module can still be explicitly executed after confirmation.
-    # Keep the default read-only scope blocked when no safe probe exists.
-    if risks and risks != {"read-only"}:
-        return fallback[0] if fallback else None
-    return None
+    return fallback[0] if fallback else None
 
 
 def coverage_command(
@@ -94,8 +89,6 @@ def coverage_command(
     openapi: Path,
     config_path: Path,
     module: str | None,
-    risks: set[str],
-    plan_name: str | None = None,
     results: Path | None = None,
     preflight: Path | None = None,
 ) -> list[str]:
@@ -110,15 +103,10 @@ def coverage_command(
         "--execution-config", str(config_path),
         "--json",
     ]
-    if plan_name:
-        command.extend(["--plan", plan_name])
-    else:
-        for risk in sorted(risks):
-            command.extend(["--risk", risk])
-    if risks & {"destructive", "external-side-effect"}:
-        command.append("--allow-dangerous")
     if module:
         command.extend(["--module", module])
+    else:
+        command.append("--all")
     if results:
         command.extend(["--results", str(results)])
     if preflight:
@@ -126,50 +114,52 @@ def coverage_command(
     return command
 
 
-def execution_scope(
-    plans_path: Path,
-    plan_name: str | None,
-    requested_risks: list[str] | None,
-) -> tuple[set[str], str | None, dict[str, Any]]:
-    if plan_name and requested_risks:
-        raise ValueError("--plan and --risk cannot be combined")
-    if not plan_name:
-        return set(requested_risks or ["read-only"]), None, {}
-    document = load_data(plans_path)
-    plans = document.get("plans", {}) if isinstance(document, dict) else {}
-    plan = plans.get(plan_name) if isinstance(plans, dict) else None
-    if not isinstance(plan, dict):
-        raise ValueError(f"unknown execution plan: {plan_name}")
-    risks = plan.get("risks")
-    if not isinstance(risks, list) or not risks or any(str(risk) not in RISK_CLASSES for risk in risks):
-        raise ValueError(f"execution plan {plan_name} has invalid risks")
-    maximum = plan.get("max_cases_per_module")
-    if maximum is not None and (not isinstance(maximum, int) or maximum < 1):
-        raise ValueError(f"execution plan {plan_name} max_cases_per_module must be a positive integer")
-    return {str(risk) for risk in risks}, plan_name, plan
+def scope_risks(contracts_root: Path, module: str | None) -> set[str]:
+    modules_root = contracts_root / "modules"
+    directories = [modules_root / module] if module else sorted(
+        path for path in modules_root.iterdir() if path.is_dir()
+    )
+    risks: set[str] = set()
+    for directory in directories:
+        cases_path = directory / "cases.yaml"
+        endpoints_path = directory / "endpoints.yaml"
+        if not cases_path.is_file():
+            continue
+        endpoints = {
+            str(item.get("id")): item
+            for item in first_list(load_data(endpoints_path), "endpoints")
+        } if endpoints_path.is_file() else {}
+        for case in first_list(load_data(cases_path), "cases"):
+            risk = str(case.get("risk", "")).strip().lower()
+            if not risk:
+                endpoint = endpoints.get(str(case.get("endpoint_id")), {})
+                risk = "read-only" if str(endpoint.get("method", "GET")).upper() in {"GET", "HEAD", "OPTIONS"} else "isolated-write"
+            if risk not in RISK_CLASSES:
+                raise ValueError(f"case {case.get('id')} has invalid risk class {risk}")
+            risks.add(risk)
+    return risks
 
 
 def confirmation_error(
     risks: set[str],
-    plan: dict[str, Any],
     confirm_write: bool,
     confirm_destructive: bool,
     confirm_external: bool,
 ) -> str | None:
-    if "isolated-write" in risks and not confirm_write:
-        return "isolated-write execution requires --confirm-write"
-    if "destructive" in risks and (not confirm_write or not confirm_destructive):
-        return "destructive execution requires --confirm-write and --confirm-destructive"
+    required: list[str] = []
+    if risks & {"isolated-write", "destructive"} and not confirm_write:
+        required.append("--confirm-write")
+    if "destructive" in risks and not confirm_destructive:
+        required.append("--confirm-destructive")
     if "external-side-effect" in risks and not confirm_external:
-        return "external-side-effect execution requires --confirm-external"
-    if plan.get("require_confirm") is True:
-        if (risks & {"isolated-write", "destructive"}) and not confirm_write:
-            return "this plan requires --confirm-write"
-        if "destructive" in risks and not confirm_destructive:
-            return "this plan requires --confirm-destructive"
-        if "external-side-effect" in risks and not confirm_external:
-            return "this plan requires --confirm-external"
-    return None
+        required.append("--confirm-external")
+    if not required:
+        return None
+    selected = " / ".join(sorted(risks - {"read-only"}))
+    return (
+        f"selected scope includes {selected} cases. "
+        f"Rerun with {' '.join(required)}."
+    )
 
 
 def run_json(command: list[str], output: Path, cwd: Path | None = None) -> tuple[int, dict[str, Any] | None]:
@@ -186,9 +176,9 @@ def run_json(command: list[str], output: Path, cwd: Path | None = None) -> tuple
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--qa-root", type=Path, help=argparse.SUPPRESS)
-    parser.add_argument("--module", help="module id, display name, OpenAPI Tag, or directory")
-    parser.add_argument("--risk", action="append", choices=sorted(RISK_CLASSES), help="risk class; defaults to read-only")
-    parser.add_argument("--plan", help="plan name from qa/execution/plans.yaml")
+    scope = parser.add_mutually_exclusive_group(required=True)
+    scope.add_argument("--all", action="store_true", help="run every business request")
+    scope.add_argument("--module", help="module id, display name, OpenAPI Tag, or directory")
     parser.add_argument("--confirm-write", action="store_true")
     parser.add_argument("--confirm-destructive", action="store_true")
     parser.add_argument("--confirm-external", action="store_true")
@@ -209,27 +199,24 @@ def main() -> int:
         config = load_execution_config(config_path)
         env_path = environment_file(config_path, config)
         environment = load_bruno_environment_document(env_path)
-        risks, plan_name, plan = execution_scope(
-            qa_root / "execution" / "plans.yaml", args.plan, args.risk
-        )
+        selected_directory = module_directory(contracts_root, args.module) if args.module else None
+        risks = scope_risks(contracts_root, selected_directory)
         confirmation = confirmation_error(
             risks,
-            plan,
             args.confirm_write,
             args.confirm_destructive,
             args.confirm_external,
         )
         if confirmation:
             raise ValueError(confirmation)
-        selected_directory = module_directory(contracts_root, args.module) if args.module else None
     except (OSError, ValueError, SystemExit) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
-    route = representative_route(contracts_root, selected_directory, risks)
+    route = representative_route(contracts_root, selected_directory)
     if route is None:
         scope = args.module or "all modules"
-        print(f"ERROR: no read-only representative route is available for {scope}", file=sys.stderr)
+        print(f"ERROR: no representative route is available for {scope}", file=sys.stderr)
         return 2
 
     qa_lock_errors = check_qa_lock(contracts_root)
@@ -267,8 +254,6 @@ def main() -> int:
                 openapi,
                 config_path,
                 args.module,
-                risks,
-                plan_name,
             ),
             static_path,
         )
@@ -296,13 +281,10 @@ def main() -> int:
 
         runtime_env_path = temporary / "runtime-environment.bru"
         runtime_env_path.write_text(render_runtime_environment(environment), encoding="utf-8")
-        bruno_command = ["run"]
-        if selected_directory:
-            bruno_command.append(selected_directory)
+        bruno_command = ["run", selected_directory or "."]
         bruno_command.extend([
             "--env-file", str(runtime_env_path),
             "--env-var", f"{RUNTIME_CONFIG_ENV}={runtime_payload(config, environment)}",
-            "--tags", f"plan-{plan_name}" if plan_name else ",".join(sorted(risks)),
             "--reporter-json", str(raw_report),
             "--reporter-skip-all-headers",
             "--reporter-skip-body",
@@ -350,8 +332,6 @@ def main() -> int:
                 openapi,
                 config_path,
                 args.module,
-                risks,
-                plan_name,
                 evidence_path,
                 preflight_path,
             ),
@@ -359,10 +339,11 @@ def main() -> int:
         )
         if coverage_report:
             scope = f"module {args.module}" if args.module else "all modules"
+            status_key = "module_status" if args.module else "status"
             print(
-                f"scope={scope} environment={config['active_environment']} status={coverage_report.get('status')} "
-                f"risks={','.join(sorted(risks))} executed={coverage_report.get('executed_cases', 0)} "
-                f"passed={coverage_report.get('passed_cases', 0)}"
+                f"scope={scope} environment={config['active_environment']} "
+                f"{status_key}={coverage_report.get(status_key)} risks={','.join(sorted(risks))} "
+                f"executed={coverage_report.get('executed_cases', 0)} passed={coverage_report.get('passed_cases', 0)}"
             )
         if bruno_result.returncode:
             print(
@@ -370,7 +351,8 @@ def main() -> int:
                 "console output was suppressed because it may contain credentials",
                 file=sys.stderr,
             )
-        if bruno_result.returncode or coverage_code or not coverage_report or coverage_report.get("completion_ok") is not True:
+        completion_key = "module_completion_ok" if args.module else "completion_ok"
+        if bruno_result.returncode or coverage_code or not coverage_report or coverage_report.get(completion_key) is not True:
             return bruno_result.returncode or coverage_code or 1
 
         if not args.module:

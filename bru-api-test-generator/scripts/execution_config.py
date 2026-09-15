@@ -16,7 +16,9 @@ sys.dont_write_bytecode = True
 RUNTIME_CONFIG_ENV = "__QA_EXECUTION_CONFIG"
 COLLECTION_MARKER = "bru-api-test-generator: runtime-config"
 COLLECTION_END_MARKER = "bru-api-test-generator: runtime-config-end"
-SIGN_MODES = {"disabled", "seres-sign"}
+TOOLING_MODES = {"project-scripts", "shared-cli"}
+COVERAGE_PROFILES = {"contract-draft", "full-matrix"}
+SIGN_PROVIDERS = {"disabled", "seres"}
 SIGN_ENV_NAMES = ("ACCESS_KEY", "SECRET_KEY")
 ENVIRONMENT_FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -24,7 +26,10 @@ HEADER_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 VARIABLE_RE = re.compile(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}")
 
 DEFAULT_CONFIG_TEMPLATE = """active_environment: local
-sign: disabled
+tooling: project-scripts
+coverage_profile: full-matrix
+sign:
+  provider: disabled
 """
 
 DEFAULT_ENVIRONMENT_TEMPLATE = """vars {
@@ -39,26 +44,6 @@ headers {
   Authorization: "Bearer {{AUTH_TOKEN}}"
   Cookie: "{{SESSION_COOKIE}}"
 }
-"""
-
-DEFAULT_PLANS_TEMPLATE = """plans:
-  smoke:
-    risks:
-      - read-only
-    max_cases_per_module: 3
-
-  regression:
-    risks:
-      - read-only
-      - isolated-write
-
-  full:
-    risks:
-      - read-only
-      - isolated-write
-      - destructive
-      - external-side-effect
-    require_confirm: true
 """
 
 BRUNO_JSON_TEMPLATE = {
@@ -94,22 +79,21 @@ exec mno-bruno-qa run --qa-root "$SCRIPT_DIR/.." "$@"
 
 EXECUTION_README_TEMPLATE = """# Bruno 执行入口
 
-`config.yaml` 只选择环境并控制 SERES 签名；公共 Header 在当前环境文件的
-`headers {}` 块中维护，由 `collection.bru` 统一注入，请求自身 Header 优先。
+`config.yaml` 只保存活动环境、工具模式、覆盖档位和签名提供方。公共 Header 在活动环境的
+`headers {}` 中维护，由 `collection.bru` 统一注入，请求自身 Header 优先。
 
 ```bat
-qa\\execution\\run.bat --module ac --risk read-only
-qa\\execution\\run.bat --module ac --risk isolated-write --confirm-write
-qa\\execution\\run.bat --plan smoke
+qa\\execution\\run.bat --all --confirm-write --confirm-destructive --confirm-external
+qa\\execution\\run.bat --module ac
 ```
 
 ```sh
-./qa/execution/run.sh --module ac --risk read-only
-./qa/execution/run.sh --plan regression --confirm-write
+./qa/execution/run.sh --all --confirm-write --confirm-destructive --confirm-external
+./qa/execution/run.sh --module ac
 ```
 
-默认只执行 `read-only`。写入、破坏性操作和外部副作用分别需要对应确认参数。
-模块运行只报告该模块，不更新 `contracts/version-lock.yaml`。
+所选 collection 或模块始终全量执行。`risk` 只用于执行前确认和报告。模块运行不更新
+`contracts/version-lock.yaml`、全局 generation-state 或全局完成状态。
 """
 
 COLLECTION_TEMPLATE = f'''auth {{
@@ -137,7 +121,7 @@ script:pre-request {{
     setCommonHeader(name, value);
   }});
 
-  if (runtimeConfig.sign === "seres-sign") {{
+  if (runtimeConfig.sign && runtimeConfig.sign.provider === "seres") {{
     const CryptoJS = require("crypto-js");
     const accessKey = requireEnv("ACCESS_KEY");
     const secretKey = requireEnv("SECRET_KEY");
@@ -185,23 +169,47 @@ def _reject_unknown(document: dict[str, Any], allowed: set[str], location: str) 
         raise ValueError(f"{location} contains unsupported field(s): {', '.join(unknown)}")
 
 
-def validate_execution_config(document: Any) -> dict[str, str]:
+def validate_execution_config(document: Any) -> dict[str, Any]:
     if not isinstance(document, dict):
         raise ValueError("execution config must contain an object")
-    _reject_unknown(document, {"active_environment", "sign"}, "execution config")
+    _reject_unknown(
+        document,
+        {"active_environment", "tooling", "coverage_profile", "sign"},
+        "execution config",
+    )
     active = document.get("active_environment")
     if not isinstance(active, str) or not active.strip():
         raise ValueError("active_environment must be a non-empty environment name")
     active = active.strip()
     if active.lower().endswith(".bru") or not ENVIRONMENT_FILE_RE.fullmatch(active):
         raise ValueError("active_environment must be a safe file name without a path or .bru suffix")
-    sign = document.get("sign", "disabled")
-    if not isinstance(sign, str) or sign not in SIGN_MODES:
-        raise ValueError("sign must be one of: disabled, seres-sign")
-    return {"active_environment": active, "sign": sign}
+    tooling = document.get("tooling")
+    if tooling not in TOOLING_MODES:
+        raise ValueError("tooling must be one of: project-scripts, shared-cli")
+    coverage_profile = document.get("coverage_profile")
+    if coverage_profile not in COVERAGE_PROFILES:
+        raise ValueError("coverage_profile must be one of: contract-draft, full-matrix")
+    sign = document.get("sign")
+    if not isinstance(sign, dict):
+        raise ValueError("sign must be an object containing provider")
+    _reject_unknown(sign, {"provider", "version"}, "execution config sign")
+    provider = sign.get("provider")
+    if provider not in SIGN_PROVIDERS:
+        raise ValueError("sign.provider must be one of: disabled, seres")
+    version = sign.get("version")
+    if provider == "seres" and version != "v1":
+        raise ValueError("sign.version must be v1 when sign.provider is seres")
+    if provider == "disabled" and version is not None:
+        raise ValueError("sign.version is not allowed when sign.provider is disabled")
+    return {
+        "active_environment": active,
+        "tooling": str(tooling),
+        "coverage_profile": str(coverage_profile),
+        "sign": {"provider": str(provider), **({"version": version} if version else {})},
+    }
 
 
-def load_execution_config(path: Path) -> dict[str, str]:
+def load_execution_config(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise ValueError(f"execution config does not exist: {path}")
     try:
@@ -286,7 +294,7 @@ def resolved_environment_headers(document: dict[str, dict[str, str]]) -> dict[st
 
 
 def required_environment_names(config: dict[str, Any]) -> list[str]:
-    return list(SIGN_ENV_NAMES if config["sign"] == "seres-sign" else ())
+    return list(SIGN_ENV_NAMES if config["sign"]["provider"] == "seres" else ())
 
 
 def runtime_payload(config: dict[str, Any], environment: dict[str, dict[str, str]] | None = None) -> str:
@@ -314,8 +322,26 @@ def _write_if_missing(path: Path, content: str, newline: str = "\n") -> bool:
     return True
 
 
-def migrate_legacy_execution_config(config_path: Path, environments_root: Path) -> list[Path]:
-    """Move legacy auth/custom_headers values into the active environment."""
+def render_execution_config(config: dict[str, Any]) -> str:
+    sign = config["sign"]
+    lines = [
+        f"active_environment: {config['active_environment']}",
+        f"tooling: {config['tooling']}",
+        f"coverage_profile: {config['coverage_profile']}",
+        "sign:",
+        f"  provider: {sign['provider']}",
+    ]
+    if sign.get("version"):
+        lines.append(f"  version: {sign['version']}")
+    return "\n".join(lines) + "\n"
+
+
+def migrate_legacy_execution_config(
+    config_path: Path,
+    environments_root: Path,
+    tooling: str,
+) -> list[Path]:
+    """Move legacy runtime fields into the environment and normalize config.yaml."""
 
     if not config_path.is_file():
         return []
@@ -327,12 +353,21 @@ def migrate_legacy_execution_config(config_path: Path, environments_root: Path) 
         raise ValueError("legacy config migration requires PyYAML") from exc
     except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:  # type: ignore[attr-defined]
         raise ValueError(f"cannot migrate legacy execution config {config_path}: {exc}") from exc
-    if not isinstance(legacy, dict) or not ({"auth", "custom_headers"} & set(legacy)):
+    if not isinstance(legacy, dict):
         return []
     active = str(legacy.get("active_environment") or "local")
     auth = legacy.get("auth", {}) if isinstance(legacy.get("auth"), dict) else {}
     mode = str(auth.get("mode") or "none")
-    sign = "seres-sign" if mode == "seres-sign" else "disabled"
+    legacy_sign = legacy.get("sign")
+    if isinstance(legacy_sign, dict):
+        provider = str(legacy_sign.get("provider") or "disabled")
+        sign = {"provider": provider}
+        if legacy_sign.get("version"):
+            sign["version"] = str(legacy_sign["version"])
+    elif legacy_sign in {"seres", "seres-sign"} or mode == "seres-sign":
+        sign = {"provider": "seres", "version": "v1"}
+    else:
+        sign = {"provider": "disabled"}
     env_path = environments_root / f"{active}.bru"
     document = load_bruno_environment_document(env_path) if env_path.is_file() else {"vars": {}, "headers": {}}
     headers = document["headers"]
@@ -352,14 +387,25 @@ def migrate_legacy_execution_config(config_path: Path, environments_root: Path) 
             headers.setdefault(name, f"{{{{{settings['env']}}}}}")
         elif isinstance(settings.get("value"), str):
             headers.setdefault(name, settings["value"])
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-    env_path.write_text(
-        render_runtime_environment(document)
-        + ("headers {\n" + "".join(f"  {name}: {json.dumps(value, ensure_ascii=False)}\n" for name, value in headers.items()) + "}\n" if headers else ""),
-        encoding="utf-8",
-    )
-    config_path.write_text(f"active_environment: {active}\nsign: {sign}\n", encoding="utf-8")
-    return [config_path, env_path]
+    changed: list[Path] = []
+    if {"auth", "custom_headers"} & set(legacy):
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        env_path.write_text(
+            render_runtime_environment(document) + render_headers_block(document),
+            encoding="utf-8",
+        )
+        changed.append(env_path)
+    normalized = {
+        "active_environment": active,
+        "tooling": legacy.get("tooling", tooling),
+        "coverage_profile": legacy.get("coverage_profile", "full-matrix"),
+        "sign": sign,
+    }
+    rendered = render_execution_config(normalized)
+    if config_path.read_text(encoding="utf-8", errors="strict") != rendered:
+        config_path.write_text(rendered, encoding="utf-8")
+        changed.append(config_path)
+    return changed
 
 
 def migrate_legacy_base_url(config_path: Path, environments_root: Path) -> list[Path]:
@@ -422,7 +468,12 @@ def initialize_execution_layout(qa_root: Path, local_scripts: bool | None = None
     new_environments = execution_root / "environments"
     config_path = execution_root / "config.yaml"
     qa_config_path = qa_root / "qa.yaml"
-    local_scripts = _tooling_mode(qa_config_path, local_scripts)
+    tooling_source = qa_config_path if qa_config_path.is_file() else config_path
+    local_scripts = _tooling_mode(
+        tooling_source,
+        local_scripts,
+    )
+    tooling = "project-scripts" if local_scripts else "shared-cli"
     changed: list[Path] = []
     if old_environments.exists():
         if new_environments.exists():
@@ -435,19 +486,18 @@ def initialize_execution_layout(qa_root: Path, local_scripts: bool | None = None
     else:
         new_environments.mkdir(parents=True, exist_ok=True)
 
-    changed.extend(migrate_legacy_execution_config(config_path, new_environments))
+    if config_path.is_file():
+        changed.extend(migrate_legacy_execution_config(config_path, new_environments, tooling))
     changed.extend(migrate_legacy_base_url(config_path, new_environments))
 
-    qa_config = f"version: 1\ntooling: {'project-scripts' if local_scripts else 'shared-cli'}\n"
-    if not qa_config_path.is_file() or qa_config_path.read_text(encoding="utf-8", errors="strict") != qa_config:
-        qa_config_path.write_text(qa_config, encoding="utf-8")
+    if qa_config_path.is_file():
+        qa_config_path.unlink()
         changed.append(qa_config_path)
     run_bat_template = RUN_BAT_TEMPLATE if local_scripts else SHARED_RUN_BAT_TEMPLATE
     run_sh_template = RUN_SH_TEMPLATE if local_scripts else SHARED_RUN_SH_TEMPLATE
     files = (
         (config_path, DEFAULT_CONFIG_TEMPLATE, "\n"),
         (new_environments / "local.bru", DEFAULT_ENVIRONMENT_TEMPLATE, "\n"),
-        (execution_root / "plans.yaml", DEFAULT_PLANS_TEMPLATE, "\n"),
         (execution_root / "run.bat", run_bat_template, "\r\n"),
         (execution_root / "run.sh", run_sh_template, "\n"),
         (execution_root / "README.md", EXECUTION_README_TEMPLATE, "\n"),
@@ -457,6 +507,20 @@ def initialize_execution_layout(qa_root: Path, local_scripts: bool | None = None
     for path, content, newline in files:
         if _write_if_missing(path, content, newline):
             changed.append(path)
+    readme_path = execution_root / "README.md"
+    current_readme = readme_path.read_text(encoding="utf-8", errors="strict")
+    if "--plan" in current_readme or "--risk" in current_readme:
+        readme_path.write_text(EXECUTION_README_TEMPLATE, encoding="utf-8")
+        changed.append(readme_path)
+    config = load_execution_config(config_path)
+    if config["tooling"] != tooling:
+        config["tooling"] = tooling
+        config_path.write_text(render_execution_config(config), encoding="utf-8")
+        changed.append(config_path)
+    plans_path = execution_root / "plans.yaml"
+    if plans_path.is_file():
+        plans_path.unlink()
+        changed.append(plans_path)
     changed.extend(migrate_legacy_base_url(config_path, new_environments))
     for path, desired, known in (
         (execution_root / "run.bat", run_bat_template.replace("\n", "\r\n"), {RUN_BAT_TEMPLATE.replace("\n", "\r\n"), SHARED_RUN_BAT_TEMPLATE.replace("\n", "\r\n")}),

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mno-bruno-qa"
-version = "2.0.0"
+version = "3.0.0"
 description = "Reusable Bruno API QA generation and execution CLI"
 requires-python = ">=3.10"
 dependencies = ["PyYAML>=6"]

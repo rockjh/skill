@@ -37,16 +37,15 @@ def qa_root_argument(parser: argparse.ArgumentParser) -> None:
 
 
 def shared_cli_mode(qa_root: Path) -> bool:
-    qa_config = qa_root / "qa.yaml"
-    if not qa_config.is_file():
+    config_path = qa_root / "execution" / "config.yaml"
+    if not config_path.is_file():
         return False
     try:
-        import yaml  # type: ignore[import-not-found]
+        from execution_config import load_execution_config
 
-        document = yaml.safe_load(qa_config.read_text(encoding="utf-8", errors="strict"))
-    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:  # type: ignore[attr-defined]
-        raise ValueError(f"cannot parse {qa_config}: {exc}") from exc
-    return isinstance(document, dict) and document.get("tooling") == "shared-cli"
+        return load_execution_config(config_path)["tooling"] == "shared-cli"
+    except ValueError as exc:
+        raise ValueError(f"cannot parse {config_path}: {exc}") from exc
 
 
 def script_bundle_errors(qa_root: Path) -> list[str]:
@@ -72,10 +71,15 @@ def generate_command(argv: list[str]) -> int:
     parser.add_argument("--incremental", action="store_true")
     parser.add_argument("--no-seed-cases", action="store_true")
     parser.add_argument("--source-root", action="append", type=Path, default=[])
+    parser.add_argument("--coverage-profile", choices=("contract-draft", "full-matrix"))
     parser.add_argument("--shared-cli", action="store_true", help="do not copy project-local Python scripts")
     args = parser.parse_args(argv)
     qa_root = args.qa_root.resolve()
     initialize_execution_layout(qa_root, local_scripts=False if args.shared_cli else None)
+    from execution_config import load_execution_config
+
+    execution_config = load_execution_config(qa_root / "execution" / "config.yaml")
+    coverage_profile = args.coverage_profile or execution_config["coverage_profile"]
     contracts = qa_root / "contracts"
     contracts.mkdir(parents=True, exist_ok=True)
     source_spec = (args.openapi or (contracts / "openapi.json")).resolve()
@@ -96,6 +100,7 @@ def generate_command(argv: list[str]) -> int:
         contracts / "modules",
         seed_cases=not args.no_seed_cases,
         incremental=args.incremental,
+        coverage_profile=coverage_profile,
     )
     if args.source_root:
         missing = [str(path) for path in args.source_root if not path.is_dir()]
@@ -104,10 +109,12 @@ def generate_command(argv: list[str]) -> int:
         candidates = scan_source_logic(args.source_root)
         unresolved = apply_candidates(candidates, contracts)
         if unresolved:
-            print(
-                f"REVIEW: {len(unresolved)} source logic candidate(s) could not be assigned to one module",
-                file=sys.stderr,
-            )
+            for candidate_id in unresolved:
+                print(
+                    f"ERROR: source candidate {candidate_id} cannot be uniquely mapped to an endpoint",
+                    file=sys.stderr,
+                )
+            return 2
         refresh_generation_state_cases(contracts)
     materialize(contracts, qa_root / "bruno", execution_config_path=qa_root / "execution" / "config.yaml")
     write_qa_lock(contracts)
@@ -125,9 +132,9 @@ def generate_command(argv: list[str]) -> int:
 def coverage_command(argv: list[str], reconcile: bool) -> int:
     parser = argparse.ArgumentParser(prog=f"mno-bruno-qa {'reconcile' if reconcile else 'check'}")
     qa_root_argument(parser)
-    parser.add_argument("--module")
-    parser.add_argument("--risk", action="append")
-    parser.add_argument("--plan")
+    scope = parser.add_mutually_exclusive_group(required=True)
+    scope.add_argument("--all", action="store_true")
+    scope.add_argument("--module")
     parser.add_argument("--results", type=Path)
     parser.add_argument("--preflight-results", type=Path)
     args = parser.parse_args(argv)
@@ -158,27 +165,10 @@ def coverage_command(argv: list[str], reconcile: bool) -> int:
         "--require-auth",
         "--execution-config", str(qa_root / "execution" / "config.yaml"),
     ]
-    if args.plan and args.risk:
-        parser.error("--plan and --risk cannot be combined")
-    plan_risks: set[str] = set()
-    if args.plan:
-        command.extend(["--plan", args.plan])
-        plans_path = qa_root / "execution" / "plans.yaml"
-        try:
-            import yaml  # type: ignore[import-not-found]
-
-            plans_document = yaml.safe_load(plans_path.read_text(encoding="utf-8", errors="strict"))
-            plan_data = plans_document.get("plans", {}).get(args.plan, {}) if isinstance(plans_document, dict) else {}
-            plan_risks = {str(risk) for risk in plan_data.get("risks", [])} if isinstance(plan_data, dict) else set()
-        except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:  # type: ignore[attr-defined]
-            parser.error(f"cannot read execution plan: {exc}")
-    else:
-        for risk in args.risk or ["read-only"]:
-            command.extend(["--risk", risk])
-    if (set(args.risk or []) | plan_risks) & {"destructive", "external-side-effect"}:
-        command.append("--allow-dangerous")
     if args.module:
         command.extend(["--module", args.module])
+    else:
+        command.append("--all")
     if args.results:
         command.extend(["--results", str(args.results)])
     if args.preflight_results:
@@ -204,6 +194,26 @@ def run_command(argv: list[str]) -> int:
         return 1
     extra = ["--qa-root", str(known.qa_root.resolve()), *remaining]
     return subprocess.run([sys.executable, str(SCRIPTS_ROOT / "run_bruno.py"), *extra], check=False).returncode
+
+
+def materialize_command(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="mno-bruno-qa materialize")
+    qa_root_argument(parser)
+    parser.add_argument("--module")
+    parser.add_argument("--check", action="store_true")
+    args = parser.parse_args(argv)
+    qa_root = args.qa_root.resolve()
+    changed = materialize(
+        qa_root / "contracts",
+        qa_root / "bruno",
+        dry_run=args.check,
+        execution_config_path=qa_root / "execution" / "config.yaml",
+        module_filter=args.module,
+        sync_index=not args.module,
+        check=args.check,
+    )
+    print(f"{'would materialize' if args.check else 'materialized'} {len(changed)} artifact(s)")
+    return 1 if args.check and changed else 0
 
 
 def preflight_command(argv: list[str]) -> int:
@@ -243,7 +253,7 @@ def preflight_command(argv: list[str]) -> int:
                 "--require-scenarios",
                 "--require-auth",
                 "--execution-config", str(config),
-                "--risk", "read-only",
+                "--all",
                 "--json",
             ],
             check=False,
@@ -301,7 +311,7 @@ def scripts_command(argv: list[str]) -> int:
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(prog="mno-bruno-qa")
-    commands = ("init", "generate", "check", "run", "preflight", "reconcile", "scripts")
+    commands = ("init", "generate", "materialize", "check", "run", "preflight", "reconcile", "scripts")
     parser.add_argument("command", nargs="?", choices=commands)
     if not argv or argv[0] in {"-h", "--help"}:
         parser.parse_args(argv)
@@ -313,6 +323,8 @@ def main(argv: list[str] | None = None) -> int:
         return init_command(remainder)
     if command == "generate":
         return generate_command(remainder)
+    if command == "materialize":
+        return materialize_command(remainder)
     if command in {"check", "reconcile"}:
         return coverage_command(remainder, command == "reconcile")
     if command == "run":

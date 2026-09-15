@@ -89,9 +89,9 @@ than read from a global mutable manifest.
 
 ## execution/config.yaml
 
-This file contains only `active_environment` and `sign`. The parser rejects all
-authentication, Header/Cookie, token/key selector, path rule, and unknown
-fields. Common Headers live in the active environment's independent
+This file contains `active_environment`, `tooling`, `coverage_profile`, and a
+structured `sign` object. The parser rejects authentication, Header/Cookie,
+token/key selector, path rule, and unknown fields. Common Headers live in the active environment's independent
 `headers {}` KV block. The CLI resolves its `{{VAR}}` references and injects
 every non-empty value from `collection.bru`; request-local Headers have
 priority. A negative case can remove a configured Header with:
@@ -103,7 +103,7 @@ request:
 ```
 
 See [execution-config.md](execution-config.md) for the schema, Header format,
-signing behavior, risk plans, and script/shared-CLI modes.
+signing behavior, scope confirmations, and script/shared-CLI modes.
 
 ## Request and response payloads
 

@@ -6,13 +6,13 @@ Use parallel workers only after the coordinator has completed the global invento
 
 1. **Coordinator, sequential:** discover repository rules, locate the offline OpenAPI file, parse every operation, inspect source mappings and shared security/fixtures, classify the business-code version, freeze `module-map.yaml`, and identify cross-module dependencies. Select the local script bundle or installed shared CLI before workers start.
 2. **Workers, parallel where independent:** start one worker per independent module. Each worker generates and tests only its assigned module.
-3. **Coordinator, sequential:** review worker reports, regenerate `index.yaml`, `generation-state.yaml`, and `qa-lock.yaml`, reconcile all modules, validate cross-module flows, apply risk plans, run the final collection, and advance `version-lock.yaml` only after all required evidence is present.
+3. **Coordinator, sequential:** review worker reports, regenerate `index.yaml`, `generation-state.yaml`, and `qa-lock.yaml`, reconcile all modules, validate cross-module flows, confirm every included risk, run the final collection, and advance `version-lock.yaml` only after all required evidence is present.
 
 ## Ownership
 
 | Owner | Writable scope |
 | --- | --- |
-| Coordinator | `README.md`, `module-map.yaml`, `index.yaml`, `generation-state.yaml`, `qa-lock.yaml`, `version-lock.yaml`, `impact-rules.yaml`, `flows/cross-module.yaml`, `execution/config.yaml`, `execution/plans.yaml`, `execution/environments/`, `bruno/`, script synchronization metadata, and business-repository metadata |
+| Coordinator | `README.md`, `module-map.yaml`, `index.yaml`, `generation-state.yaml`, `qa-lock.yaml`, `version-lock.yaml`, `impact-rules.yaml`, `flows/cross-module.yaml`, `execution/config.yaml`, `execution/environments/`, `bruno/`, script synchronization metadata, and business-repository metadata |
 | Module worker | `contracts/modules/<module-directory>/{logic,cases}.yaml` within its assigned module |
 
 Workers must not edit endpoint inventories, `.bru` files, another module,

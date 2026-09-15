@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import re
+import subprocess
 import sys
 import unicodedata
 import urllib.parse
@@ -96,6 +97,7 @@ from execution_config import (
     HEADER_NAME_RE,
     load_execution_config,
 )
+from qa_lock import check as check_qa_lock
 
 SCENARIO_CATEGORIES = (
     "success",
@@ -238,6 +240,24 @@ def case_fingerprint(case: dict[str, Any]) -> str:
         "assertions": case.get("assertions"),
     }
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def case_completion_errors(case: dict[str, Any]) -> list[str]:
+    case_id = str(case.get("id", "<unknown>"))
+    errors: list[str] = []
+    if case.get("review_required") is True or case.get("manual_review") is True or case.get("status") == "draft":
+        errors.append(f"case {case_id} is still draft or requires review")
+    assertions = case.get("assertions")
+    precise_keys = {
+        "equals", "eq", "contains", "matches", "type", "length", "minimum",
+        "maximum", "nullable", "is_null", "equals_variable", "items", "item_type",
+    }
+    if not isinstance(assertions, list) or not any(
+        isinstance(item, dict) and bool(precise_keys & set(item))
+        for item in assertions
+    ):
+        errors.append(f"case {case_id} has no exact assertion eligible for verified completion")
+    return errors
 
 
 def case_covers_scenario(case: dict[str, Any], category: str) -> bool:
@@ -930,8 +950,12 @@ def case_files(
         endpoint = (endpoints or {}).get(str(case.get("endpoint_id")))
         if endpoint:
             risk = case_risk(case, endpoint)
-            if risk not in bru_meta_tags(contents[matched]):
+            tags = bru_meta_tags(contents[matched])
+            if risk not in tags:
                 errors.append(f"case {case_id} Bruno meta.tags is missing risk {risk}")
+            obsolete = sorted(tag for tag in tags if tag.startswith("plan-"))
+            if obsolete:
+                errors.append(f"case {case_id} Bruno meta.tags contains obsolete plan tag(s): {', '.join(obsolete)}")
             actual_request = bruno_request(contents[matched])
             expected_method = str(endpoint.get("method", "GET")).upper()
             expected_path = str((case.get("request") or {}).get("path") or endpoint.get("path") or "/")
@@ -1217,7 +1241,6 @@ def check_module(
     module_tag: str | None = None,
     strict_bru_modules: bool = False,
     bru_module_name: str | None = None,
-    selected_risks: set[str] | None = None,
     selected_case_ids: set[str] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     errors: list[str] = []
@@ -1500,14 +1523,7 @@ def check_module(
         required_case_ids = {
             case_id for case_id, case in cases_by_id.items()
             if str(case.get("endpoint_id")) not in approved_excluded_endpoint_ids
-            and (
-                case_id in selected_case_ids
-                if selected_case_ids is not None
-                else (
-                    not selected_risks
-                    or case_risk(case, next((item for item in endpoints if item.get("id") == case.get("endpoint_id")), None)) in selected_risks
-                )
-            )
+            and (selected_case_ids is None or case_id in selected_case_ids)
         }
         errors.extend(f"case {case_id} was not executed" for case_id in sorted(required_case_ids - executed))
         errors.extend(f"case {case_id} failed" for case_id in sorted(required_case_ids & executed - passed))
@@ -1515,17 +1531,7 @@ def check_module(
             flow for flow in flow_items
             if all(
                 step.get("case_id") in cases_by_id
-                and (
-                    step.get("case_id") in selected_case_ids
-                    if selected_case_ids is not None
-                    else (
-                        not selected_risks
-                        or case_risk(
-                            cases_by_id[step["case_id"]],
-                            next((item for item in endpoints if item.get("id") == cases_by_id[step["case_id"]].get("endpoint_id")), None),
-                        ) in selected_risks
-                    )
-                )
+                and (selected_case_ids is None or step.get("case_id") in selected_case_ids)
                 for step in flow.get("steps", [])
                 if isinstance(step, dict)
             )
@@ -1657,33 +1663,11 @@ def main() -> int:
         type=Path,
         help="qa/execution/config.yaml (the only shared runtime config)",
     )
-    parser.add_argument("--module", help="check one module id, display name, Tag, or directory")
-    parser.add_argument("--risk", action="append", choices=sorted(RISK_CLASSES), help="execution risk class; defaults to read-only")
-    parser.add_argument("--plan", help="execution plan from qa/execution/plans.yaml")
-    parser.add_argument("--allow-dangerous", action="store_true", help="explicitly allow destructive or external-side-effect evidence")
+    scope = parser.add_mutually_exclusive_group(required=True)
+    scope.add_argument("--all", action="store_true", help="check all modules and all registered cases")
+    scope.add_argument("--module", help="check one module id, display name, Tag, or directory")
     parser.add_argument("--json", action="store_true", dest="as_json")
     args = parser.parse_args()
-    if args.plan and args.risk:
-        parser.error("--plan and --risk cannot be combined")
-    plan_max_cases: int | None = None
-    if args.plan:
-        plans_path = args.contracts_root.parent / "execution" / "plans.yaml"
-        plans_document = load_data(plans_path)
-        plans = plans_document.get("plans", {}) if isinstance(plans_document, dict) else {}
-        plan = plans.get(args.plan) if isinstance(plans, dict) else None
-        if not isinstance(plan, dict):
-            parser.error(f"unknown execution plan: {args.plan}")
-        plan_risks = plan.get("risks")
-        if not isinstance(plan_risks, list) or not plan_risks or any(str(risk) not in RISK_CLASSES for risk in plan_risks):
-            parser.error(f"execution plan {args.plan} has invalid risks")
-        selected_risks = {str(risk) for risk in plan_risks}
-        plan_max_cases = plan.get("max_cases_per_module")
-        if plan_max_cases is not None and (not isinstance(plan_max_cases, int) or plan_max_cases < 1):
-            parser.error(f"execution plan {args.plan} max_cases_per_module must be a positive integer")
-    else:
-        selected_risks = set(args.risk or ["read-only"])
-    if selected_risks & {"destructive", "external-side-effect"} and not args.allow_dangerous:
-        parser.error("destructive and external-side-effect scopes require --allow-dangerous")
 
     results = execution_evidence(load_data(args.results)) if args.results else None
     preflight = load_data(args.preflight_results) if args.preflight_results else None
@@ -1709,6 +1693,24 @@ def main() -> int:
             execution_config_error = str(exc)
     errors: list[str] = text_integrity_errors(args.contracts_root, args.bru_root)
     if args.results:
+        errors.extend(check_qa_lock(args.contracts_root))
+        if args.all:
+            version_check = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve().parent / "check_version_compatibility.py"),
+                    str(args.contracts_root.parent.parent),
+                    str(args.contracts_root),
+                    "--phase", "before-execute",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+            if version_check.returncode:
+                detail = (version_check.stdout or version_check.stderr).strip()
+                errors.append(f"business version lock is not current: {detail or version_check.returncode}")
         if args.openapi is None:
             errors.append("completion requires explicit --openapi")
         if not args.require_scenarios:
@@ -1814,10 +1816,7 @@ def main() -> int:
                 for case in module_cases
                 if case.get("id")
                 and str(case.get("endpoint_id")) not in approved_endpoint_ids
-                and case_risk(case, endpoint_lookup.get(str(case.get("endpoint_id")))) in selected_risks
             ]
-            if plan_max_cases is not None:
-                eligible_case_ids = eligible_case_ids[:plan_max_cases]
             selected_case_ids_by_module[module_id] = set(eligible_case_ids)
             required_case_ids_global.update(eligible_case_ids)
             for case in module_cases:
@@ -1835,6 +1834,8 @@ def main() -> int:
                         f"cases {previous_fingerprint} and {case_id} duplicate endpoint/scenario/request/assertions"
                     )
                 all_case_fingerprints[fingerprint] = case_id
+                if args.results and case_id in selected_case_ids_by_module[module_id]:
+                    errors.extend(case_completion_errors(case))
         flow_path = module_dir / "flows.yaml"
         if flow_path.is_file():
             flow_doc = load_data(flow_path)
@@ -1991,7 +1992,6 @@ def main() -> int:
             module_tag=module_tags.get(module_id),
             strict_bru_modules=(args.contracts_root / "modules").is_dir(),
             bru_module_name=module_dir.name,
-            selected_risks=selected_risks,
             selected_case_ids=selected_case_ids_by_module.get(module_id, set()),
         )
         module_reports[module_id] = report
@@ -2019,15 +2019,24 @@ def main() -> int:
         errors.append("offline OpenAPI provenance is unverified; completion evidence is blocked")
         errors = list(dict.fromkeys(errors))
     static_ok = not static_errors
+    module_completion_ok = False
+    module_status: str | None = None
     if args.results:
         required_case_ids = required_case_ids_global
         executed = set(results.get("executed", [])) if results else set()
         passed = set(results.get("passed", [])) if results else set()
         unknown_executed = executed - set(all_case_ids)
         errors.extend(f"execution evidence references unknown case {case_id}" for case_id in sorted(unknown_executed))
-        completion_ok = static_ok and not errors and required_case_ids.issubset(executed) and required_case_ids.issubset(passed) \
+        scope_completion_ok = static_ok and not errors and required_case_ids.issubset(executed) and required_case_ids.issubset(passed) \
             and not totals["pending_exclusions"]
-        status = "verified" if completion_ok else "blocked"
+        if args.module:
+            module_completion_ok = scope_completion_ok
+            module_status = "verified" if module_completion_ok else "blocked"
+            completion_ok = False
+            status = "draft"
+        else:
+            completion_ok = scope_completion_ok
+            status = "verified" if completion_ok else "blocked"
     elif preflight_ok and static_ok:
         completion_ok = False
         status = "runnable"
@@ -2037,6 +2046,9 @@ def main() -> int:
     else:
         completion_ok = False
         status = "draft" if static_ok else "blocked"
+    if args.module and not args.results:
+        module_status = status
+        status = "draft"
     report = {
         **totals,
         "modules": module_reports,
@@ -2049,9 +2061,12 @@ def main() -> int:
         "completion_ok": completion_ok,
         "status": status,
         "ok": completion_ok,
+        **({
+            "module_completion_ok": module_completion_ok,
+            "module_status": module_status,
+        } if args.module else {}),
         "contract_provenance_unverified": contract_provenance_unverified,
-        "execution_scope": sorted(selected_risks),
-        "execution_plan": args.plan,
+        "execution_scope": "module" if args.module else "all",
         "module_scope": args.module,
         "openapi_sha256": openapi_sha256,
         "by_tag": {
@@ -2084,11 +2099,14 @@ def main() -> int:
             print(f"ERROR: {error}")
         if errors:
             print(f"coverage check failed: {len(errors)} error(s)")
+        elif args.module and module_completion_ok:
+            print("module coverage check passed: verified")
         elif completion_ok:
             print("coverage check passed: verified")
         else:
             print(f"coverage check is static-valid but incomplete: {status}")
-    return 0 if static_ok and status != "blocked" and (not args.results or completion_ok) else 1
+    passed_completion = module_completion_ok if args.module else completion_ok
+    return 0 if static_ok and status != "blocked" and (not args.results or passed_completion) else 1
 
 
 if __name__ == "__main__":
