@@ -1,23 +1,11 @@
 ---
 name: bru-api-test-generator
-description: Generate and maintain auditable Bruno HTTP API tests in a business-code repository from an offline OpenAPI contract, optional source evidence, and environment configuration. Use for module-partitioned API case generation, execution, risk reporting, and strict coverage reconciliation; do not use for browser or database-heavy system E2E workflows.
+description: Generate, execute, and incrementally maintain auditable Bruno HTTP API tests from local OpenAPI, project source, prior QA constraints, and execution evidence. Use for module-owned API QA with exact assertions, machine-enforced lifecycle validation, independent module runs, and result-oriented failure reports; do not use for browser or database-heavy system E2E workflows.
 ---
 
 # Bruno API Test Generator
 
-Build a checked-in Bruno collection whose manifests, requests, source evidence, execution evidence, and version locks reconcile exactly.
-
-## Boundary
-
-This skill owns single-endpoint API and contract coverage:
-
-- every reachable OpenAPI operation and its success path;
-- authentication, authorization, validation, query, file, business-error, and safety scenarios supported by evidence;
-- observable controller, application, domain-service, repository, and integration branches;
-- explicitly declared ordered module or cross-module flows;
-- Bruno materialization, preflight, safe execution, evidence normalization, and reconciliation.
-
-Use the project's Python E2E workflow for browser journeys, database-heavy assertions, asynchronous system scenarios, and broad multi-service workflows.
+Build a checked-in Bruno collection, attempt execution whenever the contract came from a running loopback service, and report concrete results. Execution scope is determined only by the selected module directory.
 
 ## Required Layout
 
@@ -37,6 +25,7 @@ qa/
     generation-state.yaml
     qa-lock.yaml
     version-lock.yaml
+    worker-assignments/<module-id>.yaml
     modules/<module-directory>/
       endpoints.yaml
       parameters.yaml
@@ -46,147 +35,175 @@ qa/
       cases.yaml
       flows.yaml
       exclusions.yaml
+      source-rules.yaml
+      observed-rules.yaml
+      materialization-state.yaml
+      module-lock.yaml
       CASES.md
+  constraints/
+    rules.yaml
+    source-rules.yaml
+    observed-rules.yaml
   execution/
     config.yaml
     environments/local.bru
     run.bat
     run.sh
-    README.md
+  evidence/
+    global/
+    modules/<module-id>/
+  results/
+    global/
+    modules/<module-id>/
   logs/
-  scripts/
 ```
 
-Do not create `qa.yaml` or `execution/plans.yaml`. `execution/config.yaml` owns environment selection, tool mode, coverage profile, and signing provider:
-
-```yaml
-active_environment: local
-tooling: project-scripts
-coverage_profile: full-matrix
-sign:
-  provider: disabled
-```
-
-For SERES signing use `provider: seres` and `version: v1`. Keep all URLs, Headers, Cookies, tokens, and keys in `execution/environments/<name>.bru`; never put secrets in `config.yaml`.
+`constraints/rules.yaml` is mandatory and machine readable. The same `qa_constraints.py` engine validates it during generation, materialization, pre-execution, and post-execution. Text in this file or a reference never substitutes for a machine rule.
 
 Read [references/execution-config.md](references/execution-config.md) before initializing, migrating, or executing a collection.
 
-## Generation Workflow
+## Coordinator Workflow
 
-1. Read the business repository's `AGENTS.md`, build files, existing test conventions, security configuration, exception handling, fixtures, and existing Bruno assets.
-2. Use a user-provided offline OpenAPI/Swagger file first. Otherwise locate a checked-in document. If none exists, the bundled `fetch_local_openapi.py` may probe only an already-running loopback service and save the result locally. Never fetch a remote contract, start the service automatically, or invent an API from prose.
-3. Partition every operation into exactly one module. Prefer its OpenAPI Tag. Multi-Tag operations need an explicit primary owner; untagged operations need an explicit `operation_ids`, `path_prefixes`, one default module, or a single-module map. Ambiguous or missing ownership is blocking.
-4. Initialize with `mno-bruno-qa init`, then generate with:
+1. Read the business repository's `AGENTS.md`, build files, existing tests, security configuration, exception handling, fixtures, and existing QA assets.
+2. Prefer a user-provided local OpenAPI file, then a checked-in contract. If absent, use `fetch_local_openapi.py` only against an already-running loopback service. Do not start the service or fetch a remote contract.
+3. Run `bruno-api-test-generator init`, freeze `module-map.yaml`, and assign every operation to exactly one module. Method plus path is endpoint identity; IDs must also be unique.
+4. Read Controller, Application, Domain Service, DTO, Output, Entity, Repository, exception/error-code enums, configuration, Flyway SQL, and existing tests. Run generation with every relevant source root:
 
    ```bash
-   mno-bruno-qa generate --openapi qa/contracts/openapi.yaml --source-root . --incremental --coverage-profile full-matrix
+   bruno-api-test-generator generate --openapi qa/contracts/openapi.yaml \
+     --source-root . --incremental --coverage-profile full-matrix
    ```
 
-5. Materialize `.bru` files centrally with `mno-bruno-qa materialize` or the project-local equivalent. Incremental generation preserves manually changed cases, marks them `manual_review`, and never silently overwrites them.
+5. Reuse `qa/constraints/source-rules.yaml`, global and module `observed-rules.yaml`, prior execution evidence, and named variables from the active local Bruno environment before inventing data. Environment values are referenced as `{{VARIABLE}}`; their literal values are never copied into contracts or requests. Source-derived values must populate cases when OpenAPI omits examples/defaults.
+6. Materialize and validate all registered requests. Generated `.bru` files have no `meta.tags` line.
+7. If OpenAPI provenance has a loopback `source_url`, generation must immediately invoke the default all-module run. A failed case must not stop later cases.
+8. Merge module results, run global reconciliation, and write the final result report. The report, not static inventory, is the primary handoff.
 
-`contract-draft` creates only cases directly provable from OpenAPI. `full-matrix` creates every applicable scenario supported by contract, source, security profile, or probe evidence. `verified` is an execution result, never a generation profile.
+Read [references/offline-swagger.md](references/offline-swagger.md), [references/case-matrix.md](references/case-matrix.md), [references/coverage-manifest.md](references/coverage-manifest.md), and [references/incremental-generation.md](references/incremental-generation.md) for schemas and detailed behavior.
 
-Read [references/offline-swagger.md](references/offline-swagger.md) for acquisition and module ownership, [references/case-matrix.md](references/case-matrix.md) for scenario rules, [references/coverage-manifest.md](references/coverage-manifest.md) for schemas, and [references/incremental-generation.md](references/incremental-generation.md) for fingerprints.
+## Source Constraints
 
-## Scenario Matrix
-
-Every endpoint records decisions for `success`, `authentication`, `authorization`, `validation`, `business_error`, `query`, `safety`, and `file`. An applicable decision links at least one dedicated case. A confirmed false decision includes concrete evidence and a reason.
-Every applicable contract constraint also has a stable `coverage_id` such as `VALIDATION:POST /users:body.name:minLength`, `FILE:POST /imports:body.file:mime`, or `QUERY:GET /users:pageSize:maximum`. Each ID must be linked by a case or an approved exclusion.
-
-- `success`: at least one distinct case for every reachable endpoint.
-- `authentication`: distinguish `auth-token` authentication from `admin-operator-context` audit context. Generate missing/invalid-token cases only after representative probes establish actual status and response shape.
-- `authorization`: require OpenAPI security/permission extensions, roles, source permission annotations, `security-profile.yaml`, or probe evidence. An `/admin` path alone is never authorization evidence.
-- `validation`: cover required parameters/body fields, enum, pattern, minimum/maximum, minLength/maxLength, format, and wrong Content-Type when declared.
-- `query`: cover pagination boundaries, filters, sorting, combinations, empty results, invalid page, and invalid pageSize when applicable.
-- `file`: cover missing and empty files plus extension, MIME, and size constraints only when declared or source-proven.
-- `business_error`: generate only from API-reachable source exceptions and real error codes.
-- `safety`: generate only from declared idempotency, concurrency, or repeat-submission semantics.
-
-Cases keep a confirmed `risk` field, concrete request data, expected HTTP status, expected business code when known, and exact response assertions. A status-only assertion is incomplete. Success cases assert an exact business-success value plus a concrete result field or request/response relationship. `$ exists`, `review-*`, unresolved variables, and unconfirmed risks are draft-only and block runnable state.
-
-## Source Evidence
-
-Source scanners produce candidates, not proof. For Java, trace API-reachable calls through:
+Source scanning must inventory these evidence kinds even when one kind yields no rule:
 
 ```text
-Controller -> ApplicationDelegator.apply -> Application.doServe -> Domain Service -> Repository / Integration
+Controller -> Application -> Domain Service -> Repository / Integration
+DTO / Output / CommonResponse -> Entity -> configuration -> Flyway -> existing tests
+ControllerAdvice -> application exception -> error-code enum
 ```
 
-Discover the project exception family in this order: exception types handled by `ControllerAdvice`, exception constructors that accept an ErrorCode type, then a unique `XxxApplicationException` plus `XxxErrorCode` pair. Multiple candidates are blocking unless `--exception-type` and `--error-code-type` select one explicitly. Never exclude or prefer a project name in reusable scanner code.
+Extract field type, requiredness, length, pattern, enum, min/max, default, unique markers, error codes, response envelopes, pagination, timestamps, and realistic examples. Store the file, line, source kind, and symbol with each inferred rule.
 
-Identify an endpoint by HTTP method plus its full class-and-method mapping path and controller method. Duplicate `operationId` values are not endpoint identity. `throws`, multiline generics, and multiline annotations are valid method declarations. If source contains Spring Mapping annotations but the scanner finds zero entrypoints, stop as blocked.
+The project constraint library contains only rules proven by the target project's OpenAPI, source, configuration, migrations, tests, or successful local evidence. Do not inject built-in business-field examples, pagination defaults, error-code formats, or response conventions. Never extract or persist secrets as examples.
 
-Every coverage-required candidate must map to exactly one endpoint and one or more real case IDs. Ambiguous mapping is immediately blocking:
+## Machine Gates
 
-```text
-ERROR: source candidate <id> cannot be uniquely mapped to an endpoint
+Every enabled rule in `qa/constraints/rules.yaml` is required. A violation fails the affected action. The shared engine enforces at least:
+
+- one owner per endpoint and one module per owner;
+- unique endpoint identity and case ID;
+- every case registered to exactly one `.bru`, and no unregistered request;
+- parseable request values and JSON bodies;
+- every `review-*` placeholder has a non-empty `review_reasons` entry;
+- no `review-*` placeholder remains when a source rule or active local environment variable provides the field value;
+- no case/request drift and no silent overwrite of manual changes;
+- module workers write only their assigned module-owned paths;
+- module workers do not update `index.yaml`, `generation-state.yaml`, or `qa-lock.yaml`;
+- business source files are never modified by QA commands;
+- QA contracts, requests, evidence, and reports contain no credentials;
+- successful case inputs satisfy active source/domain field rules.
+
+Static checks, execution preflight, and post-execution reconciliation call this same engine. Do not implement a second copy of a rule in prose or a stage-specific checker.
+
+## Cases And Review Placeholders
+
+Generate all scenarios supported by OpenAPI, source, local configuration, existing tests, or execution evidence. A missing OpenAPI example is not enough reason to create `review-*`; inspect the entire source/evidence chain first.
+
+When a value still cannot be obtained, use a stable placeholder and record why:
+
+```yaml
+request:
+  body:
+    tenantId: review-tenantId
+review_required: true
+review_reasons:
+  review-tenantId: No value exists in OpenAPI, source, tests, prior evidence, or local environment
 ```
 
-Never summarize unresolved candidates as non-blocking review output.
+An unexplained placeholder fails generation and checking. An explained placeholder places only that case in `manual_confirmation`; it does not prevent unrelated cases from running or passing. A manual-confirmation case is excluded from scope-completion requirements until resolved, but its observed execution result is still reported.
 
-## Bruno Materialization
+## Exact Assertions
 
-- Materialize exactly one business request for each registered case.
-- Keep only the case risk in `.bru` `meta.tags`; never generate `plan-*` tags and never use tags to select execution scope.
-- Use a two-or-more-digit stable sequence plus the sanitized Chinese `case.title` for each business filename. Keep the stable English case ID in `meta.name` and manifests.
-- Preserve exact method, path, query, body, Header omission, assertions, captures, and flow variables from `cases.yaml`.
-- Serialize query arrays and objects according to OpenAPI `style` and `explode`. Resolve every path parameter from a concrete OpenAPI example or a declared environment/capture variable.
-- Inject common Headers and optional signing once in `collection.bru`; request-local Headers win.
-- A normal materialization fully synchronizes an unmodified `.bru` from `cases.yaml`. Concurrent edits to the case and `.bru` produce a structured diff and block. `materialize --check` is read-only and reports drift.
+Every non-review success case must assert:
+
+- exact HTTP status and business success code;
+- at least one exact key result or request/response relation;
+- list item structure and length where applicable;
+- page number, page size, total, and records/content structure for pagination;
+- created/updated resource identifiers or captured IDs for write flows.
+
+Derive assertions from DTO/Output/CommonResponse schemas, fixed source values, OpenAPI examples, and redacted successful response evidence. A long-lived `status == 200`-only case is invalid. Execution retains redacted response values and shapes under `qa/evidence/` and writes observed rules for the next incremental generation.
 
 ## Execution
 
-The generated launcher accepts only one optional execution selector:
+The launcher accepts only an optional module selector:
 
 ```bat
 qa\execution\run.bat
-qa\execution\run.bat --module "AC-信息"
+qa\execution\run.bat --module "users"
 ```
 
-No argument runs every module. `--module` accepts a module ID, display name, directory, or OpenAPI Tag and runs every registered request in that module. Do not generate `--all`, read/write, destructive, external-confirmation, `--plan`, or `--risk` parameters. Add usage comments directly to `run.bat` and `run.sh`.
+No argument runs every module. `--module` accepts an ID, display name, directory, or OpenAPI Tag. Execution scope is directory based and never selected by tags.
 
-Before any request, validate every `{{variable}}` against the active environment or a declared capture and validate file variables as real files. Never synthesize credentials, `operatorInfo`, fixtures, or upload files. Risk remains case metadata for reporting; it does not require an execution flag.
+Before requests, validate variables, files, locks, constraints, and a representative route. Bruno runs the complete selected directory; one failed request does not stop the remaining requests. Raw reports stay temporary. Normalized, redacted evidence and immutable timestamped result reports are retained.
 
-The runner prints each stage, then one `PASS` or `FAIL` line per selected case. After reconciliation it prints total, success count, failure count, failed case IDs, and version warnings. Mirror all console output to a new plain-text file under `qa/logs/` on every invocation; name it with a high-resolution timestamp and the selected scope.
+Module execution uses its module-local lock and never updates global completion or version state. Global execution uses `qa-lock.yaml` and may advance the business version lock only after complete success.
 
-Run compatibility and QA-lock checks, preflight, the selected directory, evidence normalization, artifact-safety checks where evidence is retained, and strict reconciliation. A version mismatch, missing version lock, stale local source version, unreachable version endpoint, or unverifiable remote deployment prints a red warning immediately and again in the final summary, but never blocks the current execution. Structural, configuration, connectivity, assertion, and coverage failures still block or fail normally.
+Read [references/execution-evidence.md](references/execution-evidence.md) and [references/version-management.md](references/version-management.md).
 
-For a remote `baseUrl`, optionally configure `versionPath` in the active Bruno environment. The runner reads a scalar version from common JSON fields and compares it with `version-lock.yaml`; `expectedVersion` overrides the expected value, while `versionJsonPath` or `versionHeader` selects a non-standard response. Keep the version URL on the same origin as `baseUrl`. If no endpoint is configured, warn that the remote version is unverifiable and continue.
+## Parallel Module Work
 
-Read [references/execution-evidence.md](references/execution-evidence.md) for evidence requirements and [references/version-management.md](references/version-management.md) for lock handling.
+Use parallel agents only when the user explicitly requests delegation. The coordinator initializes global assets, freezes module ownership, records shared configuration, assigns one worker per module, and performs the final merge.
 
-## Completion Gates
+A module worker may read shared assets and business source. It may write only:
 
-State meanings are fixed: `draft` is editable and makes no execution claim; `blocked` has a coverage or runtime configuration gap; `runnable` is deterministic for the selected scope; `verified` has passed complete execution and cleanup evidence. Any applicable scenario/constraint gap, review placeholder, ambiguous source mapping, stale QA lock, or failed execution is blocking. Business/deployment version drift is warning-only.
-
-Global `status: verified` is valid only after a default all-module run proves:
-
-- every endpoint has a success case;
-- every applicable scenario has a linked case;
-- every source candidate has one endpoint owner;
-- every logic entry has case IDs;
-- every case has exact assertions and passed execution evidence;
-- every declared flow has ordered, passed evidence and verified cleanup;
-- preflight passed;
-- the offline OpenAPI, generation state, and QA lock are current; business/deployment version warnings are retained in the run log.
-
-A module run reports `module_status: verified` and `module_completion_ok: true` when its scope passes. It must not write `version-lock.yaml`, global `generation-state.yaml`, global index completion, or global verified state.
-
-Static inventory is never completion evidence. Without successful execution evidence, report `draft` or `runnable`, not `verified`. Keep raw Bruno reports outside the repository when they can contain secrets; before retaining artifacts, run:
-
-```bash
-python qa/scripts/check_artifact_safety.py qa/bruno qa/contracts
+```text
+qa/contracts/modules/<its-module>/
+qa/bruno/<its-module>/
+qa/results/modules/<its-module-id>/
+qa/evidence/modules/<its-module-id>/
+qa/logs/modules/<its-module-id>/
 ```
 
-## Hard Rules
+Before dispatch, the coordinator runs `bruno-api-test-generator worker-start --module <module>`. The worker extracts module evidence, updates module cases/logic, materializes the module, writes `module-lock.yaml`, executes the module, and returns its result path. It must not edit business code, other modules, credentials, global indexes/locks, collection configuration, or cross-module flows. After each lifecycle stage it runs `worker-check --module <module> --stage <stage>`; changed paths are derived from the recorded Git snapshot and any out-of-scope path fails validation.
 
+Modules run independently. Cross-module dependencies must be explicit in a coordinator-owned flow and use captures; never rely on directory order or another module's success. Read [references/parallel-generation.md](references/parallel-generation.md) only for delegated work.
+
+After all module workers return, the coordinator runs `bruno-api-test-generator aggregate`. It reconciles current case IDs with the latest module reports, merges evidence, reruns post-execution constraints, and writes the global result-first report.
+
+## Result Report
+
+The final report begins with:
+
+- total cases;
+- executed, passed, failed, and not-executed counts;
+- each module's status;
+- failed case list;
+- not-executed case list;
+- manual-confirmation list.
+
+Every failure row includes module, case ID, interface, request summary, expected result, actual result, reason, and manual-confirmation flag. Classify failures as `generation_failure`, `insufficient_data`, `environment_unavailable`, `endpoint_unreachable`, `request_failure`, `assertion_failure`, `insufficient_source_evidence`, and/or `manual_confirmation`. Do not collapse these into a generic state.
+
+Static coverage, OpenAPI obligations, source mappings, and version warnings are supplemental sections.
+
+## Incremental And Audit Rules
+
+- New endpoints affect only their modules and new cases.
+- Changed endpoints update only affected cases; unchanged successful cases retain state and evidence.
+- Preserve manual case or `.bru` edits and fail on concurrent drift.
+- Reuse source rules, response evidence, and execution evidence.
+- Keep OpenAPI origin/SHA, generation time, source evidence, execution evidence, failures, manual confirmations, and state changes traceable.
 - Do not modify business code to make a test pass.
-- Do not relax coverage, source mapping, exact assertion, flow, preflight, or lock checks.
-- Do not guess credentials, authentication envelopes, permission behavior, business errors, file constraints, or destructive fixtures.
-- Do not update global completion or version locks from a module run.
-- `check` is read-only by default. Only explicit `--write-status` may update `index.yaml`; generation and materialization own generated assets.
-- Preflight accepts only a `full-matrix-strict` report with all strict-check metadata, matching OpenAPI SHA, and a current QA lock. `static_ok: true` alone is insufficient. Business/deployment version drift remains a visible warning.
-- Do not ignore malformed JSON, invalid UTF-8, mojibake, duplicate IDs, duplicate case mappings, unregistered `.bru` files, or stale evidence.
-- Keep cases deterministic, independently runnable where possible, and safe to rerun.
+- Do not put credentials in contracts, requests, evidence, or reports.
+- `check` does not write assets unless the coordinator explicitly requests global status writing.
 
-Use [references/cli.md](references/cli.md) for installation and project-script synchronization. Read [references/parallel-generation.md](references/parallel-generation.md) only when the user explicitly requests parallel agents or module delegation.
+Use [references/cli.md](references/cli.md) for installation and script synchronization.

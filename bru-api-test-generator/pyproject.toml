@@ -3,14 +3,14 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mno-bruno-qa"
-version = "3.1.0"
+name = "bruno-api-test-generator"
+version = "5.1.0"
 description = "Reusable Bruno API QA generation and execution CLI"
 requires-python = ">=3.10"
 dependencies = ["PyYAML>=6"]
 
 [project.scripts]
-mno-bruno-qa = "mno_bruno_qa:main"
+bruno-api-test-generator = "bruno_api_test_generator:main"
 
 [tool.setuptools]
 package-dir = {"" = "scripts"}
@@ -25,13 +25,15 @@ py-modules = [
   "fetch_local_openapi",
   "manifest_io",
   "materialize_missing_bru",
-  "mno_bruno_qa",
+  "bruno_api_test_generator",
   "normalize_bruno_report",
   "parse_openapi",
+  "qa_constraints",
   "qa_lock",
   "run_bruno",
   "runtime_preflight",
   "scripts_manager",
+  "source_constraints",
   "tool_version",
   "validate_flow_execution",
 ]

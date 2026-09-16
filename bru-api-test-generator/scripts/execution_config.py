@@ -18,7 +18,7 @@ COLLECTION_MARKER = "bru-api-test-generator: runtime-config"
 COLLECTION_END_MARKER = "bru-api-test-generator: runtime-config-end"
 TOOLING_MODES = {"project-scripts", "shared-cli"}
 COVERAGE_PROFILES = {"contract-draft", "full-matrix"}
-SIGN_PROVIDERS = {"disabled", "seres"}
+SIGN_PROVIDERS = {"disabled", "sha256"}
 SIGN_ENV_NAMES = ("ACCESS_KEY", "SECRET_KEY")
 ENVIRONMENT_FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -59,30 +59,30 @@ BRUNO_JSON_TEMPLATE = {
 
 RUN_BAT_TEMPLATE = r"""@echo off
 setlocal
-rem Usage: run.bat runs all modules; run.bat --module "AC-信息" runs one module.
-python "%~dp0..\scripts\mno_bruno_qa.py" run --qa-root "%~dp0.." %*
+rem Usage: run.bat runs all modules; run.bat --module "users" runs one module.
+python "%~dp0..\scripts\bruno_api_test_generator.py" run --qa-root "%~dp0.." %*
 exit /b %errorlevel%
 """
 
 RUN_SH_TEMPLATE = """#!/usr/bin/env sh
 set -eu
-# Usage: ./run.sh runs all modules; ./run.sh --module "AC-信息" runs one module.
+# Usage: ./run.sh runs all modules; ./run.sh --module "users" runs one module.
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-exec python3 "$SCRIPT_DIR/../scripts/mno_bruno_qa.py" run --qa-root "$SCRIPT_DIR/.." "$@"
+exec python3 "$SCRIPT_DIR/../scripts/bruno_api_test_generator.py" run --qa-root "$SCRIPT_DIR/.." "$@"
 """
 
 SHARED_RUN_BAT_TEMPLATE = r"""@echo off
 setlocal
-rem Usage: run.bat runs all modules; run.bat --module "AC-信息" runs one module.
-mno-bruno-qa run --qa-root "%~dp0.." %*
+rem Usage: run.bat runs all modules; run.bat --module "users" runs one module.
+bruno-api-test-generator run --qa-root "%~dp0.." %*
 exit /b %errorlevel%
 """
 
 SHARED_RUN_SH_TEMPLATE = """#!/usr/bin/env sh
 set -eu
-# Usage: ./run.sh runs all modules; ./run.sh --module "AC-信息" runs one module.
+# Usage: ./run.sh runs all modules; ./run.sh --module "users" runs one module.
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-exec mno-bruno-qa run --qa-root "$SCRIPT_DIR/.." "$@"
+exec bruno-api-test-generator run --qa-root "$SCRIPT_DIR/.." "$@"
 """
 
 EXECUTION_README_TEMPLATE = """# Bruno 执行入口
@@ -94,12 +94,12 @@ EXECUTION_README_TEMPLATE = """# Bruno 执行入口
 
 ```bat
 qa\\execution\\run.bat
-qa\\execution\\run.bat --module "AC-信息"
+qa\\execution\\run.bat --module "users"
 ```
 
 ```sh
 ./qa/execution/run.sh
-./qa/execution/run.sh --module "AC-信息"
+./qa/execution/run.sh --module "users"
 ```
 
 运行器会打印阶段进度、每个用例的状态及最终汇总。每次运行都会在 `qa/logs/` 新建按时间和
@@ -135,7 +135,7 @@ script:pre-request {{
     setCommonHeader(name, value);
   }});
 
-  if (runtimeConfig.sign && runtimeConfig.sign.provider === "seres") {{
+  if (runtimeConfig.sign && runtimeConfig.sign.provider === "sha256") {{
     const CryptoJS = require("crypto-js");
     const accessKey = requireEnv("ACCESS_KEY");
     const secretKey = requireEnv("SECRET_KEY");
@@ -209,10 +209,10 @@ def validate_execution_config(document: Any) -> dict[str, Any]:
     _reject_unknown(sign, {"provider", "version"}, "execution config sign")
     provider = sign.get("provider")
     if provider not in SIGN_PROVIDERS:
-        raise ValueError("sign.provider must be one of: disabled, seres")
+        raise ValueError("sign.provider must be one of: disabled, sha256")
     version = sign.get("version")
-    if provider == "seres" and version != "v1":
-        raise ValueError("sign.version must be v1 when sign.provider is seres")
+    if provider == "sha256" and version != "v1":
+        raise ValueError("sign.version must be v1 when sign.provider is sha256")
     if provider == "disabled" and version is not None:
         raise ValueError("sign.version is not allowed when sign.provider is disabled")
     return {
@@ -308,7 +308,7 @@ def resolved_environment_headers(document: dict[str, dict[str, str]]) -> dict[st
 
 
 def required_environment_names(config: dict[str, Any]) -> list[str]:
-    return list(SIGN_ENV_NAMES if config["sign"]["provider"] == "seres" else ())
+    return list(SIGN_ENV_NAMES if config["sign"]["provider"] == "sha256" else ())
 
 
 def runtime_payload(config: dict[str, Any], environment: dict[str, dict[str, str]] | None = None) -> str:
@@ -378,8 +378,8 @@ def migrate_legacy_execution_config(
         sign = {"provider": provider}
         if legacy_sign.get("version"):
             sign["version"] = str(legacy_sign["version"])
-    elif legacy_sign in {"seres", "seres-sign"} or mode == "seres-sign":
-        sign = {"provider": "seres", "version": "v1"}
+    elif legacy_sign in {"sha256", "sha256-v1"} or mode == "sha256-sign":
+        sign = {"provider": "sha256", "version": "v1"}
     else:
         sign = {"provider": "disabled"}
     env_path = environments_root / f"{active}.bru"
@@ -523,7 +523,7 @@ def initialize_execution_layout(qa_root: Path, local_scripts: bool | None = None
             changed.append(path)
     readme_path = execution_root / "README.md"
     current_readme = readme_path.read_text(encoding="utf-8", errors="strict")
-    if any(token in current_readme for token in ("--plan", "--risk", "--all", "--confirm-")):
+    if any(token in current_readme for token in ("--plan", "--all", "--confirm-")):
         readme_path.write_text(EXECUTION_README_TEMPLATE, encoding="utf-8")
         changed.append(readme_path)
     config = load_execution_config(config_path)
@@ -540,14 +540,14 @@ def initialize_execution_layout(qa_root: Path, local_scripts: bool | None = None
         (execution_root / "run.bat", run_bat_template.replace("\n", "\r\n"), {
             RUN_BAT_TEMPLATE.replace("\n", "\r\n"),
             SHARED_RUN_BAT_TEMPLATE.replace("\n", "\r\n"),
-            RUN_BAT_TEMPLATE.replace('rem Usage: run.bat runs all modules; run.bat --module "AC-信息" runs one module.\n', "").replace("\n", "\r\n"),
-            SHARED_RUN_BAT_TEMPLATE.replace('rem Usage: run.bat runs all modules; run.bat --module "AC-信息" runs one module.\n', "").replace("\n", "\r\n"),
+            RUN_BAT_TEMPLATE.replace('rem Usage: run.bat runs all modules; run.bat --module "users" runs one module.\n', "").replace("\n", "\r\n"),
+            SHARED_RUN_BAT_TEMPLATE.replace('rem Usage: run.bat runs all modules; run.bat --module "users" runs one module.\n', "").replace("\n", "\r\n"),
         }),
         (execution_root / "run.sh", run_sh_template, {
             RUN_SH_TEMPLATE,
             SHARED_RUN_SH_TEMPLATE,
-            RUN_SH_TEMPLATE.replace('# Usage: ./run.sh runs all modules; ./run.sh --module "AC-信息" runs one module.\n', ""),
-            SHARED_RUN_SH_TEMPLATE.replace('# Usage: ./run.sh runs all modules; ./run.sh --module "AC-信息" runs one module.\n', ""),
+            RUN_SH_TEMPLATE.replace('# Usage: ./run.sh runs all modules; ./run.sh --module "users" runs one module.\n', ""),
+            SHARED_RUN_SH_TEMPLATE.replace('# Usage: ./run.sh runs all modules; ./run.sh --module "users" runs one module.\n', ""),
         }),
     ):
         current = path.read_text(encoding="utf-8", errors="strict")

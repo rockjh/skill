@@ -34,7 +34,7 @@ PARAMETER_RE = re.compile(r"(?:final\s+)?(?:@[\w.]+(?:\([^)]*\))?\s+)*([A-Z]\w*)
 QUALIFIED_CALL_RE = re.compile(r"\b([a-zA-Z_]\w*)\.(\w+)\s*\(")
 PLAIN_CALL_RE = re.compile(r"(?<![.@\w])([a-zA-Z_]\w*)\s*\(")
 THROWN_EXCEPTION_RE = re.compile(r"\bthrow\s+new\s+([A-Za-z_]\w*Exception)\b")
-NUMERIC_CODE_RE = re.compile(r"(?<!\d)([1-9]\d{4,8})(?!\d)")
+NUMERIC_CODE_RE = re.compile(r"(?<!\d)([1-9]\d{3,8})(?!\d)")
 VALIDATION_RE = re.compile(r"@(NotNull|NotBlank|NotEmpty|Size|Length|Pattern|Email|Min|Max|Positive|Negative)\b")
 AUTHORIZATION_RE = re.compile(r"(?:PreAuthorize|RequiresPermissions|Secured|hasRole|hasAuthority)", re.IGNORECASE)
 HEADER_RE = re.compile(r"(?:RequestHeader|getHeader)\s*\([^\n]*?[\"']([A-Za-z][A-Za-z0-9-]*)[\"']", re.IGNORECASE)
@@ -44,6 +44,9 @@ OBSERVABLE_BRANCH_RE = re.compile(
 )
 EXCEPTION_HANDLER_RE = re.compile(r"@ExceptionHandler\s*\((.*?)\)", re.DOTALL)
 ERROR_CODE_TYPE_RE = re.compile(r"\b([A-Z]\w*(?:ErrorCode(?:Enum)?|ErrorCodes))\b")
+ERROR_CODE_VALUE_RE = re.compile(
+    r"\b([A-Z][A-Z0-9_]*)\s*\(\s*(?:\"([^\"]+)\"|'([^']+)'|([A-Za-z0-9_.-]+))"
+)
 SKIP_PARTS = {".git", "qa", "target", "build", "node_modules", "vendor", ".venv", "venv", "test", "tests"}
 JAVA_KEYWORDS = {"if", "for", "while", "switch", "catch", "return", "throw", "new", "super", "this", "synchronized"}
 
@@ -272,8 +275,8 @@ def scan(
     if code_name:
         for _, class_name, text in files:
             if class_name == code_name:
-                for name, value in re.findall(r"\b([A-Z][A-Z0-9_]*)\s*\(\s*[\"']?([1-9]\d{4,8})\b", text):
-                    error_codes[name] = value
+                for match in ERROR_CODE_VALUE_RE.finditer(text):
+                    error_codes[match.group(1)] = next(value for value in match.groups()[1:] if value is not None)
 
     methods: dict[str, dict[str, Any]] = {}
     by_name: dict[str, list[str]] = {}
@@ -415,8 +418,6 @@ def scan(
                     "endpoint_keys": endpoint_keys,
                     "endpoint_operation_ids": list(dict.fromkeys(operation_ids_by_key[key] for key in endpoint_keys)),
                 }
-                if "integration" in method["class"].lower() or "integration" in str(method["path"]).lower():
-                    candidate["suggested_risk"] = "external-side-effect"
                 header = HEADER_RE.search(line)
                 if header:
                     candidate["required_header"] = header.group(1)

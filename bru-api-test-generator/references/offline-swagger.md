@@ -15,6 +15,7 @@ The generator always parses a local specification. A checked-in file is preferre
 
    The helper detects local TCP listeners and probes only `127.0.0.1`, `localhost`, or `::1`, trying IPv4 before IPv6 on the same port. Use `--base-url http://127.0.0.1:8080` or `--port 8080` when the listener cannot be discovered automatically, and add `--path /your/openapi.json` when the application uses a non-standard documentation path. It tries common JSON/YAML documentation paths, validates the response, and writes the result atomically. Contract identity ignores deployment-only `servers`, Swagger `host`/`schemes`, and collection provenance while retaining paths, components, security, and `basePath`. If different local services still expose different contracts, it blocks instead of silently selecting one; rerun with an explicit base URL/path.
 4. Continue with the saved file as an ordinary offline contract. Record the source URL and downloaded file path in the generated manifest so the acquisition is auditable.
+5. After successful generation and materialization, a loopback `provenance.source_url` requires an immediate default execution attempt. Environment or request failures are reported per case and do not cancel later cases.
 
 Do not stop at step 2 with a "provide or check in an offline specification" message. The loopback helper is the required recovery attempt when the repository has no usable local contract.
 

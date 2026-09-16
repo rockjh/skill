@@ -3,7 +3,7 @@
 Run:
 
 ```bash
-mno-bruno-qa generate --openapi qa/contracts/openapi.json --incremental
+bruno-api-test-generator generate --openapi qa/contracts/openapi.json --incremental
 ```
 
 `qa/contracts/generation-state.yaml` records the OpenAPI SHA, stable endpoint
@@ -29,4 +29,5 @@ changing the stable ID.
 
 Do not clear `manual_review` automatically. A human must compare the changed
 contract/source evidence, update the request and assertions, execute the
-affected risk scope, and then confirm the case.
+affected module, and then confirm the case. Successful unchanged cases retain
+their execution evidence and are not reset.

@@ -15,23 +15,23 @@ Generate decisions from OpenAPI, source, security configuration, and probe evide
 
 ## Coverage Profiles
 
-`contract-draft` generates only cases whose request shape and expected transport behavior are directly provable from OpenAPI. Generated cases stay `status: draft` and `review_required: true` until their exact assertions and fixtures are confirmed.
+`contract-draft` generates only cases whose request shape and expected transport behavior are directly provable from OpenAPI plus the project constraint library. Explained data gaps remain case-local manual confirmations and do not prevent unrelated cases from executing.
 
 `full-matrix` generates every applicable scenario supported by contract, source, security profile, or probe evidence. It does not invent missing evidence. A true scenario without enough evidence to build a precise case remains a blocking gap.
 
 `verified` is not a generation profile. It is available only after the default all-module scope passes strict reconciliation and execution.
 
-## Authentication And Audit Context
+## Authentication And Required Headers
 
 Do not infer authentication or authorization from an `/admin` path. Distinguish these profiles:
 
 ```yaml
-admin-operator-context:
-  type: audit-context
-  header: operatorInfo
+required-tenant-context:
+  type: required-header
+  header: X-Tenant-Id
   probe_result:
-    missing_header_status: 200
-    reason: 本地 project.headerVerify=false
+    missing_header_status: 400
+    reason: The application rejects a missing tenant context Header
 
 auth-token:
   type: authentication
@@ -43,7 +43,7 @@ auth-token:
 
 Run one representative missing-token probe and one invalid-token probe before copying authentication expectations. Preserve the actual HTTP status and response envelope, including applications that return HTTP 200 with a business error code.
 
-An audit Header that is optional under the active configuration is not authentication evidence. Record it as confirmed non-applicable for an authentication case, with the probe result and reason.
+A required application Header is not automatically authentication evidence. Classify it from OpenAPI, source, security configuration, and probes; record confirmed non-applicability for authentication separately.
 
 Authorization requires at least one of OpenAPI security/permission extensions, `x-permissions`, `x-roles`, source permission annotations, `security-profile.yaml`, or a probe result. Otherwise use a confirmed false decision such as:
 
@@ -51,7 +51,7 @@ Authorization requires at least one of OpenAPI security/permission extensions, `
 authorization:
   applicable: false
   status: confirmed
-  reason: OpenAPI 未声明权限模型，源码未发现权限校验；operatorInfo 仅为审计上下文
+  reason: OpenAPI 未声明权限模型，源码和探针均未发现权限校验
 ```
 
 ## Validation
@@ -82,4 +82,4 @@ Generate safety cases only where idempotency, concurrency, or duplicate-submissi
 
 ## Completion
 
-Every case keeps its `risk`, request, expected HTTP/business result, and precise assertions. Draft existence-only assertions aid review but cannot satisfy verified completion. Every source-backed logic entry links real case IDs, and every declared flow has ordered execution evidence.
+Every case keeps its request, expected HTTP/business result, source evidence, and precise assertions. Explained `review-*` values remain case-local; all other success cases require exact business and result assertions. Every source-backed logic entry links real case IDs, and every declared flow has ordered execution evidence.

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,88 @@ try:
     from check_api_coverage import execution_evidence
 except ImportError:
     from scripts.check_api_coverage import execution_evidence
+
+
+SENSITIVE_KEY_RE = re.compile(
+    r"(?:authorization|cookie|password|passwd|secret|token|access.?key|private.?key|session)",
+    re.IGNORECASE,
+)
+
+
+def safe_value(value: Any, key: str = "", depth: int = 0) -> Any:
+    """Keep useful response evidence while excluding credentials and huge payloads."""
+
+    if SENSITIVE_KEY_RE.search(key):
+        return "<redacted>"
+    if depth >= 6:
+        return "<max-depth>"
+    if isinstance(value, dict):
+        return {
+            str(child_key): safe_value(child, str(child_key), depth + 1)
+            for child_key, child in list(value.items())[:100]
+        }
+    if isinstance(value, list):
+        return [safe_value(child, key, depth + 1) for child in value[:20]]
+    if isinstance(value, str):
+        if value.startswith("eyJ") and value.count(".") == 2:
+            return "<redacted>"
+        return value[:1000]
+    return value
+
+
+def response_shape(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): response_shape(child) for key, child in list(value.items())[:100]}
+    if isinstance(value, list):
+        return {"type": "array", "length": len(value), "items": response_shape(value[0]) if value else None}
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    return "string"
+
+
+def normalized_case_results(raw: Any) -> dict[str, dict[str, Any]]:
+    reports = [raw] if isinstance(raw, dict) else raw if isinstance(raw, list) else []
+    items = [
+        item
+        for report in reports
+        if isinstance(report, dict)
+        for item in report.get("results", [])
+        if isinstance(item, dict)
+    ]
+    results: dict[str, dict[str, Any]] = {}
+    for item in items:
+        test = item.get("test") if isinstance(item.get("test"), dict) else {}
+        filename = str(test.get("filename", ""))
+        name = str(item.get("name") or (Path(filename).stem if filename else ""))
+        if not name:
+            continue
+        response = item.get("response") if isinstance(item.get("response"), dict) else {}
+        body = response.get("data", response.get("body"))
+        failures: list[str] = []
+        for key in ("assertionResults", "testResults"):
+            for observation in item.get(key, []) if isinstance(item.get(key), list) else []:
+                if not isinstance(observation, dict) or str(observation.get("status", "")).lower() in {"pass", "passed", "success"}:
+                    continue
+                detail = observation.get("error") or observation.get("message") or observation.get("name") or key
+                failures.append(str(detail)[:500])
+        if item.get("error"):
+            failures.append(str(item["error"])[:500])
+        results[name] = {
+            "status": "passed" if name in execution_evidence(raw).get("passed", []) else "failed",
+            "actual": {
+                "http_status": response.get("status", response.get("statusCode")),
+                "body": safe_value(body),
+                "response_shape": response_shape(body),
+            },
+            "failure_reason": "; ".join(dict.fromkeys(failures)) or None,
+        }
+    return results
 
 
 def main() -> int:
@@ -33,6 +116,7 @@ def main() -> int:
         "version": 1,
         "executed": evidence.get("executed", []),
         "passed": evidence.get("passed", []),
+        "cases": normalized_case_results(raw),
     }
     if isinstance(raw, dict) and isinstance(raw.get("flows"), dict):
         flows: dict[str, Any] = {}

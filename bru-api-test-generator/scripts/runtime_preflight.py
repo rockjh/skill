@@ -360,7 +360,7 @@ def main() -> int:
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "base_url": base_url,
         "environment": active_environment,
-        "status": "runnable" if static_ready and context_ready and execution_ready else "blocked",
+        "status": "runnable" if static_ready and context_ready and execution_ready else "failed",
         "static_ready": static_ready,
         "context_ready": context_ready,
         "execution_ready": execution_ready,

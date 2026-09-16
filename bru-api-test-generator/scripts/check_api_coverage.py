@@ -101,6 +101,13 @@ from execution_config import (
 )
 from qa_lock import check as check_qa_lock
 from materialize_missing_bru import request_url as materialized_request_url
+from qa_constraints import (
+    check_module_lock,
+    needs_manual_confirmation,
+    qa_root_for_contracts,
+    review_reason_errors,
+    validate_stage,
+)
 
 SCENARIO_CATEGORIES = (
     "success",
@@ -112,7 +119,6 @@ SCENARIO_CATEGORIES = (
     "safety",
     "file",
 )
-RISK_CLASSES = {"read-only", "isolated-write", "destructive", "external-side-effect"}
 STRICT_REPORT_VERSION = 2
 STRICT_REPORT_FIELDS = (
     "scenario_matrix_checked",
@@ -364,8 +370,6 @@ def case_context_errors(
     if missing:
         errors.append(f"case {case_id} references undefined variable(s): {', '.join(missing)}")
     request_text = json.dumps(case.get("request", {}), ensure_ascii=False, sort_keys=True)
-    if re.search(r"review-[A-Za-z0-9_.-]+", request_text, re.IGNORECASE):
-        errors.append(f"case {case_id} contains review-* placeholder data")
     endpoint_path = str(case.get("resolved_endpoint_path", ""))
     request = case.get("request", {}) if isinstance(case.get("request"), dict) else {}
     request_path = str(request.get("path") or endpoint_path)
@@ -955,14 +959,6 @@ def normalized_body(value: Any, kind: str, rendered: bool = False) -> Any:
     return str(value if value is not None else "").strip()
 
 
-def case_risk(case: dict[str, Any], endpoint: dict[str, Any] | None = None) -> str:
-    declared = str(case.get("risk", "")).strip().lower()
-    if declared:
-        return declared
-    method = str((endpoint or {}).get("method", "GET")).upper()
-    return "read-only" if method in {"GET", "HEAD", "OPTIONS"} else "unconfirmed"
-
-
 def normalized_request_path(url: str) -> str:
     value = re.sub(r"^\{\{[^}]+\}\}", "", url).split("?", 1)[0]
     value = re.sub(r"^https?://[^/]+", "", value, flags=re.IGNORECASE)
@@ -1064,10 +1060,7 @@ def case_files(
             )
         endpoint = (endpoints or {}).get(str(case.get("endpoint_id")))
         if endpoint:
-            risk = case_risk(case, endpoint)
             tags = bru_meta_tags(contents[matched])
-            if risk not in tags:
-                errors.append(f"case {case_id} Bruno meta.tags is missing risk {risk}")
             obsolete = sorted(tag for tag in tags if tag.startswith("plan-"))
             if obsolete:
                 errors.append(f"case {case_id} Bruno meta.tags contains obsolete plan tag(s): {', '.join(obsolete)}")
@@ -1171,7 +1164,7 @@ def case_files(
             errors.append(f"case {case_id} Bruno file has no assert block: {matched}")
         covered.add(case_id)
         assertions = case.get("assertions")
-        if not isinstance(assertions, list) or not any(
+        if not needs_manual_confirmation(case) and (not isinstance(assertions, list) or not any(
             isinstance(item, dict)
             and (
                 any(key in item for key in ("equals", "eq", "contains", "matches", "type", "length", "minimum", "maximum", "nullable", "is_null", "equals_variable"))
@@ -1182,7 +1175,7 @@ def case_files(
                 )
             )
             for item in assertions
-        ):
+        )):
             errors.append(f"case {case_id} has no precise response assertion beyond status/code/exists")
         for assertion in assertions if isinstance(assertions, list) else []:
             if not isinstance(assertion, dict):
@@ -1486,16 +1479,12 @@ def check_module(
             errors.append(f"case {case.get('id')} points to unknown endpoint {endpoint_id}")
         if module_tag and case.get("swagger_tag") and str(case.get("swagger_tag")).strip() != module_tag:
             errors.append(f"case {case.get('id')} Swagger tag does not match module {module_id}")
-        endpoint_for_case = next((item for item in endpoints if item.get("id") == endpoint_id), None)
-        risk = case_risk(case, endpoint_for_case)
-        if require_scenarios and not str(case.get("risk", "")).strip():
-            errors.append(f"case {case.get('id')} has no confirmed risk class")
-        if risk not in RISK_CLASSES:
-            errors.append(f"case {case.get('id')} has invalid risk class {risk}")
+        errors.extend(review_reason_errors(case))
         if require_scenarios:
-            errors.extend(case_completion_errors(case))
-            errors.extend(success_assertion_errors(case))
-            errors.extend(query_assertion_errors(case))
+            if not needs_manual_confirmation(case):
+                errors.extend(case_completion_errors(case))
+                errors.extend(success_assertion_errors(case))
+                errors.extend(query_assertion_errors(case))
     for endpoint in endpoints:
         endpoint_cases = endpoint.get("case_ids", [])
         if not endpoint_cases:
@@ -1672,6 +1661,7 @@ def check_module(
             case_id for case_id, case in cases_by_id.items()
             if str(case.get("endpoint_id")) not in approved_excluded_endpoint_ids
             and (selected_case_ids is None or case_id in selected_case_ids)
+            and not needs_manual_confirmation(case)
         }
         errors.extend(f"case {case_id} was not executed" for case_id in sorted(required_case_ids - executed))
         errors.extend(f"case {case_id} failed" for case_id in sorted(required_case_ids & executed - passed))
@@ -1758,9 +1748,10 @@ def sync_global_index(path: Path, status: str, totals: dict[str, int], module_re
     index["generation_status"] = status
     index["inventory_endpoints"] = totals.get("inventory_endpoints", 0)
     index["generated_cases"] = totals.get("generated_cases", 0)
-    index["blocked_modules"] = sum(
-        value.get("status") == "blocked" for value in module_reports.values()
+    index["failed_modules"] = sum(
+        value.get("status") == "failed" for value in module_reports.values()
     )
+    index.pop("blocked_modules", None)
     by_id = {
         str(item.get("id")): item
         for item in index.get("modules", [])
@@ -1818,6 +1809,18 @@ def main() -> int:
     parser.add_argument("--write-status", action="store_true", help="update generated counts/status in index.yaml")
     args = parser.parse_args()
 
+    qa_root = qa_root_for_contracts(args.contracts_root)
+    constraint_stage = (
+        "post-execution" if args.results
+        else "pre-execution" if args.require_scenarios or args.require_auth
+        else "materialization"
+    )
+    constraint_errors = validate_stage(
+        qa_root,
+        constraint_stage,
+        module=args.module,
+    )
+
     results = execution_evidence(load_data(args.results)) if args.results else None
     preflight = load_data(args.preflight_results) if args.preflight_results else None
     preflight_ok = (
@@ -1831,7 +1834,7 @@ def main() -> int:
         and preflight.get("status") == "runnable"
         and not preflight.get("errors")
     )
-    execution_config_path = args.execution_config or (args.contracts_root.parent / "execution" / "config.yaml")
+    execution_config_path = args.execution_config or (qa_root / "execution" / "config.yaml")
     execution_config = None
     execution_config_error: str | None = None
     available_variables: set[str] = set()
@@ -1853,19 +1856,23 @@ def main() -> int:
                     environment_errors.append(f"environment fixture variable {name} is not a file: {environment['vars'][name]}")
         except ValueError as exc:
             execution_config_error = str(exc)
-    errors: list[str] = text_integrity_errors(args.contracts_root, args.bru_root)
+    errors: list[str] = [*constraint_errors, *text_integrity_errors(args.contracts_root, args.bru_root)]
     warnings: list[str] = []
     qa_lock_errors: list[str] = []
     business_version_checked = False
     if args.require_scenarios:
-        qa_lock_errors = check_qa_lock(args.contracts_root)
+        qa_lock_errors = (
+            check_module_lock(qa_root, args.module)
+            if args.module
+            else check_qa_lock(args.contracts_root)
+        )
         errors.extend(f"QA lock is not current: {error}" for error in qa_lock_errors)
         business_version_checked = True
         version_check = subprocess.run(
             [
                 sys.executable,
                 str(Path(__file__).resolve().parent / "check_version_compatibility.py"),
-                str(args.contracts_root.parent.parent),
+                str(qa_root.parent),
                 str(args.contracts_root),
                 "--phase", "before-execute",
             ],
@@ -1875,7 +1882,11 @@ def main() -> int:
             detail = (version_check.stdout or version_check.stderr).strip()
             warnings.append(f"business version lock is not current: {detail or version_check.returncode}")
     if args.results:
-        errors.extend(check_qa_lock(args.contracts_root))
+        errors.extend(
+            check_module_lock(qa_root, args.module)
+            if args.module
+            else check_qa_lock(args.contracts_root)
+        )
         if args.openapi is None:
             errors.append("completion requires explicit --openapi")
         if not args.require_scenarios:
@@ -2028,6 +2039,7 @@ def main() -> int:
                 for case in module_cases
                 if case.get("id")
                 and str(case.get("endpoint_id")) not in approved_endpoint_ids
+                and not needs_manual_confirmation(case)
             ]
             selected_case_ids_by_module[module_id] = set(eligible_case_ids)
             required_case_ids_global.update(eligible_case_ids)
@@ -2071,7 +2083,7 @@ def main() -> int:
                     checked_case = dict(case)
                     checked_case["resolved_endpoint_path"] = endpoint.get("path", "")
                     errors.extend(case_context_errors(checked_case, available_variables, captured_variables))
-                if args.results and case_id in selected_case_ids_by_module[module_id]:
+                if args.results and case_id in selected_case_ids_by_module[module_id] and not needs_manual_confirmation(case):
                     errors.extend(case_completion_errors(case))
         flow_path = module_dir / "flows.yaml"
         if flow_path.is_file():
@@ -2259,7 +2271,7 @@ def main() -> int:
         for key in totals:
             totals[key] += report[key]
         errors.extend(f"[{module_id}] {error}" for error in module_errors)
-        report["status"] = "blocked" if module_errors else (
+        report["status"] = "failed" if module_errors else (
             "verified" if results else ("runnable" if preflight_ok else "draft")
         )
         if module_id in declared:
@@ -2291,21 +2303,21 @@ def main() -> int:
             and not totals["pending_exclusions"]
         if args.module:
             module_completion_ok = scope_completion_ok
-            module_status = "verified" if module_completion_ok else "blocked"
+            module_status = "verified" if module_completion_ok else "failed"
             completion_ok = False
             status = "draft"
         else:
             completion_ok = scope_completion_ok
-            status = "verified" if completion_ok else "blocked"
+            status = "verified" if completion_ok else "failed"
     elif preflight_ok and static_ok:
         completion_ok = False
         status = "runnable"
     elif args.preflight_results and static_ok:
         completion_ok = False
-        status = "blocked"
+        status = "environment_unavailable"
     else:
         completion_ok = False
-        status = "draft" if static_ok else "blocked"
+        status = "draft" if static_ok else "generation_failed"
     if args.module and not args.results:
         module_status = status
         status = "draft"
@@ -2321,7 +2333,7 @@ def main() -> int:
         "qa_lock_checked": bool(args.require_scenarios),
         "business_version_checked": business_version_checked,
         "modules": module_reports,
-        "blocked_modules": sum(value.get("status") == "blocked" for value in module_reports.values()),
+        "failed_modules": sum(value.get("status") == "failed" for value in module_reports.values()),
         "errors": errors,
         "warnings": list(dict.fromkeys(warnings)),
         "static_ok": static_ok,
@@ -2376,7 +2388,7 @@ def main() -> int:
         else:
             print(f"coverage check is static-valid but incomplete: {status}")
     passed_completion = module_completion_ok if args.module else completion_ok
-    return 0 if static_ok and status != "blocked" and (not args.results or passed_completion) else 1
+    return 0 if static_ok and status not in {"failed", "generation_failed", "environment_unavailable"} and (not args.results or passed_completion) else 1
 
 
 if __name__ == "__main__":

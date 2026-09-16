@@ -12,14 +12,14 @@ sign:
 
 Allowed tool modes are `project-scripts` and `shared-cli`. Allowed coverage profiles are `contract-draft` and `full-matrix`; `verified` is an execution state, not a profile.
 
-SERES signing is structured:
+Optional SHA-256 signing is structured:
 
 ```yaml
 active_environment: local
 tooling: project-scripts
 coverage_profile: full-matrix
 sign:
-  provider: seres
+  provider: sha256
   version: v1
 ```
 
@@ -34,7 +34,6 @@ vars {
   baseUrl: http://127.0.0.1:9527
   AUTH_TOKEN: ""
   SESSION_COOKIE: ""
-  OPERATOR_INFO: ""
   ACCESS_KEY: ""
   SECRET_KEY: ""
 }
@@ -42,7 +41,6 @@ vars {
 headers {
   Authorization: "Bearer {{AUTH_TOKEN}}"
   Cookie: "{{SESSION_COOKIE}}"
-  operatorInfo: "{{OPERATOR_INFO}}"
 }
 ```
 
@@ -56,7 +54,7 @@ request:
 
 The runner parses the custom Header block, resolves variables, passes Bruno a temporary native environment, and sends the resolved map to the collection pre-request script. Do not duplicate common Header logic in request files.
 
-When `sign.provider` is `seres`, `collection.bru` reads `ACCESS_KEY` and `SECRET_KEY` from the active environment. Version `v1` uses the fixed SHA-256 algorithm and `sign`, `timestamp`, and `accesskey` Headers. A disabled provider adds no signing Headers.
+When `sign.provider` is `sha256`, `collection.bru` reads `ACCESS_KEY` and `SECRET_KEY` from the active environment. Version `v1` signs the request path, optional body, normalized query parameters, timestamp, and secret; it writes `sign`, `timestamp`, and `accesskey` Headers. A disabled provider adds no signing Headers.
 
 ## Execution Scope
 
@@ -64,12 +62,10 @@ The launcher has one optional scope selector:
 
 ```bat
 qa\execution\run.bat
-qa\execution\run.bat --module "AC-信息"
+qa\execution\run.bat --module "users"
 ```
 
-No argument runs every module. `--module` accepts a module ID, display name, directory, or OpenAPI Tag and runs every registered request in that module. The generated launchers contain these examples as comments. There are no all/read/write/external-confirmation, named-plan, or risk-filter parameters.
-
-Risk is retained in case metadata and the run report. It never changes the selected scope or requires an execution flag.
+No argument runs every module. `--module` accepts a module ID, display name, directory, or OpenAPI Tag and runs every registered request in that module. The generated launchers contain these examples as comments. There are no alternate scope classes, named plans, tags, or confirmation parameters.
 
 Bruno executes a directory directly instead of using tag filtering:
 
@@ -78,11 +74,11 @@ no argument -> bru run qa/bruno -r
 --module x  -> bru run qa/bruno/<module-directory> -r
 ```
 
-`.bru` tags contain only the case risk for inspection and reporting.
+Generated business requests do not contain `meta.tags`; execution scope is always the selected directory.
 
 ## Output And Logs
 
-The runner prints stage progress and a `PASS` or `FAIL` line for every selected case. Its final summary contains total, success count, failure count, failed case IDs, and version warnings. Every invocation creates a plain-text log under `qa/logs/`, named with a high-resolution timestamp and `run-bruno-<scope>`.
+The runner prints stage progress and a `PASS` or `FAIL` line for every selected case. Its final summary contains total, executed, passed, failed, and not-executed counts, plus failed IDs, manual confirmations, result/evidence paths, and version warnings. Global logs live under `qa/logs/`; module logs live under `qa/logs/modules/<module>/`.
 
 ## Local And Remote Versions
 
@@ -107,11 +103,11 @@ vars {
 `project-scripts` keeps a synchronized `qa/scripts` bundle. Its `scripts-version.yaml` records skill/script versions, source, aggregate and per-file SHA, and synchronization time:
 
 ```bash
-mno-bruno-qa scripts sync
-mno-bruno-qa scripts check
+bruno-api-test-generator scripts sync
+bruno-api-test-generator scripts check
 ```
 
-`shared-cli` keeps only QA assets and calls the installed `mno-bruno-qa` command from the launchers.
+`shared-cli` keeps only QA assets and calls the installed `bruno-api-test-generator` command from the launchers.
 
 Initialization migrates supported legacy runtime fields into the active environment, moves tooling into `execution/config.yaml`, and removes obsolete `qa.yaml` and `execution/plans.yaml`.
 

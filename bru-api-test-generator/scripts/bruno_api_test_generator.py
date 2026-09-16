@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 from pathlib import Path
 
 sys.dont_write_bytecode = True
@@ -18,6 +19,7 @@ from analyze_source_logic import apply_candidates, scan as scan_source_logic
 from materialize_missing_bru import materialize
 from parse_openapi import (
     extract,
+    constraint_obligations,
     generate_module_map,
     load_document,
     render_manifest,
@@ -26,7 +28,20 @@ from parse_openapi import (
 from qa_lock import check as check_qa_lock
 from qa_lock import refresh_generation_state_cases
 from qa_lock import write as write_qa_lock
+from qa_constraints import (
+    ensure_rule_library,
+    validate_stage,
+    validate_worker_snapshot,
+    worker_snapshot_path,
+    write_worker_snapshot,
+)
 from scripts_manager import check_scripts, sync_scripts
+from source_constraints import (
+    apply_constraints_to_manifest,
+    apply_environment_values,
+    apply_observed_constraints,
+    write_source_constraints,
+)
 
 
 SCRIPTS_ROOT = Path(__file__).resolve().parent
@@ -52,19 +67,27 @@ def script_bundle_errors(qa_root: Path) -> list[str]:
     return [] if shared_cli_mode(qa_root) else check_scripts(qa_root, SCRIPTS_ROOT)
 
 
+def is_loopback_openapi(document: dict[str, object]) -> bool:
+    provenance = document.get("provenance", {})
+    source_url = str(provenance.get("source_url", "")) if isinstance(provenance, dict) else ""
+    host = urllib.parse.urlsplit(source_url).hostname
+    return bool(host and host.lower() in {"localhost", "127.0.0.1", "::1"})
+
+
 def init_command(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="mno-bruno-qa init")
+    parser = argparse.ArgumentParser(prog="bruno-api-test-generator init")
     qa_root_argument(parser)
     parser.add_argument("--shared-cli", action="store_true", help="keep only QA assets and use the installed CLI")
     args = parser.parse_args(argv)
     changed = initialize_execution_layout(args.qa_root, local_scripts=False if args.shared_cli else None)
+    ensure_rule_library(args.qa_root)
     (args.qa_root / "contracts" / "modules").mkdir(parents=True, exist_ok=True)
     print(f"initialized {args.qa_root} ({len(changed)} file(s) changed)")
     return 0
 
 
 def generate_command(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="mno-bruno-qa generate")
+    parser = argparse.ArgumentParser(prog="bruno-api-test-generator generate")
     qa_root_argument(parser)
     parser.add_argument("--openapi", type=Path)
     parser.add_argument("--module-map", type=Path)
@@ -78,7 +101,8 @@ def generate_command(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     qa_root = args.qa_root.resolve()
     initialize_execution_layout(qa_root, local_scripts=False if args.shared_cli else None)
-    from execution_config import load_execution_config
+    ensure_rule_library(qa_root)
+    from execution_config import environment_file, load_bruno_environment, load_execution_config
 
     execution_config = load_execution_config(qa_root / "execution" / "config.yaml")
     coverage_profile = args.coverage_profile or execution_config["coverage_profile"]
@@ -90,7 +114,29 @@ def generate_command(argv: list[str]) -> int:
     saved_spec = contracts / ("openapi.yaml" if source_spec.suffix.lower() in {".yaml", ".yml"} else "openapi.json")
     if source_spec != saved_spec.resolve() and (not saved_spec.is_file() or source_spec.read_bytes() != saved_spec.read_bytes()):
         shutil.copy2(source_spec, saved_spec)
-    manifest = extract(saved_spec, load_document(saved_spec))
+    source_document = load_document(saved_spec)
+    manifest = extract(saved_spec, source_document)
+    source_constraints_path = qa_root / "constraints" / "source-rules.yaml"
+    if args.source_root:
+        missing = [str(path) for path in args.source_root if not path.is_dir()]
+        if missing:
+            parser.error("source root(s) do not exist: " + ", ".join(missing))
+        source_constraints = write_source_constraints(qa_root, args.source_root)
+        apply_constraints_to_manifest(manifest, source_constraints)
+    elif source_constraints_path.is_file():
+        apply_constraints_to_manifest(manifest, load_document(source_constraints_path))
+    observed_paths = [qa_root / "constraints" / "observed-rules.yaml"]
+    observed_paths.extend((contracts / "modules").glob("*/observed-rules.yaml"))
+    for observed_path in observed_paths:
+        if observed_path.is_file():
+            observed = load_document(observed_path)
+            apply_observed_constraints(manifest, observed)
+    environment_path = environment_file(qa_root / "execution" / "config.yaml", execution_config)
+    if environment_path.is_file():
+        apply_environment_values(manifest, load_bruno_environment(environment_path))
+    for endpoint in manifest.get("endpoints", []):
+        if isinstance(endpoint, dict):
+            endpoint["obligations"] = constraint_obligations(endpoint)
     module_map = (args.module_map or (contracts / "module-map.yaml")).resolve()
     if not module_map.is_file():
         module_map.parent.mkdir(parents=True, exist_ok=True)
@@ -105,9 +151,6 @@ def generate_command(argv: list[str]) -> int:
         coverage_profile=coverage_profile,
     )
     if args.source_root:
-        missing = [str(path) for path in args.source_root if not path.is_dir()]
-        if missing:
-            parser.error("source root(s) do not exist: " + ", ".join(missing))
         candidates = scan_source_logic(args.source_root, None, args.exception_type, args.error_code_type)
         if candidates.get("errors"):
             for error in candidates["errors"]:
@@ -124,6 +167,14 @@ def generate_command(argv: list[str]) -> int:
         refresh_generation_state_cases(contracts)
     materialize(contracts, qa_root / "bruno", execution_config_path=qa_root / "execution" / "config.yaml")
     write_qa_lock(contracts)
+    constraint_errors = [
+        *validate_stage(qa_root, "generation"),
+        *validate_stage(qa_root, "materialization"),
+    ]
+    if constraint_errors:
+        for error in dict.fromkeys(constraint_errors):
+            print(f"ERROR: {error}", file=sys.stderr)
+        return 2
     print(
         f"generated endpoints={len(manifest['endpoints'])} changed_modules={len(summary['changed_modules'])} "
         f"skipped_modules={len(summary['skipped_modules'])}"
@@ -132,11 +183,14 @@ def generate_command(argv: list[str]) -> int:
         print(f"REVIEW: remove the .bru file for deleted endpoint {endpoint_id}", file=sys.stderr)
     for case_id in summary["manual_review_cases"]:
         print(f"REVIEW: preserved manually modified case {case_id}", file=sys.stderr)
+    if is_loopback_openapi(source_document):
+        print("OpenAPI came from a running local service; starting the required execution attempt")
+        return run_command(["--qa-root", str(qa_root)])
     return 0
 
 
 def coverage_command(argv: list[str], reconcile: bool) -> int:
-    parser = argparse.ArgumentParser(prog=f"mno-bruno-qa {'reconcile' if reconcile else 'check'}")
+    parser = argparse.ArgumentParser(prog=f"bruno-api-test-generator {'reconcile' if reconcile else 'check'}")
     qa_root_argument(parser)
     scope = parser.add_mutually_exclusive_group(required=True)
     scope.add_argument("--all", action="store_true")
@@ -206,12 +260,18 @@ def run_command(argv: list[str]) -> int:
 
 
 def materialize_command(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="mno-bruno-qa materialize")
+    parser = argparse.ArgumentParser(prog="bruno-api-test-generator materialize")
     qa_root_argument(parser)
     parser.add_argument("--module")
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args(argv)
     qa_root = args.qa_root.resolve()
+    ensure_rule_library(qa_root)
+    generation_errors = validate_stage(qa_root, "generation", module=args.module)
+    if generation_errors:
+        for error in generation_errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+        return 1
     changed = materialize(
         qa_root / "contracts",
         qa_root / "bruno",
@@ -222,11 +282,76 @@ def materialize_command(argv: list[str]) -> int:
         check=args.check,
     )
     print(f"{'would materialize' if args.check else 'materialized'} {len(changed)} artifact(s)")
-    return 1 if args.check and changed else 0
+    if args.check and changed:
+        return 1
+    if not args.check:
+        errors = validate_stage(qa_root, "materialization", module=args.module)
+        if args.module:
+            try:
+                snapshot = worker_snapshot_path(qa_root, args.module)
+            except ValueError:
+                snapshot = None
+            if snapshot and snapshot.is_file():
+                errors.extend(validate_worker_snapshot(qa_root, args.module, "materialization"))
+        for error in errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+        if errors:
+            return 1
+    return 0
+
+
+def worker_command(argv: list[str], start: bool) -> int:
+    command = "worker-start" if start else "worker-check"
+    parser = argparse.ArgumentParser(prog=f"bruno-api-test-generator {command}")
+    qa_root_argument(parser)
+    parser.add_argument("--module", required=True)
+    if not start:
+        parser.add_argument(
+            "--stage",
+            choices=("generation", "materialization", "pre-execution", "post-execution"),
+            default="generation",
+        )
+    args = parser.parse_args(argv)
+    ensure_rule_library(args.qa_root)
+    if start:
+        try:
+            path = write_worker_snapshot(args.qa_root, args.module)
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        print(f"created module-worker snapshot: {path}")
+        return 0
+    errors = validate_worker_snapshot(args.qa_root, args.module, args.stage)
+    for error in errors:
+        print(f"ERROR: {error}", file=sys.stderr)
+    if not errors:
+        print(f"module-worker boundary passed: module={args.module} stage={args.stage}")
+    return 1 if errors else 0
+
+
+def aggregate_command(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="bruno-api-test-generator aggregate")
+    qa_root_argument(parser)
+    args = parser.parse_args(argv)
+    try:
+        from run_bruno import aggregate_module_results
+
+        report_path, evidence_path, report = aggregate_module_results(args.qa_root)
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    summary = report["summary"]
+    print(
+        f"aggregated total={summary['total']} executed={summary['executed']} passed={summary['passed']} "
+        f"failed={summary['failed']} not_executed={summary['not_executed']} status={report['status']}"
+    )
+    print(f"result_report={report_path}")
+    print(f"execution_evidence={evidence_path}")
+    return 0 if report["status"] == "verified" else 1
 
 
 def preflight_command(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="mno-bruno-qa preflight", add_help=False)
+    parser = argparse.ArgumentParser(prog="bruno-api-test-generator preflight", add_help=False)
     qa_root_argument(parser)
     known, remaining = parser.parse_known_args(argv)
     qa_root = known.qa_root.resolve()
@@ -295,7 +420,7 @@ def preflight_command(argv: list[str]) -> int:
 
 
 def scripts_command(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="mno-bruno-qa scripts")
+    parser = argparse.ArgumentParser(prog="bruno-api-test-generator scripts")
     parser.add_argument("action", choices=("sync", "check"))
     qa_root_argument(parser)
     args = parser.parse_args(argv)
@@ -303,7 +428,7 @@ def scripts_command(argv: list[str]) -> int:
         if args.action == "sync":
             print("shared-cli is active; no project-local scripts need synchronization")
         else:
-            print("shared-cli is active; installed mno-bruno-qa provides the scripts")
+            print("shared-cli is active; installed bruno-api-test-generator provides the scripts")
         return 0
     if args.action == "sync":
         changed = sync_scripts(args.qa_root, SCRIPTS_ROOT)
@@ -319,8 +444,11 @@ def scripts_command(argv: list[str]) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    parser = argparse.ArgumentParser(prog="mno-bruno-qa")
-    commands = ("init", "generate", "materialize", "check", "run", "preflight", "reconcile", "scripts")
+    parser = argparse.ArgumentParser(prog="bruno-api-test-generator")
+    commands = (
+        "init", "generate", "materialize", "check", "run", "preflight", "reconcile",
+        "aggregate", "worker-start", "worker-check", "scripts",
+    )
     parser.add_argument("command", nargs="?", choices=commands)
     if not argv or argv[0] in {"-h", "--help"}:
         parser.parse_args(argv)
@@ -334,6 +462,10 @@ def main(argv: list[str] | None = None) -> int:
         return generate_command(remainder)
     if command == "materialize":
         return materialize_command(remainder)
+    if command == "aggregate":
+        return aggregate_command(remainder)
+    if command in {"worker-start", "worker-check"}:
+        return worker_command(remainder, command == "worker-start")
     if command in {"check", "reconcile"}:
         return coverage_command(remainder, command == "reconcile")
     if command == "run":

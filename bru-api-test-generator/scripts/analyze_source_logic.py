@@ -61,10 +61,11 @@ BUSINESS_EXCEPTION_RE = re.compile(
     r"\b(?:throw\s+new|raise\s+|BusinessException|BizException|DomainException|business[_ ]?error)\b",
     re.IGNORECASE,
 )
-ERROR_CODE_RE = re.compile(r"(?<!\d)([1-9]\d{4,8})(?!\d)")
+ERROR_CODE_RE = re.compile(r"(?<!\d)([1-9]\d{3,8})(?!\d)")
+SYMBOLIC_ERROR_CODE_RE = re.compile(r"[\"']([A-Z][A-Z0-9_.-]{2,})[\"']")
 REQUIRED_HEADER_RE = re.compile(
-    r"(?:RequestHeader|getHeader|get_header|headers?\.get|headers?\s*\[|requireHeader|require_header|(?:req|request)\.get)"
-    r"[^\n]*?(operatorInfo|[A-Za-z][A-Za-z0-9-]*Info)",
+    r"(?:RequestHeader|getHeader|get_header|headers?\.get|requireHeader|require_header)\s*\(\s*"
+    r"(?:(?:value|name)\s*=\s*)?[\"']([^\"']+)[\"']",
     re.IGNORECASE,
 )
 AUTHORIZATION_RE = re.compile(r"(?:PreAuthorize|RequiresPermissions|Secured|permission|hasRole|hasAuthority)", re.IGNORECASE)
@@ -134,7 +135,7 @@ def scan(
                         "evidence": evidence,
                         "needs_case": True,
                     }
-                codes = ERROR_CODE_RE.findall(line)
+                codes = [*ERROR_CODE_RE.findall(line), *SYMBOLIC_ERROR_CODE_RE.findall(line)]
                 if codes:
                     candidate["expected_business_codes"] = list(dict.fromkeys(codes))
                 header = REQUIRED_HEADER_RE.search(line)
@@ -165,7 +166,11 @@ def _normalized(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.lower())
 
 
-def apply_candidates(result: dict[str, Any], contracts_root: Path) -> list[str]:
+def apply_candidates(
+    result: dict[str, Any],
+    contracts_root: Path,
+    module_filter: str | None = None,
+) -> list[str]:
     """Add source-backed draft logic to the best matching module without inventing cases."""
 
     try:
@@ -178,6 +183,9 @@ def apply_candidates(result: dict[str, Any], contracts_root: Path) -> list[str]:
         endpoints_path = module_dir / "endpoints.yaml"
         if endpoints_path.is_file():
             document = load_data(endpoints_path)
+            module_id = str(document.get("module", module_dir.name)) if isinstance(document, dict) else module_dir.name
+            if module_filter and module_filter not in {module_id, module_dir.name}:
+                continue
             modules.append((module_dir, document, first_list(document, "endpoints")))
     endpoint_records = [
         (module_dir, document, endpoint)
@@ -311,9 +319,7 @@ def apply_candidates(result: dict[str, Any], contracts_root: Path) -> list[str]:
                         "scenario": scenario,
                         "review_required": True,
                         "status": "draft",
-                        "risk": candidate.get("suggested_risk") or (
-                            "read-only" if str(endpoint.get("method", "GET")).upper() in {"GET", "HEAD", "OPTIONS"} else "unconfirmed"
-                        ),
+                        "review_reason": "源码和安全配置未提供精确错误响应体",
                         "logic_ids": [logic_id],
                         "request": {"omit_common_headers": [required_header]},
                         "expected": {"http_status": error_status},
@@ -363,9 +369,7 @@ def apply_candidates(result: dict[str, Any], contracts_root: Path) -> list[str]:
                             "scenario": "business_error",
                             "review_required": True,
                             "status": "draft",
-                            "risk": candidate.get("suggested_risk") or (
-                                "read-only" if str(endpoint.get("method", "GET")).upper() in {"GET", "HEAD", "OPTIONS"} else "unconfirmed"
-                            ),
+                            "review_reason": "源码给出业务错误码，但缺少可复现的触发请求数据",
                             "logic_ids": [logic_id],
                             "expected": {
                                 "http_status": error_status,
@@ -446,7 +450,11 @@ def apply_candidates(result: dict[str, Any], contracts_root: Path) -> list[str]:
         logic_path.write_text(yaml.safe_dump(updated, allow_unicode=True, sort_keys=False), encoding="utf-8")
     ledger = dict(result)
     ledger["unresolved_candidate_ids"] = unresolved
-    ledger_path = contracts_root / "source-logic-candidates.yaml"
+    ledger_path = (
+        modules[0][0] / "source-logic-candidates.yaml"
+        if module_filter and len(modules) == 1
+        else contracts_root / "source-logic-candidates.yaml"
+    )
     ledger_path.write_text(yaml.safe_dump(ledger, allow_unicode=True, sort_keys=False), encoding="utf-8")
     return unresolved
 
@@ -459,6 +467,7 @@ def main() -> int:
     parser.add_argument("--exception-type")
     parser.add_argument("--error-code-type")
     parser.add_argument("--contracts-root", type=Path, help="apply coverage-required candidates to module logic.yaml")
+    parser.add_argument("--module", help="limit writes to one module directory")
     args = parser.parse_args()
     missing = [str(root) for root in args.source_roots if not root.is_dir()]
     if missing:
@@ -470,7 +479,7 @@ def main() -> int:
     for error in scan_errors:
         print(f"ERROR: {error}", file=sys.stderr)
     if args.contracts_root and not scan_errors:
-        unresolved = apply_candidates(result, args.contracts_root)
+        unresolved = apply_candidates(result, args.contracts_root, args.module)
         if unresolved:
             for candidate_id in unresolved:
                 print(

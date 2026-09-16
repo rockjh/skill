@@ -19,8 +19,8 @@ from tool_version import SCRIPTS_VERSION, SKILL_VERSION, SOURCE_REPOSITORY
 
 README_FALLBACK = """# QA 脚本工具链
 
-此目录由 `mno-bruno-qa scripts sync` 管理。使用 `mno-bruno-qa --help` 查看
-初始化、增量生成、检查、预检、风险执行、对账和脚本同步命令。
+此目录由 `bruno-api-test-generator scripts sync` 管理。使用 `bruno-api-test-generator --help` 查看
+初始化、增量生成、检查、预检、执行、对账和脚本同步命令。
 `scripts-version.yaml` 记录版本、来源、聚合/逐文件 SHA 和同步时间。
 """
 
@@ -35,13 +35,15 @@ SCRIPT_NAMES = (
     "fetch_local_openapi.py",
     "manifest_io.py",
     "materialize_missing_bru.py",
-    "mno_bruno_qa.py",
+    "bruno_api_test_generator.py",
     "normalize_bruno_report.py",
     "parse_openapi.py",
+    "qa_constraints.py",
     "qa_lock.py",
     "run_bruno.py",
     "runtime_preflight.py",
     "scripts_manager.py",
+    "source_constraints.py",
     "tool_version.py",
     "validate_flow_execution.py",
 )

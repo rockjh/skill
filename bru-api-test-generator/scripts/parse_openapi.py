@@ -35,6 +35,7 @@ CASE_DOCS_START = "<!-- AUTO_CASES_START -->"
 CASE_DOCS_END = "<!-- AUTO_CASES_END -->"
 MODULE_DOCS_START = "<!-- AUTO_MODULE_START -->"
 MODULE_DOCS_END = "<!-- AUTO_MODULE_END -->"
+REVIEW_RE = re.compile(r"review-[A-Za-z0-9_.-]+", re.IGNORECASE)
 
 
 def slugify_tag(tag: str) -> str:
@@ -212,7 +213,7 @@ def extract(path: Path, document: dict[str, Any]) -> dict[str, Any]:
             }
             for extension in (
                 "x-permissions", "x-permission", "x-roles", "x-role",
-                "x-idempotent", "x-safety", "x-risk", "x-side-effect",
+                "x-idempotent", "x-safety",
             ):
                 if extension in operation:
                     endpoint[extension] = resolve_value(document, operation[extension])
@@ -658,6 +659,82 @@ def _fixed_schema_value(schema: Any) -> Any:
     return copy.deepcopy(enum[0]) if isinstance(enum, list) and len(enum) == 1 else None
 
 
+def header_environment_name(name: str) -> str:
+    """Return a stable environment variable name for any required Header."""
+
+    snake = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", snake).strip("_").upper()
+    return normalized or "HEADER_VALUE"
+
+
+def _example_result_assertions(value: Any, path: str) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        assertion: dict[str, Any] = {"path": path, "type": "array", "length": len(value)}
+        if value:
+            item = value[0]
+            item_type = (
+                "object" if isinstance(item, dict)
+                else "boolean" if isinstance(item, bool)
+                else "integer" if isinstance(item, int)
+                else "number" if isinstance(item, float)
+                else "array" if isinstance(item, list)
+                else "string"
+            )
+            assertion["items"] = {"type": item_type}
+        return [assertion]
+    if not isinstance(value, dict):
+        return [{"path": path, "equals": value}]
+    assertions: list[dict[str, Any]] = []
+    priority = (
+        "id", "resourceId", "page", "pageNum", "pageNumber", "pageSize", "size",
+        "total", "totalCount", "totalElements", "totalPages", "records", "content", "items", "list",
+    )
+    ordered = [key for key in priority if key in value]
+    ordered.extend(key for key in value if key not in ordered)
+    for key in ordered:
+        child = value[key]
+        child_path = f"{path}.{key}"
+        if isinstance(child, (dict, list)):
+            nested = _example_result_assertions(child, child_path)
+            if nested:
+                assertions.extend(nested)
+        else:
+            assertions.append({"path": child_path, "equals": child})
+        if key not in priority and assertions:
+            break
+    return assertions
+
+
+def _schema_result_assertions(schema: Any, path: str) -> list[dict[str, Any]]:
+    if not isinstance(schema, dict):
+        return []
+    fixed = _fixed_schema_value(schema)
+    if fixed is not None:
+        return _example_result_assertions(fixed, path)
+    if schema.get("type") == "array" and isinstance(schema.get("items"), dict):
+        item_schema = schema["items"]
+        item_type = item_schema.get("type")
+        if not item_type and isinstance(item_schema.get("properties"), dict):
+            item_type = "object"
+        assertion: dict[str, Any] = {"path": path, "type": "array"}
+        if item_type:
+            assertion["items"] = {"type": item_type}
+        return [assertion] if "items" in assertion else []
+    properties = schema.get("properties", {}) if isinstance(schema.get("properties"), dict) else {}
+    priority = (
+        "id", "resourceId", "page", "pageNum", "pageNumber", "pageSize", "size",
+        "total", "totalCount", "totalElements", "totalPages", "records", "content", "items", "list",
+    )
+    ordered = [key for key in priority if key in properties]
+    ordered.extend(key for key in properties if key not in ordered)
+    assertions: list[dict[str, Any]] = []
+    for key in ordered:
+        assertions.extend(_schema_result_assertions(properties[key], f"{path}.{key}"))
+        if assertions and key not in priority:
+            break
+    return assertions
+
+
 def exact_response_assertions(endpoint: dict[str, Any], status: int) -> list[dict[str, Any]]:
     """Derive exact response assertions only from explicit contract values."""
 
@@ -677,31 +754,25 @@ def exact_response_assertions(endpoint: dict[str, Any], status: int) -> list[dic
     if fixed[business_key] not in success_values:
         return []
     envelope_keys = {"status", "errorCode", "code", "errorMsg", "msg", "message"}
-    detail = next(
-        ((f"$.{key}", value) for key, value in fixed.items() if key not in envelope_keys),
-        None,
-    )
-    if detail is None and isinstance(example, dict):
+    details: list[dict[str, Any]] = []
+    if isinstance(example, dict):
         for key, value in example.items():
-            if key in envelope_keys:
-                continue
-            if isinstance(value, list):
-                detail = (f"$.{key}", value)
-                break
-            if not isinstance(value, dict):
-                continue
-            detail = next(
-                ((f"$.{key}.{name}", item) for name, item in value.items() if not isinstance(item, (dict, list))),
-                None,
-            )
-            if detail:
-                break
-    if detail is None:
+            if key not in envelope_keys:
+                details.extend(_example_result_assertions(value, f"$.{key}"))
+    if not details:
+        detail = next(
+            ((f"$.{key}", value) for key, value in fixed.items() if key not in envelope_keys),
+            None,
+        )
+        if detail:
+            details.append({"path": detail[0], "equals": detail[1]})
+    if not details:
+        for key, value_schema in properties.items():
+            if key not in envelope_keys:
+                details.extend(_schema_result_assertions(value_schema, f"$.{key}"))
+    if not details:
         return []
-    return [
-        {"path": f"$.{business_key}", "equals": fixed[business_key]},
-        {"path": detail[0], "equals": detail[1]},
-    ]
+    return [{"path": f"$.{business_key}", "equals": fixed[business_key]}, *details]
 
 
 def exact_error_assertions(endpoint: dict[str, Any], status: int) -> list[dict[str, Any]]:
@@ -1117,19 +1188,18 @@ def seed_contract_cases(
                 ),
                 None,
             )
-            if parameter.get("in") == "header" and name.casefold() in {"operatorinfo", "authorization", "cookie"}:
+            if parameter.get("in") == "header" and parameter.get("required") is True:
                 variable = {
-                    "operatorinfo": "OPERATOR_INFO",
                     "authorization": "AUTH_TOKEN",
                     "cookie": "SESSION_COOKIE",
-                }[name.casefold()]
+                }.get(name.casefold(), header_environment_name(name))
                 value = "{{" + variable + "}}"
             elif parameter.get("example") is not None:
                 value = copy.deepcopy(parameter["example"])
             elif example is not None:
                 value = copy.deepcopy(example)
             elif parameter.get("in") == "path" and not any(key in schema for key in ("example", "default", "enum")):
-                value = "{{PATH_" + re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").upper() + "}}"
+                value = f"review-{name}"
             else:
                 value = schema_value(schema, name)
             set_parameter(success_request, parameter, value)
@@ -1154,14 +1224,6 @@ def seed_contract_cases(
         case_assertions = copy.deepcopy(
             assertions if assertions is not None else (success_assertions if 200 <= status < 300 else error_assertions)
         )
-        write_method = str(endpoint.get("method", "GET")).upper() not in {"GET", "HEAD", "OPTIONS"}
-        declared_risk = endpoint.get("x-risk")
-        if declared_risk not in {"read-only", "isolated-write", "destructive", "external-side-effect"}:
-            declared_risk = (
-                "external-side-effect" if endpoint.get("x-side-effect")
-                else "read-only" if not write_method
-                else "unconfirmed"
-            )
         exact = bool(case_assertions)
         if scenario == "query" and 200 <= status < 300:
             result_roots = ("$.data", "$.result", "$.items", "$.list", "$.records", "$.content", "$.page", "$.total")
@@ -1171,21 +1233,30 @@ def seed_contract_cases(
                 for item in case_assertions
                 if isinstance(item, dict)
             )
-        return {
+        review_values = sorted(set(REVIEW_RE.findall(json.dumps(request, ensure_ascii=False))))
+        review_required = not exact or bool(review_values)
+        built = {
             "id": f"{endpoint_id}_{suffix}",
             "title": business_case_title(endpoint, scenario, detail, status),
             "description": f"验证{endpoint_business_action(endpoint)}的{detail or '正常'}场景。",
             "endpoint_id": endpoint_id,
             "scenario": scenario,
-            "status": "runnable" if exact and declared_risk != "unconfirmed" else "draft",
+            "status": "draft" if review_required else "runnable",
             "source": "openapi",
-            "review_required": not exact or declared_risk == "unconfirmed",
-            "risk": declared_risk,
+            "review_required": review_required,
             "request": copy.deepcopy(request),
             "expected": {"http_status": status},
             "coverage_ids": list(dict.fromkeys(coverage_ids or [])),
             "assertions": case_assertions,
         }
+        if review_values:
+            built["review_reasons"] = {
+                value: "OpenAPI、源码约束库、执行证据和本地环境均未提供可用值"
+                for value in review_values
+            }
+        elif not exact:
+            built["review_reason"] = "OpenAPI、源码和已有执行证据不足以生成精确响应断言"
+        return built
 
     seeded = [build("SUCCESS", "success", "", success_status, success_request)] if success_status is not None else []
     for parameter in parameters:
@@ -1480,7 +1551,8 @@ def seed_contract_cases(
         if case["id"].endswith("QUERY_EMPTY_RESULT") and empty_path:
             case["assertions"] = [*success_assertions, {"path": empty_path, "length": 0}]
             case["review_required"] = False
-            case["status"] = "runnable" if case["risk"] == "read-only" else "draft"
+            case["status"] = "runnable"
+            case.pop("review_reason", None)
 
     deduplicated: dict[str, dict[str, Any]] = {}
     for case in seeded:
@@ -1562,7 +1634,7 @@ def write_partitioned(
         "coverage_profile": coverage_profile,
         "inventory_endpoints": len(manifest["endpoints"]),
         "generated_cases": 0,
-        "blocked_modules": 0,
+        "failed_modules": 0,
         "modules": [],
     }
     readme_modules: dict[str, tuple[dict[str, Any], list[dict[str, Any]], str]] = {}
@@ -1658,22 +1730,31 @@ def write_partitioned(
                 if key not in {"bru", "bru_file", "file_name", "manual_review"}
             })
             if (
-                incremental
-                and isinstance(previous_case, dict)
+                isinstance(previous_case, dict)
                 and previous_case.get("fingerprint")
                 and previous_case.get("fingerprint") != current_case_fingerprint
             ):
                 case["manual_review"] = True
                 summary["manual_review_cases"].append(case_id)
         if seed_cases:
-            existing_case_ids = {str(case.get("id")) for case in cases if case.get("id")}
+            existing_by_case_id = {str(case.get("id")): case for case in cases if case.get("id")}
             for endpoint in endpoints:
                 security_path = output_dir.parent / "security-profile.yaml"
                 security_profile = load_document(security_path) if security_path.is_file() else {}
                 for seeded in seed_contract_cases(endpoint, coverage_profile, security_profile):
-                    if seeded["id"] not in existing_case_ids:
+                    existing = existing_by_case_id.get(str(seeded["id"]))
+                    if existing is None:
                         cases.append(seeded)
-                        existing_case_ids.add(seeded["id"])
+                        existing_by_case_id[str(seeded["id"])] = seeded
+                    elif existing.get("source") == "openapi" and existing.get("manual_review") is not True:
+                        preserved = {
+                            key: existing[key]
+                            for key in ("bru", "bru_file", "file_name", "sequence", "seq")
+                            if key in existing
+                        }
+                        existing.clear()
+                        existing.update(seeded)
+                        existing.update(preserved)
                 endpoint["case_ids"] = list(dict.fromkeys([
                     *endpoint.get("case_ids", []),
                     *(case["id"] for case in cases if case.get("endpoint_id") == endpoint.get("id")),
@@ -1750,14 +1831,22 @@ def write_partitioned(
                 "case_count": len(cases),
             }
         )
+    required_header_profiles: dict[str, dict[str, Any]] = {}
+    for endpoint in manifest["endpoints"]:
+        for parameter in endpoint.get("parameters", []):
+            if not isinstance(parameter, dict) or parameter.get("in") != "header" or parameter.get("required") is not True:
+                continue
+            header = str(parameter.get("name", "")).strip()
+            if not header or header.casefold() in {"authorization", "cookie"}:
+                continue
+            required_header_profiles[f"required-header-{slugify_tag(header)}"] = {
+                "type": "required-header",
+                "header": header,
+                "status": "probe-required",
+            }
     security_profile = {
         "version": 1,
         "source": manifest["source"],
-        "admin-operator-context": {
-            "type": "audit-context",
-            "header": "operatorInfo",
-            "status": "probe-required",
-        },
         "auth-token": {
             "type": "authentication",
             "header": "Authorization",
@@ -1774,6 +1863,7 @@ def write_partitioned(
                 }
             ),
         },
+        **required_header_profiles,
     }
     security_path = output_dir.parent / "security-profile.yaml"
     if not security_path.exists():

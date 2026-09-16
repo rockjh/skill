@@ -17,8 +17,8 @@ stale lock is not a passing state.
       impact_review: non-api
 
 The generated global index should also record `generation_status` (`draft`,
-`runnable`, `verified`, or `blocked`), the offline contract SHA, inventory
-counts, blocked-module count, and `execution_config_file`. `draft` is an
+`runnable`, `verified`, or `failed`), the offline contract SHA, inventory
+counts, failed-module count, and `execution_config_file`. `draft` is an
 expected intermediate state, not completion evidence.
 
 `generation-state.yaml` is the incremental generator ledger:
@@ -99,7 +99,7 @@ priority. A negative case can remove a configured Header with:
 ```yaml
 request:
   omit_common_headers:
-    - operatorInfo
+    - X-Tenant-Id
 ```
 
 See [execution-config.md](execution-config.md) for the schema, Header format,
@@ -134,7 +134,6 @@ Cases link back to an endpoint and optionally to source logic. Assertions must i
         title: 创建用户成功
         description: 验证合法用户资料能够创建成功并返回新用户信息。
         endpoint_id: USER_CREATE
-        risk: isolated-write
         scenarios:
           success: {applicable: true, status: confirmed}
           authentication: {applicable: true, status: inferred}
@@ -156,7 +155,6 @@ Cases link back to an endpoint and optionally to source logic. Assertions must i
         title: 用户名重复时创建失败
         description: 验证重复用户名被业务规则拒绝并返回明确提示。
         endpoint_id: USER_CREATE
-        risk: isolated-write
         logic_ids:
           - USER_CREATE_DUPLICATE_LOGIC
         bru: 02-用户名重复时创建失败.bru
@@ -311,7 +309,7 @@ Generate this file; do not hand-edit it:
     generation_status: draft
     inventory_endpoints: 30
     generated_cases: 0
-    blocked_modules: 0
+    failed_modules: 0
     source:
       openapi_file: contracts/openapi.json
       swagger_sha256: ...

@@ -1,43 +1,52 @@
-# Parallel Module Generation
+# Parallel Module Generation And Execution
 
-Use parallel workers only after the coordinator has completed the global inventory. The point of parallelism is independent module ownership; it is not permission to skip contract reconciliation or run shared test data concurrently.
+Use workers only after the coordinator freezes the OpenAPI inventory, module map, shared execution configuration, and `qa/constraints/rules.yaml`.
 
-## Phases
+Before dispatching each assignment, record its Git-backed boundary:
 
-1. **Coordinator, sequential:** discover repository rules, locate the offline OpenAPI file, parse every operation, inspect source mappings and shared security/fixtures, classify the business-code version, freeze `module-map.yaml`, and identify cross-module dependencies. Select the local script bundle or installed shared CLI before workers start.
-2. **Workers, parallel where independent:** start one worker per independent module. Each worker generates and tests only its assigned module.
-3. **Coordinator, sequential:** review worker reports, regenerate `index.yaml`, `generation-state.yaml`, and `qa-lock.yaml`, reconcile all modules, validate cross-module flows, report every included risk, run the final collection, and advance `version-lock.yaml` only after all required evidence is present.
+```bash
+bruno-api-test-generator worker-start --module <module>
+```
 
 ## Ownership
 
 | Owner | Writable scope |
 | --- | --- |
-| Coordinator | `README.md`, `module-map.yaml`, `index.yaml`, `generation-state.yaml`, `qa-lock.yaml`, `version-lock.yaml`, `impact-rules.yaml`, `flows/cross-module.yaml`, `execution/config.yaml`, `execution/environments/`, `bruno/`, script synchronization metadata, and business-repository metadata |
-| Module worker | `contracts/modules/<module-directory>/{logic,cases}.yaml` within its assigned module |
+| Coordinator | Global contracts, locks, constraint merges, execution configuration, collection files, cross-module flows, and final reports |
+| Module worker | Its `contracts/modules/<directory>/`, `bruno/<directory>/`, `results/modules/<id>/`, `evidence/modules/<id>/`, and `logs/modules/<id>/` only |
 
-Workers must not edit endpoint inventories, `.bru` files, another module,
-business source code, shared credentials, or coordinator-owned files. A worker
-may read shared files and must return its case IDs, logic IDs, changed paths,
-and unresolved blockers to the coordinator. The coordinator alone materializes
-requests so sequential and parallel generation use identical naming, common
-Header exclusions, and collection-level runtime behavior.
+Workers may read shared contracts, configuration, prior evidence, and business source. They must not write business code, another module, `index.yaml`, `generation-state.yaml`, `qa-lock.yaml`, `version-lock.yaml`, `collection.bru`, shared environments, or cross-module flows.
 
-## Scheduling
+The coordinator records each assignment and gives the constraint validator the worker role, assigned module, and changed paths. `module-worker-boundary` and `business-code-immutable` fail any path outside the table above.
 
-- Workers may generate modules concurrently when their endpoint sets, fixtures, and flows are independent.
-- A module that requires another module's captured ID, shared mutable account, or ordered setup belongs in the coordinator phase or waits for its dependency.
-- Parallel execution requires isolated users, tenants, database records, and environment variables. Without demonstrated isolation, execute module collections sequentially even if generation was parallel.
-- A worker failure does not authorize silently dropping the module. The coordinator records the failure and the final coverage check remains failing until the module is repaired or explicitly excluded with a reason.
-- Record a failed worker as that module's `blocked` status while allowing unrelated workers to leave reviewable `draft` or `runnable` artifacts. Schedule by endpoint volume when a one-worker-per-module split would leave a large module unbalanced; keep each module's write scope disjoint.
+## Worker Sequence
 
-## Handoff
+1. Read the assigned module contracts and the shared machine rules.
+2. Inspect its reachable Controller, Application, Domain Service, DTO/Output, Entity, Repository, exception/error-code, configuration, Flyway, and test evidence.
+3. Write module `source-rules.yaml`, `logic.yaml`, `cases.yaml`, and explicit flows/exclusions when applicable.
+4. Run module materialization. It writes only the module Bruno directory, `materialization-state.yaml`, `module-lock.yaml`, and module documentation.
+5. Run `bruno-api-test-generator run --module <module>`. It validates the module lock and writes module-local evidence, results, and logs.
+6. Run `bruno-api-test-generator worker-check --module <module> --stage post-execution`. Changed paths are calculated from the recorded snapshot.
+7. Return rule/case/logic/flow IDs, result/evidence paths, failures by category, and manual confirmations.
 
-Each worker reports:
+A worker failure affects only that module. Other workers continue.
 
-- module ID and owned paths;
-- generated endpoint, logic, case, and flow IDs;
-- cases that require Bruno materialization;
-- missing operations for explicitly flow-required modules or exclusions with reasons;
-- blockers and required coordinator actions.
+## Independence And Flows
 
-The coordinator treats worker reports as input, not proof. The global coverage and flow validators, plus the final Bruno run, are authoritative.
+A module run cannot depend on another module having passed. Shared setup or captured identifiers require a coordinator-owned explicit flow. Never encode a dependency through filenames, module order, or shared mutable fixtures.
+
+Parallel execution additionally requires isolated accounts, tenants, records, and fixture paths. Without demonstrated isolation, workers may generate concurrently but the coordinator executes modules sequentially.
+
+## Coordinator Merge
+
+After workers finish, the coordinator:
+
+1. validates each worker snapshot boundary and module lock;
+2. merges source and observed rules into the global constraint library;
+3. regenerates `index.yaml` and `generation-state.yaml` without resetting unchanged successful cases;
+4. materializes globally and refreshes `qa-lock.yaml`;
+5. validates cross-module flows;
+6. runs `bruno-api-test-generator aggregate` to reconcile independent module reports and evidence; and
+7. runs the all-module collection only when a coordinator-owned cross-module flow requires it.
+
+Worker reports are inputs, not proof. Shared constraints, global reconciliation, and execution evidence are authoritative.

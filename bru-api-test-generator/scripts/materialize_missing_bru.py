@@ -24,6 +24,7 @@ from execution_config import (
     load_execution_config,
 )
 from parse_openapi import display_directory, render_manifest, update_module_document
+from qa_constraints import write_module_lock
 from qa_lock import write as write_qa_lock
 
 
@@ -370,13 +371,11 @@ def render_case(
             request["content_type"] = inferred_content_type
     kind = body_kind(request, body)
     sequence = sequence if sequence is not None else case.get("sequence", case.get("seq", 1))
-    risk = str(case.get("risk") or ("read-only" if method.upper() in {"GET", "HEAD", "OPTIONS"} else "unconfirmed"))
     lines = [
         "meta {",
         f"  name: {case.get('id')}",
         "  type: http",
         f"  seq: {sequence}",
-        f"  tags: [{risk}]",
         "}",
         "",
         f"{method} {{",
@@ -506,24 +505,15 @@ def ensure_request_script(content: str, case: dict[str, Any]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def ensure_execution_tags(content: str, tags: list[str]) -> str:
+def strip_meta_tags(content: str) -> str:
+    """Remove legacy generated tags; execution scope is directory-based."""
+
     meta = re.search(r"(?ms)^\s*meta\s*\{(.*?)^\s*\}", content)
     if meta is None:
         raise ValueError("business Bruno request has no meta block")
-    line = f"  tags: [{', '.join(tags)}]"
     block = meta.group(0)
-    if re.search(r"(?m)^\s*tags:\s*.*$", block):
-        updated = re.sub(r"(?m)^\s*tags:\s*.*$", line, block, count=1)
-    else:
-        updated = block[:-1].rstrip() + "\n" + line + "\n}"
+    updated = re.sub(r"(?m)^\s*tags:\s*.*\r?\n?", "", block)
     return content[:meta.start()] + updated + content[meta.end():]
-
-
-def case_risk(case: dict[str, Any], endpoint: dict[str, Any]) -> str:
-    declared = str(case.get("risk", "")).strip()
-    if declared:
-        return declared
-    return "read-only" if str(endpoint.get("method", "GET")).upper() in {"GET", "HEAD", "OPTIONS"} else "unconfirmed"
 
 
 def contract_signature(content: str) -> str:
@@ -600,6 +590,8 @@ def materialize(
         raise SystemExit(str(exc)) from exc
     collection_path = bruno_root / "collection.bru"
     if not collection_path.exists():
+        if module_filter:
+            raise SystemExit("module materialization requires coordinator-initialized collection.bru")
         if not dry_run:
             collection_path.parent.mkdir(parents=True, exist_ok=True)
             collection_path.write_text(COLLECTION_TEMPLATE, encoding="utf-8")
@@ -631,6 +623,12 @@ def materialize(
             )
         if module_filter and module_filter not in {module_id, module_dir.name}:
             continue
+        module_state_cases = state_cases
+        local_state_path = module_dir / "materialization-state.yaml"
+        if module_filter and local_state_path.is_file():
+            local_state = load_data(local_state_path)
+            if isinstance(local_state, dict) and isinstance(local_state.get("cases"), dict):
+                module_state_cases = local_state["cases"]
         cases_path = module_dir / "cases.yaml"
         if not cases_path.is_file():
             continue
@@ -661,7 +659,7 @@ def materialize(
                     )
                 existing_by_id[existing_id] = path
 
-        planned: list[tuple[dict[str, Any], dict[str, Any], Path, list[str]]] = []
+        planned: list[tuple[dict[str, Any], dict[str, Any], Path]] = []
         targets: dict[Path, str] = {}
         mappings_changed = False
         for position, case in enumerate(cases, 1):
@@ -704,8 +702,7 @@ def materialize(
                     f"Bruno filename collision: cases {targets[target]} and {case_id} both map to {relative}"
                 )
             targets[target] = case_id
-            tags = [case_risk(case, endpoint)]
-            planned.append((case, endpoint, target, tags))
+            planned.append((case, endpoint, target))
             desired_mapping = relative.as_posix()
             if case.get("bru") != desired_mapping or "bru_file" in case or "file_name" in case:
                 if "bru_file" in case or "file_name" in case:
@@ -722,13 +719,13 @@ def materialize(
                 updated_cases_document["cases"] = cases
                 cases_path.write_text(render_manifest(updated_cases_document, cases_path), encoding="utf-8")
 
-        for case, endpoint, target, tags in planned:
+        for case, endpoint, target in planned:
             case_id = str(case["id"])
             rendered_case = dict(case)
             expected_sequence = int(target.stem.split("-", 1)[0])
             expected = render_case(rendered_case, endpoint, expected_sequence)
             current_case_fingerprint = _case_fingerprint(case)
-            baseline = state_cases.get(case_id, {}) if isinstance(state_cases.get(case_id), dict) else {}
+            baseline = module_state_cases.get(case_id, {}) if isinstance(module_state_cases.get(case_id), dict) else {}
             if target.exists():
                 try:
                     existing = target.read_text(encoding="utf-8", errors="strict")
@@ -799,7 +796,7 @@ def materialize(
                     raise SystemExit(f"cannot read Bruno file {existing_path}: {exc}") from exc
                 if not is_http_request_content(existing):
                     continue
-                updated = strip_legacy_auth(existing)
+                updated = strip_meta_tags(strip_legacy_auth(existing))
                 if updated != existing:
                     created.append(existing_path)
                     if not dry_run:
@@ -830,14 +827,32 @@ def materialize(
                 raise SystemExit(f"cannot read Bruno file {existing_path}: {exc}") from exc
             if not is_http_request_content(existing):
                 continue
-            updated = strip_legacy_auth(existing)
+            updated = strip_meta_tags(strip_legacy_auth(existing))
             if updated != existing:
                 created.append(existing_path)
                 if not dry_run:
                     existing_path.write_text(updated, encoding="utf-8")
     if not dry_run and sync_index and not module_filter:
         sync_index_counts(contracts_root)
-    if not dry_run and isinstance(generation_state, dict) and materialized_state:
+    if not dry_run and module_filter and materialized_state:
+        selected_module = next(
+            (
+                directory for directory in modules_root.iterdir()
+                if directory.is_dir()
+                and module_filter in {
+                    directory.name,
+                    str((load_data(directory / "endpoints.yaml") or {}).get("module", directory.name)),
+                }
+            ),
+            None,
+        )
+        if selected_module is not None:
+            local_state_path = selected_module / "materialization-state.yaml"
+            local_state_path.write_text(
+                render_manifest({"version": 1, "cases": materialized_state}, local_state_path),
+                encoding="utf-8",
+            )
+    if not dry_run and not module_filter and isinstance(generation_state, dict) and materialized_state:
         updated_state = dict(generation_state)
         updated_cases = dict(state_cases)
         for case_id, values in materialized_state.items():
@@ -861,6 +876,8 @@ def materialize(
         )
         if drift:
             raise SystemExit("materialize consistency check failed: " + ", ".join(str(path) for path in drift))
+    if not dry_run and module_filter:
+        write_module_lock(contracts_root.parent, module_filter)
     return list(dict.fromkeys(created))
 
 

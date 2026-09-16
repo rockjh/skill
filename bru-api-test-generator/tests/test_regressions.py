@@ -84,7 +84,7 @@ def execution_fixture(
         "active_environment": "local",
         "tooling": "project-scripts",
         "coverage_profile": "full-matrix",
-        "sign": {"provider": "seres", "version": "v1"} if sign in {"seres", "seres-sign"} else {"provider": "disabled"},
+        "sign": {"provider": "sha256", "version": "v1"} if sign in {"sha256", "sha256-v1"} else {"provider": "disabled"},
     }, ensure_ascii=False), encoding="utf-8")
     env_file = environments / "local.bru"
     values = {"BASE_URL": "http://127.0.0.1:18080", **(environment or {})}
@@ -156,7 +156,6 @@ class RegressionTests(unittest.TestCase):
             "id": "IMPORT_CREATE",
             "method": "POST",
             "path": "/imports",
-            "x-risk": "isolated-write",
             "request_body": {"content": {"multipart/form-data": {"schema": {
                 "type": "object",
                 "required": ["profile", "file"],
@@ -213,7 +212,7 @@ class RegressionTests(unittest.TestCase):
             helper = root / "args.py"
             helper.write_text("import json, sys; print(json.dumps(sys.argv[1:]))\n", encoding="utf-8")
             wrapper = root / "bru.cmd"
-            wrapper.write_text(f'@echo off\r\npython "{helper}" %*\r\n', encoding="ascii")
+            wrapper.write_text(f'@echo off\r\n"{sys.executable}" "{helper}" %*\r\n', encoding="ascii")
             arguments = ["--env-var", 'RUNTIME={"name":"a b&c"}']
             with mock.patch.dict(os.environ, {"PATH": str(root) + os.pathsep + os.environ["PATH"]}):
                 completed = subprocess.run(
@@ -308,12 +307,12 @@ class RegressionTests(unittest.TestCase):
     def test_case_fingerprint_detects_identical_contract(self):
         coverage = load_script("check_api_coverage")
         first = {
-            "endpoint_id": "CAR_OPTION_CREATE",
-            "scenario": "missing_operator",
+            "endpoint_id": "USER_CREATE",
+            "scenario": "missing_tenant",
             "request": {"body": {"name": "x"}},
-            "assertions": [{"path": "$.msg", "contains": "operator"}],
+            "assertions": [{"path": "$.msg", "contains": "tenant"}],
         }
-        second = dict(first, id="CAR_OPTION_CREATE_MISSING_OPERATOR_2")
+        second = dict(first, id="USER_CREATE_MISSING_TENANT_2")
         self.assertEqual(coverage.case_fingerprint(first), coverage.case_fingerprint(second))
 
     def test_raw_report_dict_uses_assertions_not_top_level_status(self):
@@ -372,7 +371,7 @@ class RegressionTests(unittest.TestCase):
             {"version": 1, **valid},
             {**valid, "active_environment": "local.bru"},
             {**valid, "active_environment": "local:bad"},
-            {**valid, "sign": {"provider": "seres"}},
+            {**valid, "sign": {"provider": "sha256"}},
             {**valid, "sign": {"provider": "unknown"}},
             {**valid, "auth": {}},
             {**valid, "custom_headers": {}},
@@ -508,8 +507,9 @@ class RegressionTests(unittest.TestCase):
             }), encoding="utf-8")
             legacy_environment = root / "bruno" / "environments"
             legacy_environment.mkdir(parents=True)
+            load_script("qa_constraints").ensure_rule_library(root)
             (legacy_environment / "local.bru").write_text(
-                "vars {\n  BASE_URL: http://127.0.0.1:18080\n  OPERATOR_INFO:\n}\n",
+                "vars {\n  BASE_URL: http://127.0.0.1:18080\n  TENANT_ID:\n}\n",
                 encoding="utf-8",
             )
             parser.write_partitioned(parser.extract(spec_path, document), map_path, output_dir)
@@ -529,8 +529,8 @@ class RegressionTests(unittest.TestCase):
             self.assertFalse((root / "bruno" / "environments").exists())
             self.assertTrue((root / "execution" / "run.bat").is_file())
             self.assertTrue((root / "execution" / "run.sh").is_file())
-            self.assertIn("mno_bruno_qa.py\" run", (root / "execution" / "run.bat").read_text(encoding="utf-8"))
-            self.assertIn('mno_bruno_qa.py" run', (root / "execution" / "run.sh").read_text(encoding="utf-8"))
+            self.assertIn("bruno_api_test_generator.py\" run", (root / "execution" / "run.bat").read_text(encoding="utf-8"))
+            self.assertIn('bruno_api_test_generator.py" run', (root / "execution" / "run.sh").read_text(encoding="utf-8"))
             self.assertEqual(
                 sorted(path.name for path in (root / "execution" / "environments").glob("*.bru")),
                 ["local.bru"],
@@ -763,29 +763,29 @@ class RegressionTests(unittest.TestCase):
     def test_business_filename_uses_sequence_and_chinese_case_title(self):
         materializer = load_script("materialize_missing_bru")
         path = materializer.display_case_file(
-            {"id": "traffic_query_success", "title": "查询车辆/流量信息成功"},
+            {"id": "product_query_success", "title": "查询商品/库存信息成功"},
             1,
         )
-        self.assertEqual(path.name, "01-查询车辆流量信息成功.bru")
+        self.assertEqual(path.name, "01-查询商品库存信息成功.bru")
         rendered = materializer.render_case(
-            {"id": "traffic_query_success", "title": "查询车辆流量信息成功"},
-            {"method": "GET", "path": "/traffic"},
+            {"id": "product_query_success", "title": "查询商品库存信息成功"},
+            {"method": "GET", "path": "/products"},
         )
-        self.assertIn("name: traffic_query_success", rendered)
-        self.assertIn("url: {{baseUrl}}/traffic", rendered)
+        self.assertIn("name: product_query_success", rendered)
+        self.assertIn("url: {{baseUrl}}/products", rendered)
 
     def test_materializer_rejects_explicit_case_id_filename(self):
         materializer = load_script("materialize_missing_bru")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            module = root / "contracts" / "modules" / "流量查询"
+            module = root / "contracts" / "modules" / "商品查询"
             module.mkdir(parents=True)
             (module / "endpoints.yaml").write_text(json.dumps({"endpoints": [{
-                "id": "TRAFFIC", "method": "GET", "path": "/traffic", "summary": "查询车辆流量",
+                "id": "PRODUCT", "method": "GET", "path": "/products", "summary": "查询商品库存",
             }]}), encoding="utf-8")
             (module / "cases.yaml").write_text(json.dumps({"cases": [{
-                "id": "traffic_query_success", "endpoint_id": "TRAFFIC",
-                "title": "查询车辆流量成功", "bru": "01-traffic_query_success.bru",
+                "id": "product_query_success", "endpoint_id": "PRODUCT",
+                "title": "查询商品库存成功", "bru": "01-product_query_success.bru",
             }]}), encoding="utf-8")
             config, _ = execution_fixture(root)
             with self.assertRaisesRegex(SystemExit, "invalid business Bruno filename"):
@@ -797,7 +797,7 @@ class RegressionTests(unittest.TestCase):
         materializer = load_script("materialize_missing_bru")
         with self.assertRaisesRegex(SystemExit, "Chinese case.title"):
             materializer.display_case_file(
-                {"id": "traffic_query_success", "title": "traffic_query_success"},
+                {"id": "product_query_success", "title": "product_query_success"},
                 1,
             )
 
@@ -805,14 +805,14 @@ class RegressionTests(unittest.TestCase):
         materializer = load_script("materialize_missing_bru")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            module = root / "contracts" / "modules" / "流量查询"
+            module = root / "contracts" / "modules" / "商品查询"
             module.mkdir(parents=True)
             (module / "endpoints.yaml").write_text(json.dumps({"endpoints": [{
-                "id": "TRAFFIC", "method": "GET", "path": "/traffic", "summary": "查询车辆流量",
+                "id": "PRODUCT", "method": "GET", "path": "/products", "summary": "查询商品库存",
             }]}), encoding="utf-8")
             cases = [
-                {"id": case_id, "endpoint_id": "TRAFFIC", "title": "查询车辆流量", "sequence": 1}
-                for case_id in ("traffic_one", "traffic_two")
+                {"id": case_id, "endpoint_id": "PRODUCT", "title": "查询商品库存", "sequence": 1}
+                for case_id in ("product_one", "product_two")
             ]
             (module / "cases.yaml").write_text(json.dumps({"cases": cases}), encoding="utf-8")
             config, _ = execution_fixture(root)
@@ -825,13 +825,13 @@ class RegressionTests(unittest.TestCase):
         materializer = load_script("materialize_missing_bru")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            module = root / "contracts" / "modules" / "流量查询"
+            module = root / "contracts" / "modules" / "商品查询"
             module.mkdir(parents=True)
             (module / "endpoints.yaml").write_text(json.dumps({"endpoints": [{
-                "id": "TRAFFIC", "method": "GET", "path": "/traffic", "summary": "查询车辆流量",
+                "id": "PRODUCT", "method": "GET", "path": "/products", "summary": "查询商品库存",
             }]}), encoding="utf-8")
             (module / "cases.yaml").write_text(json.dumps({"cases": [{
-                "id": "traffic_query_success", "endpoint_id": "TRAFFIC", "title": "查询车辆流量成功",
+                "id": "product_query_success", "endpoint_id": "PRODUCT", "title": "查询商品库存成功",
             }]}), encoding="utf-8")
             config, _ = execution_fixture(root)
             materializer.materialize(
@@ -842,20 +842,20 @@ class RegressionTests(unittest.TestCase):
                 if path.name != "collection.bru"
             )
             cases_document = load_script("manifest_io").load_data(module / "cases.yaml")
-            self.assertEqual(cases_document["cases"][0]["bru"], "01-查询车辆流量成功.bru")
+            self.assertEqual(cases_document["cases"][0]["bru"], "01-查询商品库存成功.bru")
             second_changes = materializer.materialize(
                 root / "contracts", root / "bruno", execution_config_path=config
             )
-            self.assertEqual([path.name for path in first], ["01-查询车辆流量成功.bru"])
+            self.assertEqual([path.name for path in first], ["01-查询商品库存成功.bru"])
             self.assertEqual(second_changes, [])
             original = first[0].read_text(encoding="utf-8")
-            first[0].write_text(original.replace("/traffic", "/wrong"), encoding="utf-8")
+            first[0].write_text(original.replace("/products", "/wrong"), encoding="utf-8")
             drift = materializer.materialize(
                 root / "contracts",
                 root / "bruno",
                 dry_run=True,
                 execution_config_path=config,
-                module_filter="流量查询",
+                module_filter="商品查询",
                 check=True,
             )
             self.assertIn(first[0].name, {path.name for path in drift})
@@ -874,7 +874,7 @@ class RegressionTests(unittest.TestCase):
             cases_path = module / "cases.yaml"
             cases_path.write_text(json.dumps({"cases": [{
                 "id": "USER_GET_OK", "title": "查询用户成功", "endpoint_id": "USER_GET",
-                "risk": "read-only", "expected": {"http_status": 200},
+                "expected": {"http_status": 200},
                 "assertions": [{"path": "$.data.id", "equals": "one"}],
             }]}), encoding="utf-8")
             config, _ = execution_fixture(root)
@@ -901,17 +901,17 @@ class RegressionTests(unittest.TestCase):
         coverage = load_script("check_api_coverage")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            module = root / "contracts" / "modules" / "车辆查询"
+            module = root / "contracts" / "modules" / "商品查询"
             module.mkdir(parents=True)
-            endpoint = {"id": "TRAFFIC", "method": "GET", "path": "/traffic"}
+            endpoint = {"id": "PRODUCT", "method": "GET", "path": "/products"}
             (module / "endpoints.yaml").write_text(json.dumps({"endpoints": [endpoint]}), encoding="utf-8")
             cases = [
                 {
-                    "id": "traffic_first", "endpoint_id": "TRAFFIC", "title": "查询第一辆车成功",
+                    "id": "product_first", "endpoint_id": "PRODUCT", "title": "查询第一个商品成功",
                     "expected": {"http_status": 200}, "assertions": [{"path": "$.data", "equals": 1}],
                 },
                 {
-                    "id": "traffic_second", "endpoint_id": "TRAFFIC", "title": "查询第二辆车成功",
+                    "id": "product_second", "endpoint_id": "PRODUCT", "title": "查询第二个商品成功",
                     "expected": {"http_status": 200}, "assertions": [{"path": "$.data", "equals": 1}],
                 },
             ]
@@ -930,9 +930,9 @@ class RegressionTests(unittest.TestCase):
             )
             self.assertFalse(any(path.suffix == ".bru" for path in changes))
             reordered = load_script("manifest_io").load_data(cases_path)["cases"]
-            self.assertEqual(reordered[0]["bru"], "02-查询第二辆车成功.bru")
-            self.assertEqual(reordered[1]["bru"], "01-查询第一辆车成功.bru")
-            _, _, _, errors = coverage.case_files(reordered, root / "bruno" / "车辆查询")
+            self.assertEqual(reordered[0]["bru"], "02-查询第二个商品成功.bru")
+            self.assertEqual(reordered[1]["bru"], "01-查询第一个商品成功.bru")
+            _, _, _, errors = coverage.case_files(reordered, root / "bruno" / "商品查询")
             self.assertFalse(any("filename must match" in error for error in errors))
 
     def test_coverage_enforces_chinese_case_title_and_exempts_collection_config(self):
@@ -941,25 +941,25 @@ class RegressionTests(unittest.TestCase):
             root = Path(directory)
             (root / "environments").mkdir()
             case = {
-                "id": "traffic_query_success",
-                "title": "查询车辆流量成功",
-                "bru": "01-查询车辆流量成功.bru",
+                "id": "product_query_success",
+                "title": "查询商品库存成功",
+                "bru": "01-查询商品库存成功.bru",
                 "expected": {"http_status": 200},
                 "assertions": [{"path": "$.data", "equals": 1}],
             }
-            (root / "01-查询车辆流量成功.bru").write_text(
-                "meta {\n  name: traffic_query_success\n  type: http\n}\nget {\n  url: {{BASE_URL}}/traffic\n}\nassert {\n  res.status: eq 200\n  res.body.data: eq 1\n}\n",
+            (root / "01-查询商品库存成功.bru").write_text(
+                "meta {\n  name: product_query_success\n  type: http\n}\nget {\n  url: {{BASE_URL}}/products\n}\nassert {\n  res.status: eq 200\n  res.body.data: eq 1\n}\n",
                 encoding="utf-8",
             )
             (root / "environments" / "local.bru").write_text("vars { BASE_URL: http://localhost }\n", encoding="utf-8")
             (root / "collection.bru").write_text("meta { name: collection }\n", encoding="utf-8")
             covered, _, _, errors = coverage.case_files([case], root)
-            self.assertEqual(covered, {"traffic_query_success"})
+            self.assertEqual(covered, {"product_query_success"})
             self.assertEqual(errors, [])
 
-            case["bru"] = "01-traffic_query_success.bru"
-            (root / "01-traffic_query_success.bru").write_text(
-                "meta {\n  name: traffic_query_success\n  type: http\n}\nget {\n  url: {{BASE_URL}}/traffic\n}\nassert {\n  res.status: eq 200\n}\n",
+            case["bru"] = "01-product_query_success.bru"
+            (root / "01-product_query_success.bru").write_text(
+                "meta {\n  name: product_query_success\n  type: http\n}\nget {\n  url: {{BASE_URL}}/products\n}\nassert {\n  res.status: eq 200\n}\n",
                 encoding="utf-8",
             )
             _, _, _, errors = coverage.case_files([case], root)
@@ -970,14 +970,14 @@ class RegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             case = {
-                "id": "traffic_query_success",
-                "title": "查询车辆流量成功",
-                "bru": "01-删除车辆成功.bru",
+                "id": "product_query_success",
+                "title": "查询商品库存成功",
+                "bru": "01-删除商品成功.bru",
                 "expected": {"http_status": 200},
                 "assertions": [{"path": "$.data", "equals": 1}],
             }
             (root / case["bru"]).write_text(
-                "meta {\n  name: traffic_query_success\n  type: http\n}\nget {\n  url: {{BASE_URL}}/traffic\n}\nassert {\n  res.status: eq 200\n  res.body.data: eq 1\n}\n",
+                "meta {\n  name: product_query_success\n  type: http\n}\nget {\n  url: {{BASE_URL}}/products\n}\nassert {\n  res.status: eq 200\n  res.body.data: eq 1\n}\n",
                 encoding="utf-8",
             )
             _, _, _, errors = coverage.case_files([case], root)
@@ -991,7 +991,7 @@ class RegressionTests(unittest.TestCase):
             "parameters": [
                 {"name": "status", "required": True, "schema": {"enum": ["ON", "OFF"]}},
                 {"name": "pageNum", "schema": {"type": "integer"}},
-                {"name": "operatorInfo", "in": "header", "required": True, "schema": {"type": "string"}},
+                {"name": "X-Tenant-Id", "in": "header", "required": True, "schema": {"type": "string"}},
             ],
             "request_body": {"content": {"multipart/form-data": {"schema": {
                 "type": "object",
@@ -1006,8 +1006,8 @@ class RegressionTests(unittest.TestCase):
         )
         self.assertTrue(all(case["review_required"] is True for case in seeded))
         self.assertTrue(all("business_error" != case["scenario"] for case in seeded))
-        header_case = next(case for case in seeded if case["id"].endswith("MISSING_OPERATORINFO"))
-        self.assertEqual(header_case["request"]["omit_common_headers"], ["operatorInfo"])
+        header_case = next(case for case in seeded if case["id"].endswith("MISSING_X_TENANT_ID"))
+        self.assertEqual(header_case["request"]["omit_common_headers"], ["X-Tenant-Id"])
 
     def test_seed_cases_populate_success_body_and_omit_each_required_field(self):
         parser = load_script("parse_openapi")
@@ -1063,7 +1063,7 @@ class RegressionTests(unittest.TestCase):
             root = Path(directory)
             config, env_file = execution_fixture(
                 root,
-                headers={"operatorInfo": "{{OPERATOR_INFO}}"},
+                headers={"X-Tenant-Id": "{{X_TENANT_ID}}"},
             )
             loaded = execution_config.load_execution_config(config)
             self.assertEqual(execution_config.required_environment_names(loaded), [])
@@ -1087,7 +1087,7 @@ class RegressionTests(unittest.TestCase):
             self.assertTrue(report["static_ready"])
             self.assertTrue(report["context_ready"])
             self.assertFalse(report["execution_ready"])
-            self.assertEqual(report["status"], "blocked")
+            self.assertEqual(report["status"], "failed")
 
     def test_coverage_detects_method_url_query_and_body_drift(self):
         coverage = load_script("check_api_coverage")
@@ -1289,10 +1289,13 @@ class RegressionTests(unittest.TestCase):
             index = contracts / "index.yaml"
             index.write_text(json.dumps({"generated_cases": 0, "modules": []}), encoding="utf-8")
             config, _ = execution_fixture(root)
+            bruno_root = root / "bruno"
+            bruno_root.mkdir()
+            (bruno_root / "collection.bru").write_text(materializer.COLLECTION_TEMPLATE, encoding="utf-8")
             before = index.read_text(encoding="utf-8")
             materializer.materialize(
                 contracts,
-                root / "bruno",
+                bruno_root,
                 execution_config_path=config,
                 module_filter="模块一",
             )
@@ -1326,6 +1329,8 @@ class RegressionTests(unittest.TestCase):
             full = root / "full"
             scoped = root / "scoped"
             materializer.materialize(contracts, full, execution_config_path=config)
+            scoped.mkdir()
+            (scoped / "collection.bru").write_text(materializer.COLLECTION_TEMPLATE, encoding="utf-8")
             for module_id, _ in modules:
                 materializer.materialize(
                     contracts,
@@ -1362,13 +1367,13 @@ class RegressionTests(unittest.TestCase):
             errors = coverage.validate_module_documentation(path, [{"id": "USER_CREATE_OK"}])
             self.assertTrue(any("sequenceDiagram" in error for error in errors))
 
-    def test_seres_sign_algorithm_and_header_names_are_fixed(self):
+    def test_optional_sha256_sign_algorithm_and_header_names_are_fixed(self):
         execution_config = load_script("execution_config")
         config = execution_config.validate_execution_config({
             "active_environment": "local",
             "tooling": "project-scripts",
             "coverage_profile": "full-matrix",
-            "sign": {"provider": "seres", "version": "v1"},
+            "sign": {"provider": "sha256", "version": "v1"},
         })
         script = execution_config.COLLECTION_TEMPLATE
         self.assertEqual(
@@ -1397,11 +1402,11 @@ class RegressionTests(unittest.TestCase):
         })
         environment = {
             "vars": {"BASE_URL": "http://localhost", "SERVICE_TOKEN": "secret"},
-            "headers": {"Authorization": "Bearer {{SERVICE_TOKEN}}", "operatorInfo": "qa"},
+            "headers": {"Authorization": "Bearer {{SERVICE_TOKEN}}", "X-Tenant-Id": "qa"},
         }
         payload = json.loads(execution_config.runtime_payload(config, environment))
         self.assertEqual(payload["headers"]["Authorization"], "Bearer secret")
-        self.assertEqual(payload["headers"]["operatorInfo"], "qa")
+        self.assertEqual(payload["headers"]["X-Tenant-Id"], "qa")
         script = execution_config.COLLECTION_TEMPLATE
         self.assertIn("runtimeConfig.headers", script)
         self.assertIn("if (value === undefined || value === null || value === \"\") return", script)
@@ -1429,13 +1434,13 @@ class RegressionTests(unittest.TestCase):
         )
         original = "script:pre-request {\n  console.log('业务前置');\n}\nassert {\n}\n"
         excluded_case = {
-            "id": "USER_WITHOUT_OPERATOR",
-            "request": {"omit_common_headers": ["operatorInfo", "X-Trace"]},
+            "id": "USER_WITHOUT_TENANT",
+            "request": {"omit_common_headers": ["X-Tenant-Id", "X-Trace"]},
         }
         merged = materializer.ensure_request_script(original, excluded_case)
         self.assertEqual(merged.count("script:pre-request"), 1)
         self.assertIn("console.log('业务前置')", merged)
-        self.assertIn('req.deleteHeaders(["operatorInfo", "X-Trace"])', merged)
+        self.assertIn('req.deleteHeaders(["X-Tenant-Id", "X-Trace"])', merged)
         disabled = materializer.ensure_request_script(merged, {"id": "USER_NORMAL"})
         self.assertNotIn(materializer.OMIT_MARKER, disabled)
         self.assertIn("console.log('业务前置')", disabled)
@@ -1575,7 +1580,7 @@ class RegressionTests(unittest.TestCase):
                     encoding="utf-8",
                 )
                 self.assertEqual(result.returncode, 2)
-                self.assertIn('"status": "blocked"', result.stdout)
+                self.assertIn('"status": "failed"', result.stdout)
 
     def test_filesystem_version_digest_change_is_conservative(self):
         checker = load_script("check_version_compatibility")
@@ -1873,6 +1878,7 @@ class RegressionTests(unittest.TestCase):
             bru = root / "bruno" / "things"
             module.mkdir(parents=True)
             bru.mkdir(parents=True)
+            load_script("qa_constraints").ensure_rule_library(root)
             endpoint = {
                 "version": 1,
                 "module": "things",
@@ -1911,7 +1917,7 @@ class RegressionTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (bru / "01-查询事物列表成功.bru").write_text(
-                "meta {\n  name: THING_LIST_OK\n  type: http\n  tags: [read-only]\n}\nget {\n  url: {{BASE_URL}}/things\n}\nassert {\n  res.status: eq 200\n  res.body.code: eq 0\n  res.body.data: eq {}\n}\n",
+                "meta {\n  name: THING_LIST_OK\n  type: http\n}\nget {\n  url: {{BASE_URL}}/things\n}\nassert {\n  res.status: eq 200\n  res.body.code: eq 0\n  res.body.data: eq {}\n}\n",
                 encoding="utf-8",
             )
             result = subprocess.run(
@@ -1949,7 +1955,7 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(verified.returncode, 1)
             verified_report = json.loads(verified.stdout)
             self.assertFalse(verified_report["completion_ok"])
-            self.assertEqual(verified_report["status"], "blocked")
+            self.assertEqual(verified_report["status"], "failed")
             self.assertTrue(any("completion requires --require-scenarios" in error for error in verified_report["errors"]))
 
     def test_module_execution_reports_verified_without_changing_global_state(self):
@@ -1993,7 +1999,6 @@ class RegressionTests(unittest.TestCase):
                 "title": "查询事物列表成功",
                 "endpoint_id": "THING_LIST",
                 "scenario": "success",
-                "risk": "read-only",
                 "expected": {"http_status": 200, "business_code": 0},
                 "assertions": [{"path": "$.data", "equals": {}}],
                 "bru": "01-查询事物列表成功.bru",
@@ -2012,7 +2017,7 @@ class RegressionTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (bru / case["bru"]).write_text(
-                "meta {\n  name: THING_LIST_OK\n  type: http\n  tags: [read-only]\n}\n"
+                "meta {\n  name: THING_LIST_OK\n  type: http\n}\n"
                 "get {\n  url: {{BASE_URL}}/things\n}\n"
                 "assert {\n  res.status: eq 200\n  res.body.code: eq 0\n  res.body.data: eq {}\n}\n",
                 encoding="utf-8",
@@ -2038,6 +2043,9 @@ class RegressionTests(unittest.TestCase):
                 encoding="utf-8",
             )
             qa_lock.write(contracts)
+            qa_constraints = load_script("qa_constraints")
+            qa_constraints.ensure_rule_library(root)
+            qa_constraints.write_module_lock(root, "things")
             evidence = root / "evidence.json"
             evidence.write_text(json.dumps({"executed": [case["id"]], "passed": [case["id"]]}), encoding="utf-8")
             preflight = root / "preflight.json"
@@ -2126,19 +2134,18 @@ class RegressionTests(unittest.TestCase):
         coverage = load_script("check_api_coverage")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            title = "批量更新 AC 信息成功"
+            title = "批量更新资源成功"
             case = {
-                "id": "AC_BATCH_UPDATE_SUCCESS",
+                "id": "RESOURCE_BATCH_UPDATE_SUCCESS",
                 "title": title,
-                "endpoint_id": "AC_BATCH_UPDATE",
+                "endpoint_id": "RESOURCE_BATCH_UPDATE",
                 "bru": f"01-{title}.bru",
-                "risk": "isolated-write",
                 "request": {
                     "body_type": "application/json",
                     "body": {
                         "payload": {
                             "pdid": "p-1",
-                            "items": [{"url": "https://example.invalid/ac", "totalNum": 2}],
+                            "items": [{"url": "https://example.invalid/resources/1", "totalNum": 2}],
                         }
                     },
                 },
@@ -2146,15 +2153,15 @@ class RegressionTests(unittest.TestCase):
                 "assertions": [{"path": "$.data.accepted", "equals": True}],
             }
             (root / case["bru"]).write_text(
-                "meta {\n  name: AC_BATCH_UPDATE_SUCCESS\n  type: http\n  tags: [isolated-write]\n}\n"
-                "post {\n  url: {{BASE_URL}}/ac/batch\n  body: json\n}\n"
+                "meta {\n  name: RESOURCE_BATCH_UPDATE_SUCCESS\n  type: http\n}\n"
+                "post {\n  url: {{BASE_URL}}/resources/batch\n  body: json\n}\n"
                 "body:json {\n"
                 "  {\n    \"payload\": {\n      \"pdid\": \"p-1\",\n"
-                "      \"items\": [{\"url\": \"https://example.invalid/ac\", \"totalNum\": 2}]\n    }\n  }\n"
+                "      \"items\": [{\"url\": \"https://example.invalid/resources/1\", \"totalNum\": 2}]\n    }\n  }\n"
                 "}\nassert {\n  res.status: eq 200\n  res.body.data.accepted: eq true\n}\n",
                 encoding="utf-8",
             )
-            endpoint = {"id": "AC_BATCH_UPDATE", "method": "POST", "path": "/ac/batch"}
+            endpoint = {"id": "RESOURCE_BATCH_UPDATE", "method": "POST", "path": "/resources/batch"}
             _, _, _, errors = coverage.case_files([case], root, {endpoint["id"]: endpoint})
             self.assertEqual(errors, [])
 
@@ -2167,35 +2174,34 @@ class RegressionTests(unittest.TestCase):
         coverage = load_script("check_api_coverage")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            title = "新增 AC 信息成功"
+            title = "新增资源成功"
             case = {
-                "id": "AC_CREATE_SUCCESS",
+                "id": "RESOURCE_CREATE_SUCCESS",
                 "title": title,
-                "endpoint_id": "AC_CREATE",
+                "endpoint_id": "RESOURCE_CREATE",
                 "bru": f"01-{title}.bru",
-                "risk": "isolated-write",
                 "request": {"body_type": "application/json", "body": {"pdid": "p-1"}},
                 "expected": {"http_status": 200},
                 "assertions": [{"path": "$.data.id", "equals": "1"}],
             }
             (root / case["bru"]).write_text(
-                "meta {\n  name: AC_CREATE_SUCCESS\n  type: http\n  tags: [isolated-write]\n}\n"
-                "post {\n  url: {{BASE_URL}}/ac\n  body: json\n}\n"
+                "meta {\n  name: RESOURCE_CREATE_SUCCESS\n  type: http\n}\n"
+                "post {\n  url: {{BASE_URL}}/resources\n  body: json\n}\n"
                 "body:json {\n  {\"pdid\": \"p-1\",}\n}\n"
                 "assert {\n  res.status: eq 200\n  res.body.data.id: eq \"1\"\n}\n",
                 encoding="utf-8",
             )
-            endpoint = {"id": "AC_CREATE", "method": "POST", "path": "/ac"}
+            endpoint = {"id": "RESOURCE_CREATE", "method": "POST", "path": "/resources"}
             _, _, _, errors = coverage.case_files([case], root, {endpoint["id"]: endpoint})
             self.assertTrue(any("invalid JSON at line" in error and "column" in error for error in errors), errors)
 
     def test_seed_titles_use_endpoint_business_semantics(self):
         parser = load_script("parse_openapi")
         cases = (
-            ({"id": "LIST", "method": "GET", "operation_id": "listByPage", "tags": ["AC"], "responses": {"200": {}}}, "分页查询 AC 信息成功"),
-            ({"id": "GROUP", "method": "POST", "operation_id": "batchChangeGroup", "tags": ["AC"], "responses": {"200": {}}}, "批量变更 AC 分组成功"),
-            ({"id": "DELETE", "method": "DELETE", "operation_id": "batchDelete", "tags": ["AC"], "responses": {"200": {}}}, "批量删除 AC 信息成功"),
-            ({"id": "IMPORT", "method": "POST", "operation_id": "importAc", "tags": ["AC"], "responses": {"202": {}}}, "导入 AC 文件成功受理"),
+            ({"id": "LIST", "method": "GET", "operation_id": "listByPage", "tags": ["Resource"], "responses": {"200": {}}}, "分页查询 Resource 信息成功"),
+            ({"id": "GROUP", "method": "POST", "operation_id": "batchChangeGroup", "tags": ["Resource"], "responses": {"200": {}}}, "批量变更 Resource 分组成功"),
+            ({"id": "DELETE", "method": "DELETE", "operation_id": "batchDelete", "tags": ["Resource"], "responses": {"200": {}}}, "批量删除 Resource 信息成功"),
+            ({"id": "IMPORT", "method": "POST", "operation_id": "importResource", "tags": ["Resource"], "responses": {"202": {}}}, "导入 Resource 文件成功受理"),
         )
         for endpoint, expected in cases:
             self.assertEqual(parser.seed_contract_cases(endpoint)[0]["title"], expected)
@@ -2203,14 +2209,14 @@ class RegressionTests(unittest.TestCase):
     def test_scenario_matrix_is_inferred_from_real_contract_features(self):
         parser = load_script("parse_openapi")
         endpoint = {
-            "id": "AC_LIST",
+            "id": "RESOURCE_LIST",
             "method": "GET",
-            "path": "/v1/admin/ac",
+            "path": "/v1/resources",
             "security": [{"bearerAuth": []}],
             "parameters": [
                 {"name": "pageNum", "in": "query", "schema": {"type": "integer", "minimum": 1}},
                 {"name": "status", "in": "query", "schema": {"type": "string", "enum": ["ON", "OFF"]}},
-                {"name": "operatorInfo", "in": "header", "required": True, "schema": {"type": "string"}},
+                {"name": "X-Tenant-Id", "in": "header", "required": True, "schema": {"type": "string"}},
             ],
             "responses": {"200": {}, "400": {}},
         }
@@ -2222,9 +2228,9 @@ class RegressionTests(unittest.TestCase):
         self.assertTrue(matrix["validation"]["applicable"])
         self.assertTrue(all(item["status"] in {"inferred", "confirmed"} for item in matrix.values()))
         seeded_ids = {case["id"] for case in parser.seed_contract_cases(endpoint)}
-        self.assertIn("AC_LIST_MISSING_OPERATORINFO", seeded_ids)
-        self.assertIn("AC_LIST_INVALID_STATUS", seeded_ids)
-        self.assertIn("AC_LIST_BOUNDARY_PAGENUM", seeded_ids)
+        self.assertIn("RESOURCE_LIST_MISSING_X_TENANT_ID", seeded_ids)
+        self.assertIn("RESOURCE_LIST_INVALID_STATUS", seeded_ids)
+        self.assertIn("RESOURCE_LIST_BOUNDARY_PAGENUM", seeded_ids)
 
     def test_script_bundle_sync_is_versioned_and_checkable(self):
         manager = load_script("scripts_manager")
@@ -2239,7 +2245,7 @@ class RegressionTests(unittest.TestCase):
             (qa_root / "scripts" / "run_bruno.py").write_text("outdated", encoding="utf-8")
             self.assertTrue(any("outdated" in error for error in manager.check_scripts(qa_root, ROOT / "scripts")))
 
-    def test_scope_risks_are_reported_without_confirmation_flags(self):
+    def test_scope_cases_do_not_filter_arbitrary_case_metadata(self):
         runner = load_script("run_bruno")
         with tempfile.TemporaryDirectory() as directory:
             contracts = Path(directory) / "contracts"
@@ -2250,12 +2256,10 @@ class RegressionTests(unittest.TestCase):
             }), encoding="utf-8")
             (module / "cases.yaml").write_text(json.dumps({
                 "cases": [
-                    {"id": "APP_GET_OK", "endpoint_id": "APP_GET", "risk": "read-only"},
-                    {"id": "APP_POST_OK", "endpoint_id": "APP_POST", "risk": "isolated-write"},
+                    {"id": "APP_GET_OK", "endpoint_id": "APP_GET", "legacy_classification": "a"},
+                    {"id": "APP_POST_OK", "endpoint_id": "APP_POST", "legacy_classification": "b"},
                 ],
             }), encoding="utf-8")
-            risks = runner.scope_risks(contracts, "APP")
-            self.assertEqual(risks, {"read-only", "isolated-write"})
             cases = runner.scope_cases(contracts, "APP")
             self.assertEqual([case["id"] for case in cases], ["APP_GET_OK", "APP_POST_OK"])
 
@@ -2294,42 +2298,39 @@ class RegressionTests(unittest.TestCase):
             self.assertTrue(any("was not checked" in warning for warning in runner.target_version_warnings(environment, contracts)))
 
             first_log = runner.log_path(root, None)
-            second_log = runner.log_path(root, "AC-信息")
+            second_log = runner.log_path(root, "users")
             self.assertIn("run-bruno-all.log", first_log.name)
-            self.assertIn("run-bruno-AC-信息.log", second_log.name)
+            self.assertIn("run-bruno-users.log", second_log.name)
             output = io.StringIO()
             with mock.patch("sys.stdout", output):
-                total, passed, failed = runner.render_case_summary(
+                total, executed, passed, failed, not_executed = runner.render_case_summary(
                     [{"id": "A", "title": "成功"}, {"id": "B", "title": "失败"}],
                     {"executed": ["A", "B"], "passed": ["A"]},
                 )
-            self.assertEqual((total, passed, failed), (2, 1, ["B"]))
+            self.assertEqual((total, executed, passed, failed, not_executed), (2, 2, 1, ["B"], []))
             self.assertIn("[PASS] A", output.getvalue())
             self.assertIn("[FAIL] B", output.getvalue())
 
-    def test_materializer_removes_obsolete_plan_tags(self):
+    def test_materializer_removes_all_meta_tags(self):
         materializer = load_script("materialize_missing_bru")
         content = (
             "meta {\n  name: APP_LIST_OK\n  type: http\n"
-            "  tags: [read-only, plan-smoke, plan-full]\n}\n"
+            "  tags: [legacy, plan-smoke, plan-full]\n}\n"
             "get {\n  url: {{baseUrl}}/app\n}\n"
         )
-        updated = materializer.ensure_execution_tags(content, ["read-only"])
-        self.assertIn("tags: [read-only]", updated)
-        self.assertNotIn("plan-", updated)
+        updated = materializer.strip_meta_tags(content)
+        self.assertNotIn("tags:", updated)
         rendered = materializer.render_case(
             {
                 "id": "APP_LIST_OK",
                 "title": "查询应用列表成功",
-                "risk": "read-only",
                 "_execution_tags": ["plan-smoke"],
                 "expected": {"http_status": 200},
                 "assertions": [{"path": "$.data", "equals": {}}],
             },
             {"method": "GET", "path": "/app"},
         )
-        self.assertIn("tags: [read-only]", rendered)
-        self.assertNotIn("plan-", rendered)
+        self.assertNotIn("tags:", rendered)
 
     def test_full_matrix_adds_query_and_declared_file_constraint_cases(self):
         parser = load_script("parse_openapi")
@@ -2379,20 +2380,20 @@ class RegressionTests(unittest.TestCase):
             spec.parent.mkdir(parents=True)
             document = {
                 "openapi": "3.0.0",
-                "paths": {"/ac": {"get": {
+                "paths": {"/resources": {"get": {
                     "operationId": "listByPage",
-                    "tags": ["AC"],
+                    "tags": ["Resources"],
                     "responses": {"200": {}},
                 }}},
             }
             spec.write_text(json.dumps(document), encoding="utf-8")
-            module_map.write_text(json.dumps({"modules": [{"id": "ac", "name": "AC", "directory": "AC", "swagger_tags": ["AC"]}]}), encoding="utf-8")
+            module_map.write_text(json.dumps({"modules": [{"id": "resources", "name": "Resources", "directory": "Resources", "swagger_tags": ["Resources"]}]}), encoding="utf-8")
             manifest = parser.extract(spec, document)
             parser.write_partitioned(manifest, module_map, output, seed_cases=True)
             second = parser.write_partitioned(manifest, module_map, output, seed_cases=True, incremental=True)
             self.assertEqual(second["changed_modules"], [])
-            self.assertEqual(second["skipped_modules"], ["ac"])
-            cases_path = output / "AC" / "cases.yaml"
+            self.assertEqual(second["skipped_modules"], ["resources"])
+            cases_path = output / "Resources" / "cases.yaml"
             cases = parser.load_document(cases_path)
             cases["cases"][0]["description"] = "人工调整后的业务说明"
             cases_path.write_text(parser.render_manifest(cases, cases_path), encoding="utf-8")
@@ -2408,37 +2409,37 @@ class RegressionTests(unittest.TestCase):
         scanner = load_script("analyze_source_logic")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "AcController.java").write_text(
-                'class AcController {\n'
-                '  private final AcApplication application;\n'
+            (root / "ResourceController.java").write_text(
+                'class ResourceController {\n'
+                '  private final ResourceApplication application;\n'
                 '  @DeleteMapping\n'
-                '  public Object deleteAc() { request.getHeader("operatorInfo"); return application.deleteAc(); }\n'
+                '  public Object deleteResource() { request.getHeader("X-Tenant-Id"); return application.deleteResource(); }\n'
                 '}\n',
                 encoding="utf-8",
             )
-            (root / "AcApplication.java").write_text(
-                'class AcApplication {\n'
-                '  private final AcDomainService domainService;\n'
-                '  public Object deleteAc() { return domainService.deleteAc(); }\n'
+            (root / "ResourceApplication.java").write_text(
+                'class ResourceApplication {\n'
+                '  private final ResourceDomainService domainService;\n'
+                '  public Object deleteResource() { return domainService.deleteResource(); }\n'
                 '}\n',
                 encoding="utf-8",
             )
-            (root / "AcDomainService.java").write_text(
-                'class AcDomainService {\n'
-                '  public Object deleteAc() { throw new MnoTrafficApplicationException(MnoTrafficErrorCodeEnum.GROUP_IN_USE); }\n'
+            (root / "ResourceDomainService.java").write_text(
+                'class ResourceDomainService {\n'
+                '  public Object deleteResource() { throw new ResourceApplicationException(ResourceErrorCode.RESOURCE_IN_USE); }\n'
                 '}\n',
                 encoding="utf-8",
             )
-            (root / "MnoTrafficErrorCodeEnum.java").write_text(
-                'enum MnoTrafficErrorCodeEnum { GROUP_IN_USE(143000); }\n',
+            (root / "ResourceErrorCode.java").write_text(
+                'enum ResourceErrorCode { RESOURCE_IN_USE(4091); }\n',
                 encoding="utf-8",
             )
             result = scanner.scan([root])
         required = [item for item in result["candidates"] if item.get("coverage_required")]
-        self.assertTrue(any(item.get("required_header") == "operatorInfo" for item in required))
-        self.assertTrue(any("143000" in item.get("expected_business_codes", []) for item in required))
+        self.assertTrue(any(item.get("required_header") == "X-Tenant-Id" for item in required))
+        self.assertTrue(any("4091" in item.get("expected_business_codes", []) for item in required))
 
-    def test_rcp_and_traffic_java_structures_resolve_real_delegator_entrypoints(self):
+    def test_java_structures_resolve_delegator_and_integration_entrypoints(self):
         scanner = load_script("analyze_java_logic")
 
         def write_sources(root: Path, sources: dict[str, str]) -> None:
@@ -2448,78 +2449,78 @@ class RegressionTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            rcp = root / "rcp"
-            write_sources(rcp, {
-                "RcpController.java": (
-                    '@RequestMapping("/v1/rcp")\nclass RcpController {\n'
+            catalog = root / "catalog"
+            write_sources(catalog, {
+                "CatalogController.java": (
+                    '@RequestMapping("/v1/catalog")\nclass CatalogController {\n'
                     '  private final ApplicationDelegator delegator;\n'
                     '  @PostMapping(\n    path = "/items"\n  )\n'
                     '  public ResponseEntity<\n      Object> create() throws Exception {\n'
-                    '    return delegator.apply(new CreateRcpApplication());\n  }\n}\n'
+                    '    return delegator.apply(new CreateCatalogItemApplication());\n  }\n}\n'
                 ),
-                "CreateRcpApplication.java": (
-                    'class CreateRcpApplication {\n  private final RcpDomainService domainService;\n'
+                "CreateCatalogItemApplication.java": (
+                    'class CreateCatalogItemApplication {\n  private final CatalogDomainService domainService;\n'
                     '  public Object doServe() throws Exception { return domainService.create(); }\n}\n'
                 ),
-                "RcpDomainService.java": (
-                    'class RcpDomainService {\n  public Object create() { '
-                    'throw new MnoRcpApplicationException(MnoRcpErrorCode.INVALID_ITEM); }\n}\n'
+                "CatalogDomainService.java": (
+                    'class CatalogDomainService {\n  public Object create() { '
+                    'throw new CatalogApplicationException(CatalogErrorCode.INVALID_ITEM); }\n}\n'
                 ),
-                "MnoRcpApplicationException.java": (
-                    'class MnoRcpApplicationException extends RuntimeException {\n'
-                    '  public MnoRcpApplicationException(MnoRcpErrorCode code) {}\n}\n'
+                "CatalogApplicationException.java": (
+                    'class CatalogApplicationException extends RuntimeException {\n'
+                    '  public CatalogApplicationException(CatalogErrorCode code) {}\n}\n'
                 ),
-                "MnoRcpErrorCode.java": 'enum MnoRcpErrorCode { INVALID_ITEM(100009); }\n',
-                "RcpAdvice.java": (
-                    '@ControllerAdvice\nclass RcpAdvice {\n'
-                    '  @ExceptionHandler(MnoRcpApplicationException.class)\n'
-                    '  public Object handle(MnoRcpApplicationException error) { return error; }\n}\n'
+                "CatalogErrorCode.java": 'enum CatalogErrorCode { INVALID_ITEM("CATALOG_INVALID_ITEM"); }\n',
+                "CatalogAdvice.java": (
+                    '@ControllerAdvice\nclass CatalogAdvice {\n'
+                    '  @ExceptionHandler(CatalogApplicationException.class)\n'
+                    '  public Object handle(CatalogApplicationException error) { return error; }\n}\n'
                 ),
             })
-            traffic = root / "traffic"
-            write_sources(traffic, {
-                "TrafficController.java": (
-                    '@RequestMapping("/v1/traffic")\nclass TrafficController {\n'
+            orders = root / "orders"
+            write_sources(orders, {
+                "OrderController.java": (
+                    '@RequestMapping("/v1/orders")\nclass OrderController {\n'
                     '  private final ApplicationDelegator delegator;\n'
-                    '  private final DeleteTrafficApplication deleteApplication;\n'
-                    '  @DeleteMapping(path = "ac/{id}")\n'
+                    '  private final DeleteOrderItemApplication deleteApplication;\n'
+                    '  @DeleteMapping(path = "items/{id}")\n'
                     '  public Object delete() throws Exception { return delegator.apply(deleteApplication); }\n}\n'
                 ),
-                "DeleteTrafficApplication.java": (
-                    'class DeleteTrafficApplication {\n  private final TrafficDomainService domainService;\n'
+                "DeleteOrderItemApplication.java": (
+                    'class DeleteOrderItemApplication {\n  private final OrderDomainService domainService;\n'
                     '  public Object doServe() { return domainService.delete(); }\n}\n'
                 ),
-                "TrafficDomainService.java": (
-                    'class TrafficDomainService {\n  private final TrafficIntegration integration;\n'
+                "OrderDomainService.java": (
+                    'class OrderDomainService {\n  private final OrderIntegration integration;\n'
                     '  public Object delete() { return integration.delete(); }\n}\n'
                 ),
-                "TrafficIntegration.java": (
-                    'class TrafficIntegration {\n  public Object delete() { '
-                    'throw new MnoTrafficApplicationException(MnoTrafficErrorCodeEnum.GROUP_IN_USE); }\n}\n'
+                "OrderIntegration.java": (
+                    'class OrderIntegration {\n  public Object delete() { '
+                    'throw new OrderApplicationException(OrderErrorCode.ITEM_IN_USE); }\n}\n'
                 ),
-                "MnoTrafficApplicationException.java": (
-                    'class MnoTrafficApplicationException extends RuntimeException {\n'
-                    '  public MnoTrafficApplicationException(MnoTrafficErrorCodeEnum code) {}\n}\n'
+                "OrderApplicationException.java": (
+                    'class OrderApplicationException extends RuntimeException {\n'
+                    '  public OrderApplicationException(OrderErrorCode code) {}\n}\n'
                 ),
-                "MnoTrafficErrorCodeEnum.java": 'enum MnoTrafficErrorCodeEnum { GROUP_IN_USE(143000); }\n',
+                "OrderErrorCode.java": 'enum OrderErrorCode { ITEM_IN_USE(4091); }\n',
             })
 
-            rcp_result = scanner.scan([rcp])
-            traffic_result = scanner.scan([traffic])
+            catalog_result = scanner.scan([catalog])
+            order_result = scanner.scan([orders])
 
-        self.assertEqual(rcp_result["errors"], [])
-        self.assertEqual(rcp_result["entrypoint_count"], 1)
-        self.assertEqual(rcp_result["exception_family"]["exception_type"], "MnoRcpApplicationException")
-        rcp_business = [item for item in rcp_result["candidates"] if item["kind"] == "business_exception"]
-        self.assertTrue(any("POST /v1/rcp/items" in item["endpoint_keys"] for item in rcp_business))
-        self.assertTrue(any("100009" in item.get("expected_business_codes", []) for item in rcp_business))
+        self.assertEqual(catalog_result["errors"], [])
+        self.assertEqual(catalog_result["entrypoint_count"], 1)
+        self.assertEqual(catalog_result["exception_family"]["exception_type"], "CatalogApplicationException")
+        catalog_business = [item for item in catalog_result["candidates"] if item["kind"] == "business_exception"]
+        self.assertTrue(any("POST /v1/catalog/items" in item["endpoint_keys"] for item in catalog_business))
+        self.assertTrue(any("CATALOG_INVALID_ITEM" in item.get("expected_business_codes", []) for item in catalog_business))
 
-        self.assertEqual(traffic_result["errors"], [])
-        self.assertEqual(traffic_result["entrypoint_count"], 1)
-        self.assertEqual(traffic_result["exception_family"]["exception_type"], "MnoTrafficApplicationException")
-        traffic_business = [item for item in traffic_result["candidates"] if item["kind"] == "business_exception"]
-        self.assertTrue(any("DELETE /v1/traffic/ac/{id}" in item["endpoint_keys"] for item in traffic_business))
-        self.assertTrue(any("143000" in item.get("expected_business_codes", []) for item in traffic_business))
+        self.assertEqual(order_result["errors"], [])
+        self.assertEqual(order_result["entrypoint_count"], 1)
+        self.assertEqual(order_result["exception_family"]["exception_type"], "OrderApplicationException")
+        order_business = [item for item in order_result["candidates"] if item["kind"] == "business_exception"]
+        self.assertTrue(any("DELETE /v1/orders/items/{id}" in item["endpoint_keys"] for item in order_business))
+        self.assertTrue(any("4091" in item.get("expected_business_codes", []) for item in order_business))
 
     def test_java_scanner_blocks_when_mappings_exist_but_no_entrypoint_is_parsed(self):
         scanner = load_script("analyze_java_logic")
@@ -2538,25 +2539,25 @@ class RegressionTests(unittest.TestCase):
         scanner = load_script("analyze_source_logic")
         with tempfile.TemporaryDirectory() as directory:
             contracts = Path(directory) / "contracts"
-            module = contracts / "modules" / "AC"
+            module = contracts / "modules" / "resources"
             module.mkdir(parents=True)
             endpoint = {
-                "id": "AC_DELETE", "method": "DELETE", "path": "/ac",
+                "id": "RESOURCE_DELETE", "method": "DELETE", "path": "/resources/{id}",
                 "responses": {"200": {}}, "scenario_matrix": {}, "case_ids": [],
             }
             (module / "endpoints.yaml").write_text(
-                yaml.safe_dump({"module": "ac", "endpoints": [endpoint]}, sort_keys=False), encoding="utf-8",
+                yaml.safe_dump({"module": "resources", "endpoints": [endpoint]}, sort_keys=False), encoding="utf-8",
             )
             (module / "cases.yaml").write_text(
-                yaml.safe_dump({"module": "ac", "cases": []}, sort_keys=False), encoding="utf-8",
+                yaml.safe_dump({"module": "resources", "cases": []}, sort_keys=False), encoding="utf-8",
             )
             (module / "logic.yaml").write_text(
-                yaml.safe_dump({"module": "ac", "logic": []}, sort_keys=False), encoding="utf-8",
+                yaml.safe_dump({"module": "resources", "logic": []}, sort_keys=False), encoding="utf-8",
             )
             result = {"version": 2, "candidates": [{
                 "id": "BUSINESS_NO_STATUS", "kind": "business_exception", "coverage_required": True,
-                "endpoint_keys": ["DELETE /ac"], "expected_business_codes": ["143000"],
-                "file": "TrafficDomainService.java", "line": 10, "evidence": "GROUP_IN_USE",
+                "endpoint_keys": ["DELETE /resources/{id}"], "expected_business_codes": ["4091"],
+                "file": "ResourceDomainService.java", "line": 10, "evidence": "RESOURCE_IN_USE",
             }]}
             unresolved = scanner.apply_candidates(result, contracts)
             cases = load_script("manifest_io").first_list(
@@ -2572,84 +2573,387 @@ class RegressionTests(unittest.TestCase):
             root = Path(directory)
             source = root / "source"
             source.mkdir()
-            (source / "AcController.java").write_text(
-                'class AcController {\n'
-                '  private final AcApplication application;\n'
+            (source / "ResourceController.java").write_text(
+                'class ResourceController {\n'
+                '  private final ResourceApplication application;\n'
                 '  @DeleteMapping\n'
-                '  public Object deleteAc() { request.getHeader("operatorInfo"); return application.deleteAc(); }\n'
+                '  public Object deleteResource() { request.getHeader("X-Tenant-Id"); return application.deleteResource(); }\n'
                 '}\n',
                 encoding="utf-8",
             )
-            (source / "AcApplication.java").write_text(
-                'class AcApplication {\n'
-                '  private final AcDomainService domainService;\n'
-                '  public Object deleteAc() { return domainService.deleteAc(); }\n'
+            (source / "ResourceApplication.java").write_text(
+                'class ResourceApplication {\n'
+                '  private final ResourceDomainService domainService;\n'
+                '  public Object deleteResource() { return domainService.deleteResource(); }\n'
                 '}\n',
                 encoding="utf-8",
             )
-            (source / "AcDomainService.java").write_text(
-                'class AcDomainService {\n'
-                '  public Object deleteAc() { throw new MnoTrafficApplicationException(MnoTrafficErrorCodeEnum.GROUP_IN_USE); }\n'
+            (source / "ResourceDomainService.java").write_text(
+                'class ResourceDomainService {\n'
+                '  public Object deleteResource() { throw new ResourceApplicationException(ResourceErrorCode.RESOURCE_IN_USE); }\n'
                 '}\n',
                 encoding="utf-8",
             )
-            (source / "MnoTrafficErrorCodeEnum.java").write_text(
-                'enum MnoTrafficErrorCodeEnum { GROUP_IN_USE(143000); }\n',
+            (source / "ResourceErrorCode.java").write_text(
+                'enum ResourceErrorCode { RESOURCE_IN_USE(4091); }\n',
                 encoding="utf-8",
             )
             contracts = root / "qa" / "contracts"
-            module = contracts / "modules" / "AC"
+            module = contracts / "modules" / "resources"
             module.mkdir(parents=True)
             (contracts / "security-profile.yaml").write_text(
                 yaml.safe_dump({
-                    "admin-operator-context": {
-                        "type": "audit-context",
-                        "header": "operatorInfo",
+                    "required-header-x-tenant-id": {
+                        "type": "required-header",
+                        "header": "X-Tenant-Id",
                         "probe_result": {"missing_header_status": 400},
                     },
                 }, sort_keys=False),
                 encoding="utf-8",
             )
             endpoint = {
-                "id": "AC_DELETE",
+                "id": "RESOURCE_DELETE",
                 "method": "DELETE",
-                "path": "/v0/admin/ac/{id}",
-                "operation_id": "deleteAc",
-                "tags": ["AC"],
+                "path": "/v1/resources/{id}",
+                "operation_id": "deleteResource",
+                "tags": ["Resources"],
                 "responses": {"200": {}, "400": {}},
             }
             endpoint["scenario_matrix"] = parser.inferred_scenario_matrix(endpoint)
             (module / "endpoints.yaml").write_text(
                 yaml.safe_dump({
                     "version": 1,
-                    "module": "ac",
-                    "name": "AC",
-                    "swagger_tag": "AC",
+                    "module": "resources",
+                    "name": "Resources",
+                    "swagger_tag": "Resources",
                     "endpoints": [endpoint],
                 }, sort_keys=False, allow_unicode=True),
                 encoding="utf-8",
             )
             (module / "cases.yaml").write_text(
-                yaml.safe_dump({"version": 1, "module": "ac", "swagger_tag": "AC", "cases": []}),
+                yaml.safe_dump({"version": 1, "module": "resources", "swagger_tag": "Resources", "cases": []}),
                 encoding="utf-8",
             )
             (module / "logic.yaml").write_text(
-                yaml.safe_dump({"version": 1, "module": "ac", "swagger_tag": "AC", "logic": []}),
+                yaml.safe_dump({"version": 1, "module": "resources", "swagger_tag": "Resources", "logic": []}),
                 encoding="utf-8",
             )
             result = scanner.scan([source])
             self.assertEqual(scanner.apply_candidates(result, contracts), [])
             cases = parser.load_document(module / "cases.yaml")["cases"]
-            header_case = next(case for case in cases if case["id"].endswith("MISSING_OPERATORINFO"))
-            self.assertEqual(header_case["request"]["omit_common_headers"], ["operatorInfo"])
+            header_case = next(case for case in cases if case["id"].endswith("MISSING_X_TENANT_ID"))
+            self.assertEqual(header_case["request"]["omit_common_headers"], ["X-Tenant-Id"])
             self.assertEqual(header_case["scenario"], "validation")
-            self.assertTrue(any(case.get("expected", {}).get("business_code") == "143000" for case in cases))
+            self.assertTrue(any(case.get("expected", {}).get("business_code") == "4091" for case in cases))
             updated_endpoint = parser.load_document(module / "endpoints.yaml")["endpoints"][0]
             self.assertFalse(updated_endpoint["scenario_matrix"]["authentication"]["applicable"])
             self.assertTrue(updated_endpoint["scenario_matrix"]["validation"]["applicable"])
             self.assertTrue(updated_endpoint["scenario_matrix"]["business_error"]["applicable"])
             logic = parser.load_document(module / "logic.yaml")["logic"]
             self.assertTrue(all(item.get("case_ids") for item in logic))
+
+    def test_source_constraints_extract_and_apply_project_evidence(self):
+        source_constraints = load_script("source_constraints")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "ProductOutput.java").write_text(
+                "class ProductOutput {\n"
+                "  @NotBlank\n  @Size(min = 8, max = 8)\n  private String sku;\n"
+                "  private ProductStatus status;\n}\n",
+                encoding="utf-8",
+            )
+            (root / "ZProductStatus.java").write_text(
+                "enum ProductStatus {\n  ACTIVE,\n  INACTIVE;\n}\n",
+                encoding="utf-8",
+            )
+            (root / "WarehouseRequest.kt").write_text(
+                "data class WarehouseRequest(\n  @field:NotBlank\n  val warehouseCode: String\n)\n",
+                encoding="utf-8",
+            )
+            (root / "application.yaml").write_text(
+                "qa:\n  region-code: R1\n  password: must-not-be-recorded\n",
+                encoding="utf-8",
+            )
+            flyway = root / "flyway"
+            flyway.mkdir()
+            (flyway / "V1__inventory.sql").write_text(
+                "CREATE TABLE inventory (\n"
+                "  serial_number VARCHAR(20) NOT NULL,\n"
+                "  UNIQUE KEY uk_inventory_serial_number (serial_number)\n"
+                ");\n",
+                encoding="utf-8",
+            )
+            (root / "ProductOutputTest.java").write_text(
+                'class ProductOutputTest { void test() { output.setRegionCode("R2"); } }\n',
+                encoding="utf-8",
+            )
+            (root / "ErrorCode.java").write_text(
+                'enum ErrorCode { INVALID_SKU("CATALOG_INVALID_SKU", "invalid sku"); }\n',
+                encoding="utf-8",
+            )
+
+            document = source_constraints.extract_source_constraints([root])
+            rules = {
+                name.casefold(): rule
+                for rule in document["field_rules"]
+                for name in rule.get("field_names", [])
+            }
+            self.assertTrue(rules["sku"]["constraints"]["required"])
+            self.assertEqual(rules["sku"]["constraints"]["minLength"], 8)
+            self.assertEqual(rules["status"]["constraints"]["enum"], ["ACTIVE", "INACTIVE"])
+            self.assertEqual(rules["regioncode"]["constraints"]["default"], "R1")
+            self.assertEqual(rules["regioncode"]["example"], "R2")
+            self.assertTrue(rules["serialnumber"]["constraints"]["unique"])
+            self.assertNotIn("password", rules)
+            self.assertEqual(document["error_codes"][0]["code"], "CATALOG_INVALID_SKU")
+            self.assertTrue(any(item["type_name"] == "ProductOutput" for item in document["response_rules"]))
+            for role in ("dto", "config", "flyway", "test", "exception_enum"):
+                self.assertIn(role, document["source_inventory"])
+
+            manifest = {"endpoints": [{
+                "parameters": [],
+                "request_body": {"content": {"application/json": {"schema": {
+                    "type": "object",
+                    "properties": {"sku": {"type": "string"}, "status": {}, "regionCode": {}},
+                }}}},
+                "responses": {},
+            }]}
+            source_constraints.apply_constraints_to_manifest(manifest, document)
+            schema = manifest["endpoints"][0]["request_body"]["content"]["application/json"]["schema"]
+            self.assertIn("sku", schema["required"])
+            self.assertEqual(schema["properties"]["status"]["enum"], ["ACTIVE", "INACTIVE"])
+            self.assertEqual(schema["properties"]["regionCode"]["default"], "R1")
+
+    def test_source_constraints_do_not_invent_domain_defaults(self):
+        source_constraints = load_script("source_constraints")
+        with tempfile.TemporaryDirectory() as directory:
+            document = source_constraints.extract_source_constraints([Path(directory)])
+        self.assertEqual(document["field_rules"], [])
+        self.assertEqual(document["error_codes"], [])
+
+    def test_shared_constraints_enforce_review_worker_boundary_and_secrets(self):
+        constraints = load_script("qa_constraints")
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = Path(directory)
+            module = qa_root / "contracts" / "modules" / "things"
+            module.mkdir(parents=True)
+            (module / "endpoints.yaml").write_text(json.dumps({
+                "module": "things",
+                "endpoints": [{"id": "THING_GET", "method": "GET", "path": "/things"}],
+            }), encoding="utf-8")
+            (module / "cases.yaml").write_text(json.dumps({"cases": [{
+                "id": "THING_GET_OK",
+                "endpoint_id": "THING_GET",
+                "request": {"query": {"regionCode": "review-regionCode"}},
+                "review_reasons": {"review-regionCode": "No source or local value exists"},
+            }]}), encoding="utf-8")
+            constraints.ensure_rule_library(qa_root)
+
+            unexplained = {
+                "id": "BAD",
+                "request": {"body": {"sku": "review-sku"}},
+            }
+            self.assertTrue(constraints.review_reason_errors(unexplained))
+            unexplained["review_reasons"] = {"review-sku": "No contract, source, evidence, or local value exists"}
+            self.assertEqual(constraints.review_reason_errors(unexplained), [])
+
+            missing_paths = constraints.validate_stage(
+                qa_root, "generation", module="things", actor="module-worker",
+            )
+            self.assertTrue(any("explicit changed paths" in error for error in missing_paths))
+            escaped = constraints.validate_stage(
+                qa_root,
+                "generation",
+                module="things",
+                actor="module-worker",
+                changed_paths=[qa_root / "contracts" / "index.yaml"],
+            )
+            self.assertTrue(any("coordinator-owned path" in error for error in escaped))
+            allowed = constraints.validate_stage(
+                qa_root,
+                "generation",
+                module="things",
+                actor="module-worker",
+                changed_paths=[module / "cases.yaml"],
+            )
+            self.assertEqual(allowed, [])
+
+            token = "eyJ" + "a" * 30 + "." + "b" * 12 + "." + "c" * 12
+            (qa_root / "constraints" / "source-rules.yaml").write_text(
+                yaml.safe_dump({"version": 1, "field_rules": [], "example": token}),
+                encoding="utf-8",
+            )
+            secret_errors = constraints.validate_stage(qa_root, "generation", module="things")
+            self.assertTrue(any("secret-free constraint" in error for error in secret_errors))
+
+    def test_execution_evidence_is_redacted_classified_and_merged(self):
+        normalizer = load_script("normalize_bruno_report")
+        runner = load_script("run_bruno")
+        raw = {"results": [{
+            "name": "THING_LIST_OK",
+            "assertionResults": [{"status": "pass"}],
+            "testResults": [],
+            "response": {"status": 200, "data": {
+                "code": 0,
+                "accessToken": "must-not-survive",
+                "data": {"pageNum": 1, "pageSize": 20, "total": 1, "records": [{"id": "thing-1"}]},
+            }},
+        }]}
+        normalized = normalizer.normalized_case_results(raw)
+        self.assertEqual(normalized["THING_LIST_OK"]["actual"]["body"]["accessToken"], "<redacted>")
+        cases = [
+            {
+                "id": "THING_LIST_OK", "endpoint_id": "THING_LIST", "_module": "things",
+                "_module_directory": "things", "_endpoint": {"method": "GET", "path": "/things"},
+                "expected": {"http_status": 200}, "assertions": [{"path": "$.code", "equals": 0}],
+            },
+            {
+                "id": "THING_LIST_BAD", "endpoint_id": "THING_LIST", "_module": "things",
+                "_module_directory": "things", "_endpoint": {"method": "GET", "path": "/things"},
+                "expected": {"http_status": 200}, "assertions": [{"path": "$.code", "equals": 0}],
+            },
+            {
+                "id": "THING_LIST_REVIEW", "endpoint_id": "THING_LIST", "_module": "things",
+                "_module_directory": "things", "_endpoint": {"method": "GET", "path": "/things"},
+                "request": {"query": {"regionCode": "review-regionCode"}},
+                "review_reasons": {"review-regionCode": "Source evidence is unavailable"},
+            },
+        ]
+        evidence = {
+            "executed": ["THING_LIST_OK", "THING_LIST_BAD"],
+            "passed": ["THING_LIST_OK"],
+            "cases": {
+                "THING_LIST_OK": normalized["THING_LIST_OK"],
+                "THING_LIST_BAD": {
+                    "status": "failed",
+                    "actual": {"http_status": 500, "body": {"code": 500}},
+                    "failure_reason": "expected 200 but received 500",
+                },
+            },
+        }
+        report = runner.result_report(cases, evidence, "all")
+        self.assertEqual(report["summary"], {"total": 3, "executed": 2, "passed": 1, "failed": 1, "not_executed": 1})
+        self.assertEqual([item["case_id"] for item in report["failures"]], ["THING_LIST_BAD"])
+        self.assertEqual([item["case_id"] for item in report["not_executed"]], ["THING_LIST_REVIEW"])
+        self.assertEqual(report["failures"][0]["failure_category"], "assertion_failure")
+        self.assertEqual(report["manual_confirmation"][0]["failure_categories"], ["insufficient_source_evidence", "manual_confirmation"])
+        for key in ("module", "case_id", "interface", "request_summary", "expected", "actual", "failure_reason", "needs_manual_confirmation"):
+            self.assertIn(key, report["failures"][0])
+
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = Path(directory)
+            first = {"version": 1, "executed": ["THING_LIST_OK"], "passed": ["THING_LIST_OK"], "cases": {
+                "THING_LIST_OK": normalized["THING_LIST_OK"],
+            }}
+            first_report, _, _ = runner.persist_execution_artifacts(qa_root, cases, first, "things")
+            second = {"version": 1, "executed": ["THING_LIST_BAD"], "passed": ["THING_LIST_BAD"], "cases": {
+                "THING_LIST_BAD": {"actual": {"http_status": 200, "body": {"code": 0}}},
+            }}
+            runner.persist_execution_artifacts(qa_root, cases, second, "things")
+            observed = yaml.safe_load(
+                (qa_root / "contracts" / "modules" / "things" / "observed-rules.yaml").read_text(encoding="utf-8")
+            )
+            self.assertEqual({item["case_id"] for item in observed["observations"]}, {"THING_LIST_OK", "THING_LIST_BAD"})
+            persisted_report = json.loads(first_report.read_text(encoding="utf-8"))
+            self.assertTrue(persisted_report["execution_evidence"].startswith("evidence/modules/things/"))
+
+    def test_successful_observation_upgrades_generated_assertions(self):
+        parser = load_script("parse_openapi")
+        source_constraints = load_script("source_constraints")
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = Path(directory)
+            spec = qa_root / "openapi.json"
+            document = {
+                "openapi": "3.0.0",
+                "tags": [{"name": "things"}],
+                "paths": {"/things": {"get": {
+                    "operationId": "listThings",
+                    "tags": ["things"],
+                    "responses": {"200": {"description": "ok", "content": {"application/json": {"schema": {
+                        "type": "object", "properties": {"code": {"type": "integer"}, "data": {"type": "object"}},
+                    }}}}},
+                }}},
+            }
+            spec.write_text(json.dumps(document), encoding="utf-8")
+            manifest = parser.extract(spec, document)
+            endpoint_id = manifest["endpoints"][0]["id"]
+            module_map = qa_root / "contracts" / "module-map.yaml"
+            module_map.parent.mkdir(parents=True)
+            module_map.write_text(json.dumps({
+                "modules": [{"id": "things", "name": "things", "swagger_tags": ["things"]}],
+            }), encoding="utf-8")
+            output = qa_root / "contracts" / "modules"
+            parser.write_partitioned(manifest, module_map, output, seed_cases=True)
+            cases_path = output / "things" / "cases.yaml"
+            first = parser.load_document(cases_path)["cases"]
+            success = next(case for case in first if case["scenario"] == "success")
+            self.assertTrue(success["review_required"])
+
+            source_constraints.apply_observed_constraints(manifest, {"observations": [{
+                "case_id": success["id"],
+                "endpoint_id": endpoint_id,
+                "evidence_file": "evidence/global/run.json",
+                "response": {"http_status": 200, "body": {
+                    "code": 0,
+                    "data": {"pageNum": 1, "pageSize": 20, "total": 1, "records": [{"id": "thing-1"}]},
+                }},
+            }]})
+            parser.write_partitioned(manifest, module_map, output, seed_cases=True, incremental=True)
+            upgraded = next(
+                case for case in parser.load_document(cases_path)["cases"] if case["id"] == success["id"]
+            )
+            self.assertFalse(upgraded["review_required"])
+            assertions = {item["path"]: item for item in upgraded["assertions"]}
+            for path in ("$.code", "$.data.pageNum", "$.data.pageSize", "$.data.total", "$.data.records"):
+                self.assertIn(path, assertions)
+            self.assertEqual(assertions["$.data.records"]["length"], 1)
+            self.assertEqual(assertions["$.data.records"]["items"], {"type": "object"})
+
+    def test_loopback_openapi_provenance_requires_execution(self):
+        cli = load_script("bruno_api_test_generator")
+        self.assertTrue(cli.is_loopback_openapi({"provenance": {"source_url": "http://127.0.0.1:8080/v3/api-docs"}}))
+        self.assertTrue(cli.is_loopback_openapi({"provenance": {"source_url": "http://[::1]:8080/openapi"}}))
+        self.assertFalse(cli.is_loopback_openapi({"provenance": {"source_url": "https://api.example.com/openapi"}}))
+
+    def test_module_materialization_reuses_its_local_baseline(self):
+        materializer = load_script("materialize_missing_bru")
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = Path(directory)
+            module = qa_root / "contracts" / "modules" / "things"
+            module.mkdir(parents=True)
+            (module / "endpoints.yaml").write_text(json.dumps({
+                "module": "things",
+                "endpoints": [{"id": "THING_GET", "method": "GET", "path": "/things"}],
+            }), encoding="utf-8")
+            cases_path = module / "cases.yaml"
+            cases_path.write_text(json.dumps({"module": "things", "cases": [{
+                "id": "THING_GET_OK",
+                "title": "查询事物成功",
+                "endpoint_id": "THING_GET",
+                "expected": {"http_status": 200},
+                "assertions": [{"path": "$.data.id", "equals": "one"}],
+            }]}), encoding="utf-8")
+            config, _ = execution_fixture(qa_root)
+            bruno = qa_root / "bruno"
+            bruno.mkdir()
+            (bruno / "collection.bru").write_text(materializer.COLLECTION_TEMPLATE, encoding="utf-8")
+            materializer.materialize(
+                qa_root / "contracts", bruno, execution_config_path=config, module_filter="things",
+            )
+            document = load_script("manifest_io").load_data(cases_path)
+            document["cases"][0]["assertions"][0]["equals"] = "two"
+            cases_path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+            materializer.materialize(
+                qa_root / "contracts", bruno, execution_config_path=config, module_filter="things",
+            )
+            self.assertEqual(
+                materializer.materialize(
+                    qa_root / "contracts", bruno, execution_config_path=config, module_filter="things",
+                ),
+                [],
+            )
+            request = next((bruno / "things").glob("*.bru"))
+            self.assertIn('res.body.data.id: eq "two"', request.read_text(encoding="utf-8"))
 
     def test_legacy_execution_config_is_migrated_to_environment_headers(self):
         execution_config = load_script("execution_config")
@@ -2665,13 +2969,13 @@ class RegressionTests(unittest.TestCase):
                 "  mode: bearer\n"
                 "  token_env: AUTH_TOKEN\n"
                 "custom_headers:\n"
-                "  operatorInfo:\n"
-                "    env: OPERATOR_INFO\n",
+                "  X-Tenant-Id:\n"
+                "    env: TENANT_ID\n",
                 encoding="utf-8",
             )
-            (execution / "README.md").write_text("run --plan smoke\nrun --risk read-only\n", encoding="utf-8")
+            (execution / "README.md").write_text("run --plan smoke\nrun --all\n", encoding="utf-8")
             (environments / "local.bru").write_text(
-                "vars {\n  BASE_URL: http://localhost\n  AUTH_TOKEN: token\n  OPERATOR_INFO: operator\n}\n",
+                "vars {\n  BASE_URL: http://localhost\n  AUTH_TOKEN: token\n  TENANT_ID: tenant-1\n}\n",
                 encoding="utf-8",
             )
             execution_config.initialize_execution_layout(qa_root)
@@ -2687,14 +2991,13 @@ class RegressionTests(unittest.TestCase):
             self.assertFalse((qa_root / "qa.yaml").exists())
             self.assertFalse((qa_root / "scripts").exists())
             readme = (execution / "README.md").read_text(encoding="utf-8")
-            self.assertIn('run.bat --module "AC-信息"', readme)
+            self.assertIn('run.bat --module "users"', readme)
             self.assertNotIn("--all", readme)
             self.assertNotIn("--confirm-", readme)
             self.assertNotIn("--plan", readme)
-            self.assertNotIn("--risk", readme)
             environment = execution_config.load_bruno_environment_document(environments / "local.bru")
             self.assertEqual(environment["headers"]["Authorization"], "Bearer {{AUTH_TOKEN}}")
-            self.assertEqual(environment["headers"]["operatorInfo"], "{{OPERATOR_INFO}}")
+            self.assertEqual(environment["headers"]["X-Tenant-Id"], "{{TENANT_ID}}")
 
     def test_shared_cli_mode_keeps_asset_only_layout(self):
         execution_config = load_script("execution_config")
@@ -2705,12 +3008,12 @@ class RegressionTests(unittest.TestCase):
             self.assertFalse((qa_root / "qa.yaml").exists())
             self.assertFalse((qa_root / "execution" / "plans.yaml").exists())
             self.assertIn("tooling: shared-cli", (qa_root / "execution" / "config.yaml").read_text(encoding="utf-8"))
-            self.assertIn("mno-bruno-qa run", (qa_root / "execution" / "run.bat").read_text(encoding="utf-8"))
-            self.assertIn("mno-bruno-qa run", (qa_root / "execution" / "run.sh").read_text(encoding="utf-8"))
+            self.assertIn("bruno-api-test-generator run", (qa_root / "execution" / "run.bat").read_text(encoding="utf-8"))
+            self.assertIn("bruno-api-test-generator run", (qa_root / "execution" / "run.sh").read_text(encoding="utf-8"))
 
     def test_public_cli_routes_help_to_the_subcommand(self):
         completed = subprocess.run(
-            [sys.executable, str(ROOT / "scripts" / "mno_bruno_qa.py"), "generate", "--help"],
+            [sys.executable, str(ROOT / "scripts" / "bruno_api_test_generator.py"), "generate", "--help"],
             check=False,
             capture_output=True,
             text=True,
@@ -2720,7 +3023,7 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("--incremental", completed.stdout)
         self.assertIn("--shared-cli", completed.stdout)
         run_help = subprocess.run(
-            [sys.executable, str(ROOT / "scripts" / "mno_bruno_qa.py"), "run", "--help"],
+            [sys.executable, str(ROOT / "scripts" / "bruno_api_test_generator.py"), "run", "--help"],
             check=False,
             capture_output=True,
             text=True,
@@ -2731,7 +3034,6 @@ class RegressionTests(unittest.TestCase):
         self.assertNotIn("--all", run_help.stdout)
         self.assertNotIn("--confirm-", run_help.stdout)
         self.assertNotIn("--plan", run_help.stdout)
-        self.assertNotIn("--risk", run_help.stdout)
 
     def test_qa_lock_accepts_yaml_openapi(self):
         qa_lock = load_script("qa_lock")
@@ -2777,6 +3079,312 @@ class RegressionTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertTrue(any("case fingerprints" in error for error in qa_lock.check(contracts)))
+
+    def test_generate_reuses_existing_source_rules_without_source_root(self):
+        cli = load_script("bruno_api_test_generator")
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = Path(directory) / "qa"
+            contracts = qa_root / "contracts"
+            constraints = qa_root / "constraints"
+            contracts.mkdir(parents=True)
+            constraints.mkdir()
+            spec = Path(directory) / "openapi.json"
+            spec.write_text('{"openapi":"3.0.0","paths":{}}', encoding="utf-8")
+            (contracts / "module-map.yaml").write_text('{"modules":[]}', encoding="utf-8")
+            (constraints / "source-rules.yaml").write_text(yaml.safe_dump({
+                "version": 1,
+                "field_rules": [{
+                    "id": "source-field-regioncode",
+                    "field": "regionCode",
+                    "field_names": ["regionCode"],
+                    "constraints": {"type": "string", "required": True},
+                    "example": "region-2",
+                }],
+            }), encoding="utf-8")
+            manifest = {"endpoints": [{
+                "id": "THING_LIST",
+                "operation_id": "listThings",
+                "method": "GET",
+                "path": "/things",
+                "parameters": [{
+                    "name": "regionCode", "in": "query", "required": True,
+                    "schema": {"type": "string"},
+                }],
+                "responses": {},
+            }]}
+            captured: dict[str, object] = {}
+
+            def capture_partition(value, *_args, **_kwargs):
+                captured["manifest"] = value
+                return {"changed_modules": [], "skipped_modules": [], "deleted_endpoint_ids": [], "manual_review_cases": []}
+
+            with (
+                mock.patch.object(cli, "initialize_execution_layout"),
+                mock.patch.object(cli, "ensure_rule_library"),
+                mock.patch.object(cli, "extract", return_value=manifest),
+                mock.patch.object(cli, "write_partitioned", side_effect=capture_partition),
+                mock.patch.object(cli, "materialize"),
+                mock.patch.object(cli, "write_qa_lock"),
+                mock.patch.object(cli, "validate_stage", return_value=[]),
+                mock.patch("execution_config.load_execution_config", return_value={
+                    "coverage_profile": "contract-draft", "active_environment": "local",
+                }),
+            ):
+                result = cli.generate_command(["--qa-root", str(qa_root), "--openapi", str(spec)])
+
+            self.assertEqual(result, 0)
+            parameter = captured["manifest"]["endpoints"][0]["parameters"][0]
+            self.assertEqual(parameter["schema"]["example"], "region-2")
+            self.assertEqual(parameter["schema"]["x-qa-rule-id"], "source-field-regioncode")
+
+    def test_controller_return_type_builds_exact_response_assertions(self):
+        source_constraints = load_script("source_constraints")
+        parser = load_script("parse_openapi")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "ProductController.java").write_text(
+                "class ProductController {\n"
+                "  @GetMapping(\"/products/{id}\")\n"
+                "  public CommonResponse<ProductOutput> getProduct() { return null; }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            (root / "CommonResponse.java").write_text(
+                "class CommonResponse<T> {\n"
+                "  private Integer code = 0;\n"
+                "  @NotNull\n  private T data;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            (root / "ProductOutput.java").write_text(
+                "class ProductOutput {\n  @NotBlank\n  private String id;\n}\n",
+                encoding="utf-8",
+            )
+            (root / "ProductOutputTest.java").write_text(
+                'class ProductOutputTest { void example() { output.setId("product-1"); } }\n',
+                encoding="utf-8",
+            )
+            rules = source_constraints.extract_source_constraints([root])
+            endpoint = {
+                "operation_id": "getProduct",
+                "responses": {"200": {"content": {"application/json": {"schema": {}}}}},
+            }
+            manifest = {"endpoints": [endpoint]}
+            source_constraints.apply_constraints_to_manifest(manifest, rules)
+            schema = endpoint["responses"]["200"]["content"]["application/json"]["schema"]
+            self.assertEqual(schema["properties"]["code"]["default"], 0)
+            self.assertEqual(schema["properties"]["data"]["properties"]["id"]["example"], "product-1")
+            assertions = parser.exact_response_assertions(endpoint, 200)
+            self.assertIn({"path": "$.code", "equals": 0}, assertions)
+            self.assertIn({"path": "$.data.id", "equals": "product-1"}, assertions)
+
+    def test_local_environment_values_are_reused_as_templates(self):
+        source_constraints = load_script("source_constraints")
+        manifest = {"endpoints": [{
+            "parameters": [{"name": "tenantId", "in": "path", "required": True, "schema": {"type": "string"}}],
+            "request_body": {"content": {"application/json": {"schema": {
+                "type": "object", "properties": {"regionCode": {"type": "string"}},
+            }}}},
+        }]}
+        source_constraints.apply_environment_values(
+            manifest, {"TENANT_ID": "private-tenant", "REGION_CODE": "private-region"},
+        )
+        endpoint = manifest["endpoints"][0]
+        self.assertEqual(endpoint["parameters"][0]["schema"]["example"], "{{TENANT_ID}}")
+        region = endpoint["request_body"]["content"]["application/json"]["schema"]["properties"]["regionCode"]
+        self.assertEqual(region["example"], "{{REGION_CODE}}")
+        self.assertNotIn("private-region", json.dumps(manifest))
+
+    def test_machine_rule_stages_cannot_be_weakened(self):
+        constraints = load_script("qa_constraints")
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = Path(directory)
+            path = constraints.ensure_rule_library(qa_root)
+            document = yaml.safe_load(path.read_text(encoding="utf-8"))
+            document["rules"][0]["stages"].remove("post-execution")
+            path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+            errors = constraints.rule_library_errors(path)
+            self.assertTrue(any("incomplete stages" in error for error in errors))
+
+    def test_source_required_unique_and_review_authorization_are_enforced(self):
+        constraints = load_script("qa_constraints")
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = Path(directory)
+            module = qa_root / "contracts" / "modules" / "things"
+            module.mkdir(parents=True)
+            endpoint = {
+                "id": "THING_CREATE", "method": "POST", "path": "/things",
+                "request_body": {"content": {"application/json": {"schema": {
+                    "type": "object", "properties": {
+                        "tenantId": {"x-qa-rule-id": "source-field-tenantid"},
+                        "serial": {"x-qa-rule-id": "source-field-serial"},
+                    },
+                }}}},
+            }
+            (module / "endpoints.yaml").write_text(json.dumps({"module": "things", "endpoints": [endpoint]}), encoding="utf-8")
+            (module / "cases.yaml").write_text(json.dumps({"module": "things", "cases": [
+                {"id": "CREATE_ONE", "endpoint_id": "THING_CREATE", "scenario": "success", "request": {"body": {"serial": "same"}}},
+                {
+                    "id": "CREATE_TWO", "endpoint_id": "THING_CREATE", "scenario": "success",
+                    "request": {"body": {"tenantId": "review-tenantId", "serial": "same"}},
+                    "review_reasons": {"review-tenantId": "No value was found"},
+                },
+            ]}), encoding="utf-8")
+            source = qa_root / "constraints" / "source-rules.yaml"
+            source.parent.mkdir(parents=True)
+            source.write_text(yaml.safe_dump({"field_rules": [
+                {
+                    "id": "source-field-tenantid", "field": "tenantId", "field_names": ["tenantId"],
+                    "constraints": {"type": "string", "required": True}, "example": "tenant-1",
+                },
+                {
+                    "id": "source-field-serial", "field": "serial", "field_names": ["serial"],
+                    "constraints": {"type": "string", "unique": True},
+                },
+            ]}), encoding="utf-8")
+            constraints.ensure_rule_library(qa_root)
+            errors = constraints.validate_stage(qa_root, "generation")
+            self.assertTrue(any("missing source-required field tenantId" in error for error in errors))
+            self.assertTrue(any("reuse source-unique field serial" in error for error in errors))
+            self.assertTrue(any("review placeholder review-tenantId is unauthorized" in error for error in errors))
+
+    def test_worker_snapshot_enforces_actual_git_workspace_boundary(self):
+        constraints = load_script("qa_constraints")
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            qa_root = repository / "qa"
+            module = qa_root / "contracts" / "modules" / "things"
+            module.mkdir(parents=True)
+            cases = module / "cases.yaml"
+            (module / "endpoints.yaml").write_text(
+                '{"module":"things","endpoints":[{"id":"THING_GET","method":"GET","path":"/things"}]}',
+                encoding="utf-8",
+            )
+            cases.write_text('{"module":"things","cases":[]}', encoding="utf-8")
+            constraints.ensure_rule_library(qa_root)
+            subprocess.run(["git", "init", "-q", str(repository)], check=True)
+            subprocess.run(["git", "-C", str(repository), "config", "user.email", "qa@example.invalid"], check=True)
+            subprocess.run(["git", "-C", str(repository), "config", "user.name", "QA"], check=True)
+            subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repository), "commit", "-qm", "baseline"], check=True)
+            constraints.write_worker_snapshot(qa_root, "things")
+
+            cases.write_text('{"module":"things","cases":[],"worker_note":"ok"}', encoding="utf-8")
+            self.assertEqual(constraints.validate_worker_snapshot(qa_root, "things", "generation"), [])
+            global_index = qa_root / "contracts" / "index.yaml"
+            global_index.write_text("status: changed\n", encoding="utf-8")
+            errors = constraints.validate_worker_snapshot(qa_root, "things", "generation")
+            self.assertTrue(any("coordinator-owned path" in error and "index.yaml" in error for error in errors))
+
+    def test_module_constraint_scope_still_enforces_global_identity_uniqueness(self):
+        constraints = load_script("qa_constraints")
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = Path(directory)
+            for module_id, path in (("alpha", "/alpha"), ("beta", "/beta")):
+                module = qa_root / "contracts" / "modules" / module_id
+                module.mkdir(parents=True)
+                (module / "endpoints.yaml").write_text(json.dumps({
+                    "module": module_id,
+                    "endpoints": [{"id": "DUPLICATE_ENDPOINT", "method": "GET", "path": path}],
+                }), encoding="utf-8")
+                (module / "cases.yaml").write_text(json.dumps({
+                    "module": module_id,
+                    "cases": [{"id": "DUPLICATE_CASE", "endpoint_id": "DUPLICATE_ENDPOINT"}],
+                }), encoding="utf-8")
+            constraints.ensure_rule_library(qa_root)
+            errors = constraints.validate_stage(qa_root, "generation", module="alpha")
+            self.assertTrue(any("endpoint id DUPLICATE_ENDPOINT is duplicated" in error for error in errors))
+            self.assertTrue(any("case id DUPLICATE_CASE is duplicated" in error for error in errors))
+
+    def test_module_results_and_evidence_are_aggregated(self):
+        runner = load_script("run_bruno")
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = Path(directory)
+            for module_id, status in (("alpha", "passed"), ("beta", "failed")):
+                module = qa_root / "contracts" / "modules" / module_id
+                module.mkdir(parents=True)
+                endpoint_id = f"{module_id.upper()}_GET"
+                case_id = f"{endpoint_id}_OK"
+                (module / "endpoints.yaml").write_text(json.dumps({
+                    "module": module_id,
+                    "endpoints": [{"id": endpoint_id, "method": "GET", "path": f"/{module_id}"}],
+                }), encoding="utf-8")
+                (module / "cases.yaml").write_text(json.dumps({
+                    "module": module_id,
+                    "cases": [{"id": case_id, "endpoint_id": endpoint_id, "expected": {"http_status": 200}}],
+                }), encoding="utf-8")
+                evidence_path = qa_root / "evidence" / "modules" / module_id / "20260101-evidence.json"
+                evidence_path.parent.mkdir(parents=True)
+                evidence_path.write_text(json.dumps({
+                    "executed": [case_id], "passed": [case_id] if status == "passed" else [],
+                    "cases": {case_id: {"actual": {"http_status": 200}, "failure_reason": "mismatch"}},
+                }), encoding="utf-8")
+                result_path = qa_root / "results" / "modules" / module_id / "20260101-result.json"
+                result_path.parent.mkdir(parents=True)
+                result_path.write_text(json.dumps({
+                    "execution_evidence": evidence_path.relative_to(qa_root).as_posix(),
+                    "cases": [{
+                        "module": module_id, "case_id": case_id, "interface": f"GET /{module_id}",
+                        "request_summary": {"method": "GET", "path": f"/{module_id}"},
+                        "expected": {"http_status": 200}, "actual": {"http_status": 200},
+                        "status": status, "failure_category": None if status == "passed" else "assertion_failure",
+                        "failure_reason": None if status == "passed" else "mismatch",
+                        "needs_manual_confirmation": False,
+                    }],
+                }), encoding="utf-8")
+
+            with mock.patch.object(runner, "validate_stage", return_value=[]):
+                report_path, evidence_path, report = runner.aggregate_module_results(qa_root)
+            self.assertTrue(report_path.is_file())
+            self.assertTrue(evidence_path.is_file())
+            self.assertEqual(report["summary"], {"total": 2, "executed": 2, "passed": 1, "failed": 1, "not_executed": 0})
+            self.assertEqual(report["failures"][0]["case_id"], "BETA_GET_OK")
+            merged = json.loads(evidence_path.read_text(encoding="utf-8"))
+            self.assertEqual(set(merged["executed"]), {"ALPHA_GET_OK", "BETA_GET_OK"})
+
+    def test_post_execution_constraint_errors_are_persisted(self):
+        runner = load_script("run_bruno")
+        with tempfile.TemporaryDirectory() as directory:
+            report_path = Path(directory) / "result.json"
+            report = {"summary": {"total": 1}}
+            result = runner.persist_post_execution_constraints(
+                report_path, report, ["response schema mismatch"], 0,
+            )
+            persisted = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(result, 1)
+            self.assertEqual(persisted["status"], "failed")
+            self.assertEqual(persisted["constraint_errors"], ["response schema mismatch"])
+
+    def test_loopback_generation_invokes_run_command(self):
+        cli = load_script("bruno_api_test_generator")
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = Path(directory) / "qa"
+            contracts = qa_root / "contracts"
+            contracts.mkdir(parents=True)
+            (contracts / "module-map.yaml").write_text('{"modules":[]}', encoding="utf-8")
+            spec = Path(directory) / "openapi.json"
+            source_document = {
+                "openapi": "3.0.0", "paths": {},
+                "provenance": {"source_url": "http://127.0.0.1:8080/v3/api-docs"},
+            }
+            spec.write_text(json.dumps(source_document), encoding="utf-8")
+            summary = {"changed_modules": [], "skipped_modules": [], "deleted_endpoint_ids": [], "manual_review_cases": []}
+            with (
+                mock.patch.object(cli, "initialize_execution_layout"),
+                mock.patch.object(cli, "ensure_rule_library"),
+                mock.patch.object(cli, "extract", return_value={"endpoints": []}),
+                mock.patch.object(cli, "write_partitioned", return_value=summary),
+                mock.patch.object(cli, "materialize"),
+                mock.patch.object(cli, "write_qa_lock"),
+                mock.patch.object(cli, "validate_stage", return_value=[]),
+                mock.patch.object(cli, "run_command", return_value=7) as run,
+                mock.patch("execution_config.load_execution_config", return_value={
+                    "coverage_profile": "contract-draft", "active_environment": "local",
+                }),
+            ):
+                result = cli.generate_command(["--qa-root", str(qa_root), "--openapi", str(spec)])
+            self.assertEqual(result, 7)
+            run.assert_called_once_with(["--qa-root", str(qa_root.resolve())])
 
 
 if __name__ == "__main__":
