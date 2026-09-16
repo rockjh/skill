@@ -1,69 +1,54 @@
 # Per-Scenario Source Version and Impact Policy
 
-Every `scenarios/*/场景定义.yaml` records its own compact source basis. There is no global source-version file, scenario manifest, or `版本变更记录.md`; Git history is the change record.
+Every `scenarios/*/场景定义.yaml` records its own compact source basis. `discovery/workspace.yaml` maps stable repository IDs to resolvable roots, but there is no global scenario registry or duplicate scenario-version file. Git history is the change record.
 
 ## Source contract
 
 ```yaml
-# 用途：记录本场景完成契约审查时的源码基线；禁止保存凭据、地址或其他敏感值。
-# 源码关联：每项对应一个被场景依赖的仓库，repo 是项目约定中的稳定关联键。
+# 源码基线：每项对应一个被当前场景直接依赖的仓库。
 source:
-  - repo: mno-traffic
-    # 40 位 Git SHA，表示已完成场景影响审查的提交，不代表未提交改动。
-    commit: 61604f3dd84cea56cc29732faea2dbd727a6e906
-    # 高价值源码符号，用于重新定位入口、模型、状态变化和消息链路；列表不得为空。
+  - repo: <repository-id-from-discovery>
+    # 40 位 Git SHA，表示已经完成场景影响审查的提交。
+    commit: <40-character-git-sha>
+    # 用于重新定位入口、模型、状态变化、控制和清理的高价值源码符号。
     anchors:
-      - SoftwareSaleSubscriptionController
-      - OperatorThresholdFulfillmentService
-  - repo: mno-operator
-    # 40 位 Git SHA，格式和语义与上一仓库相同。
-    commit: 16640b8fb5dd10c7d1e94eed16b3e35a3cb09077
-    # 与该仓库直接相关且可解析的源码符号。
-    anchors:
-      - OperatorBusinessOperatorApplication
+      - <source-symbol>
 ```
 
-- `repo` is the stable repository name. Resolve its local path from project convention or an explicit command argument, not from each scenario.
-- `commit` is the newest committed source revision reviewed against the current scenario.
-- `anchors` are a short set of high-value entrypoints, services, producers/consumers, models, tables, jobs, or configuration symbols that make impact rediscovery reliable.
+Angle-bracket values are metavariables. `repo` must resolve through the discovery inventory, and `commit` must equal that repository's reviewed discovery snapshot. `anchors` are a short set of entrypoints, services, producers/consumers, schemas, repositories, jobs, configuration symbols, controls, or cleanup methods that make rediscovery reliable. The source list covers every repository marked relevant to the scenario's topology; one caller repository cannot stand in for a downstream service, message, or data-store owner.
 
-Do not add branch names, duplicate commit fields, review timestamps, narrative notes, or copied diffs to the scenario definition.
+Do not add branch names, duplicate commit fields, timestamps, narrative notes, or copied diffs. Relevant dirty source cannot be represented by `commit` and must be reported separately.
 
-When migrating the old `generated_from_commit` / `last_reviewed_commit` format, do not mechanically choose the newer value. Use the generated revision as the initial comparison basis, complete the impact review, regenerate affected artifacts when needed, and only then write the reviewed `HEAD` to `source.commit`.
+When migrating an older source-version format, do not mechanically select a newer revision. Use the prior generated revision as the comparison basis, complete impact review, regenerate only affected artifacts, and then write reviewed `HEAD`.
 
 ## Review algorithm
 
-For each scenario and source repository:
+For every scenario/repository pair:
 
-1. Resolve `source.commit`, current `HEAD`, and staged, unstaged, and untracked changes.
-2. Verify the recorded commit exists; otherwise perform full rediscovery.
-3. Inspect `git diff --name-status <commit>..<HEAD>` and the actual old/new contents of potentially relevant files.
-4. Re-resolve every anchor and trace affected callers, request/response models, message producers/consumers, schemas, jobs, and configuration.
+1. Resolve the repository through `discovery/workspace.yaml`, then read recorded commit, current `HEAD`, and staged, unstaged, and untracked changes.
+2. Verify the recorded commit exists; otherwise repeat full relevant discovery.
+3. Inspect `git diff --name-status <commit>..<HEAD>` and actual old/new contents of potentially relevant files.
+4. Re-resolve each anchor and trace affected callers, request/response or message models, state rules, correlation, persistence, jobs, configuration, controls, and cleanup.
 5. Inspect relevant dirty contents; an unchanged anchor file does not prove no impact.
-6. Decide whether changes affect preconditions, data, actions, expectations, correlation, integration mappings, timing, cleanup, or diagrams.
-7. When update authorization exists, regenerate only affected artifacts and set `source.commit` to current `HEAD` after the review succeeds. The resulting repository diff is the audit trail.
+6. Decide whether changes affect topology, configuration precedence, preconditions, data, actions, controls, expectations, correlation, integrations, timing, cleanup, restoration, or diagrams.
+7. With update authorization, regenerate only affected artifacts and update the discovery repository commit plus every affected `source.commit` to the same reviewed SHA. Re-run discovery before contract gates; the repository diff is the audit trail.
 
-Relevant dirty source cannot be represented by the compact commit field. Do not claim the scenario is synchronized to dirty source. Ask for a commit before treating it as authoritative, or clearly report a draft result and leave `source.commit` unchanged.
+Do not claim synchronization to dirty relevant source. Ask for a commit before treating it as authoritative, or label generated work as draft and leave the recorded commit unchanged.
+
+If new repositories, build modules, dependency edges, or configuration sources appear, update and revalidate workspace discovery before scenario regeneration. Topology cannot be inferred only from the prior scenario anchors.
 
 ## Outcomes
 
-- `unchanged`: `HEAD` equals `source.commit` and no relevant dirty changes exist.
-- `no_relevant_change`: committed changes were inspected and do not affect the scenario. With update authorization, advance `source.commit` to `HEAD`; do not rewrite other artifacts.
-- `affected`: committed changes affect the scenario. Update only affected contract, data, code, diagrams, or cleanup, then advance `source.commit` to `HEAD`.
-- `full_rediscovery_required`: the old commit is unavailable or anchors cannot be resolved reliably. Repeat source discovery before updating.
-- `dirty_review_required`: relevant uncommitted source exists. Report it and do not advance `source.commit` or claim synchronization.
+- `unchanged`: `HEAD` equals recorded commit and no relevant dirty changes exist.
+- `no_relevant_change`: committed changes were inspected and do not affect the scenario. With authorization, advance the recorded commit without rewriting other artifacts.
+- `affected`: committed changes affect the contract or generated implementation. Update only affected artifacts, then advance the commit.
+- `full_rediscovery_required`: the old commit is unavailable, an anchor is unresolved, or workspace topology/configuration changed materially.
+- `dirty_review_required`: relevant uncommitted source exists. Report it and do not advance the commit or claim synchronization.
 
 ## Script behavior
 
-`scripts/check_source_versions.py` discovers `scenarios/*/场景定义.yaml`. It accepts optional `--scenario <中文场景名称>` to inspect exactly one scenario directory; an unknown or ambiguous name is an error. Without the option it inspects all scenarios.
+`scripts/check_source_versions.py` discovers `scenarios/*/场景定义.yaml` directly and resolves repository IDs through discovery. It accepts optional exact `--scenario <中文场景名称>`; unknown, ambiguous, or path-like values are errors.
 
-Emit one concise human-readable result per scenario/repository containing:
+Emit one result per scenario/repository with recorded/current commit, clean/dirty state, relevant changed files, affected or unresolved anchors, exactly one outcome above, and a concise reason.
 
-- recorded commit and current commit;
-- clean/dirty state;
-- relevant changed files;
-- affected or unresolved anchors;
-- exactly one decision: `unchanged`, `no_relevant_change`, `affected`, `full_rediscovery_required`, or `dirty_review_required`;
-- a concise reason for that decision.
-
-The check command is read-only. It must not silently update definitions, regenerate tests, discard working-tree changes, fetch or rewrite Git history, or collapse multiple scenarios into one project-level result. An explicit update workflow may write `source.commit` only after content inspection and impact analysis finish.
+The command is read-only. It must not fetch, update definitions, regenerate tests, discard changes, rewrite history, or collapse several scenarios into one project-level decision. Updating source commits is a separate explicitly authorized workflow after content inspection.

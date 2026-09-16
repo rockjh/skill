@@ -1,221 +1,275 @@
 # Python E2E Workflow Contract
 
-The unit of planning, generation, and maintenance is one scenario directory. `E2E_PLAN.md` may contain project-wide strategy, configuration conventions, commands, and constraints, but never a scenario inventory.
+The unit of scenario planning, generation, and maintenance is one scenario directory. `discovery/workspace.yaml` owns workspace facts, and `E2E_PLAN.md` may explain project-wide strategy and commands; neither is a global scenario manifest.
 
 ## Contract trace
 
-Before generating assertions, maintain a temporary working trace:
+Before generating assertions, maintain a temporary source-backed trace:
 
 ```text
-用户预期 -> 源码入口 -> 请求/响应模型 -> 状态变化 -> 关联键 -> 可观测证据 -> 清理方式
+用户预期 -> 公共入口 -> 请求/响应或消息模型 -> 状态变化 -> 关联键 -> 可观测证据 -> 控制方式 -> 清理/恢复
 ```
 
-Every assertion and cleanup action must be justified by this trace. It is discovery working state, not another generated manifest. Do not change the user's expectation to make it agree with current source. When the trace cannot confirm an interface, test-control capability, request/response or message contract, correlation rule, or expected result, set `contract_blocked` and identify the missing contract. Reserve `pending_environment` for missing addresses, credentials, and environment-specific test data.
+Every action, assertion, control, and cleanup must be justified by this trace. Keep only concise source anchors in the durable scenario contract. Do not change user expectations to match current source.
 
 ## Scenario definition
 
-Each `scenarios/<中文业务名称>/场景定义.yaml` is the authoritative contract for that scenario. Use only these top-level sections: `meta`, `preconditions`, `integrations`, `steps`, `cleanup`, and `source`.
+Each `scenarios/<中文业务名称>/场景定义.yaml` is authoritative for that scenario. Use exactly these top-level sections: `meta`, `generation`, `readiness`, `preconditions`, `integrations`, `controls`, `isolation`, `steps`, `cleanup`, and `source`.
+
+The following is a schema-shaped example. Values in angle brackets are metavariables and must be replaced with discovered values rather than copied:
 
 ```yaml
-# 用途：定义一个业务 E2E 场景的契约；禁止保存凭据、地址或其他敏感运行值。
-# 场景元数据：稳定 ID 仅用于定义和一个 pytest marker。
+# 用途：定义一个业务 E2E 场景的来源、控制、步骤和恢复契约；禁止保存凭据或连接值。
 meta:
-  id: MNO_REALNAME_DUAL_OPERATOR_RENEWAL
-  name: 实名后双运营商套餐阈值与跨月续订
-  # 状态枚举：ready=契约与环境已就绪，pending_environment=仅缺环境值，contract_blocked=源码契约无法确认。
+  id: <STABLE_SCENARIO_ID>
+  name: <中文业务名称>
   status: pending_environment
-  actor: 已实名车主
+  actor: <业务参与者>
 
-# 业务前置条件：描述可验证的环境和数据条件，不填写连接信息。
+# 生成职责：多场景时每个场景必须有独立 delegated owner；降级时如实记录原因。
+generation:
+  mode: delegated
+  owner: <subagent-task-id>
+  write_scope: scenarios/<中文业务名称>
+  degradation_reason: null
+
+# 就绪判定：四项状态共同决定 meta.status，blockers 只写缺口而不写敏感值。
+readiness:
+  source_contract: confirmed
+  safe_control: confirmed
+  runtime_configuration: missing
+  test_data: missing
+  blockers:
+    - connection:<MISSING_ENDPOINT_ENVIRONMENT_VARIABLE_NAME>
+    - business_data:<MISSING_BUSINESS_DATA_VARIABLE_NAME>
+
+# 业务前置：只写可验证条件，不写连接信息。
 preconditions:
-  - 测试车辆存在移动与联通有效车卡关系
-  - 移动20GB大包和联通周期套餐可唯一匹配
-  - 环境支持第二个月时间控制
+  - <source-confirmed-precondition>
 
-# 外部依赖：HTTP 项为客户端名称；布尔值表示场景是否必须使用对应组件。
+# 运行依赖：类型和 ID 均来自工作区发现，不限定具体技术。
 integrations:
-  http:
-    - mno-traffic
-    - mno-operator
-  kafka: true
-  mysql: true
-  redis: false
-  emq: false
+  services:
+    - <discovered-service-id>
+  components:
+    - id: <discovered-component-id>
+      type: <discovered-component-type>
+      required: true
 
-# 业务步骤：data_ref 是指向同目录业务数据文件的 JSON Pointer。
+# 控制矩阵：每类都必须完成评估，即使能力不存在。
+controls:
+  public_api:
+    status: usable
+    assessment: <source-backed-capability-conclusion>
+    evidence:
+      - <repository-id>#<source-symbol>
+    planned_use:
+      - <business-action-symbol>
+  test_or_admin_api:
+    status: not_found
+    assessment: <searched-locations-and-conclusion>
+    evidence:
+      - <repository-id>#<search-or-source-symbol>
+    planned_use: []
+  mocks_and_faults:
+    status: not_applicable
+    assessment: <source-backed-relevance-conclusion>
+    evidence: []
+    planned_use: []
+  dynamic_configuration:
+    status: not_applicable
+    assessment: <source-backed-relevance-conclusion>
+    evidence: []
+    planned_use: []
+  scheduled_jobs:
+    status: not_applicable
+    assessment: <source-backed-relevance-conclusion>
+    evidence: []
+    planned_use: []
+  messages:
+    status: not_applicable
+    assessment: <source-backed-relevance-conclusion>
+    evidence: []
+    planned_use: []
+  database_read:
+    status: usable
+    assessment: <source-backed-capability-conclusion>
+    evidence:
+      - <repository-id>#<repository-method-symbol>
+    planned_use:
+      - <business-evidence-symbol>
+  database_control:
+    status: not_applicable
+    assessment: <source-backed-relevance-conclusion>
+    evidence: []
+    planned_use: []
+    safety: null
+  observability:
+    status: usable
+    assessment: <source-backed-capability-conclusion>
+    evidence:
+      - <repository-id>#<query-or-event-symbol>
+    planned_use:
+      - <business-evidence-symbol>
+    correlation_keys:
+      - <source-confirmed-correlation-symbol>
+    business_evidence:
+      - <observable-outcome-symbol>
+    recovery:
+      - <idempotent-recovery-symbol>
+  decision:
+    safe_control_path: true
+    blockers: []
+
+# 隔离边界：关联键、资源和可变控制必须由当前场景真正独占；锁名称不能替代隔离证明。
+isolation:
+  namespace: <scenario-unique-namespace>
+  correlation_keys:
+    - <scenario-owned-correlation-reference>
+  owned_resources:
+    - kind: <record|message-client|cache-key|file|other>
+      identity: <scenario-unique-resource-reference>
+      cleanup: <idempotent-cleanup-symbol>
+      restore: <restoration-symbol>
+      verify: <restoration-verification-symbol>
+  mutable_controls: []
+  serial_lock: null
+
+# 业务步骤：control 必须引用控制矩阵类别，side_effect 决定运行时门禁。
 steps:
-  - id: real_name
-    action: send_real_name_notification
-    data_ref: 业务数据.json#/real_name
+  - id: <step-id>
+    action: <business-action-symbol>
+    control: public_api
+    side_effect: write
+    data_ref: 业务数据.json#/<json-pointer>
     expect:
-      - real_name_persisted
+      - <business-outcome-symbol>
 
-  - id: activate
-    action: activate_salable_plan
-    data_ref: 业务数据.json#/activate
-    expect:
-      - mobile_atom_success
-      - unicom_atom_success
-
-  - id: threshold
-    action: send_dual_operator_threshold
-    data_ref: 业务数据.json#/threshold
-    expect:
-      - kafka_reminder_published
-      - mysql_reminder_persisted
-
-  - id: next_month
-    action: advance_to_next_month
-    expect:
-      - dual_operator_renewal_created
-
-# 清理契约：动作必须由源码确认、可重复执行，并在资源创建后立即注册。
+# 清理恢复：动作必须来源明确、幂等且按资源创建顺序立即注册。
 cleanup:
-  strategy: api
+  strategy: <api|fixture|control|composite>
   actions:
-    - unsubscribe_salable_order
+    - <cleanup-symbol>
+  verifies:
+    - <restoration-evidence-symbol>
 
-# 源码基线：commit 为 40 位 Git SHA；anchors 是与本场景直接关联的非空源码符号。
+# 源码基线：每项对应一个参与本场景的仓库。
 source:
-  - repo: mno-traffic
-    commit: 61604f3dd84cea56cc29732faea2dbd727a6e906
+  - repo: <repository-id>
+    commit: <40-character-git-sha>
     anchors:
-      - SoftwareSaleSubscriptionController
-      - OperatorThresholdFulfillmentService
-
-  - repo: mno-operator
-    commit: 16640b8fb5dd10c7d1e94eed16b3e35a3cb09077
-    anchors:
-      - OperatorBusinessOperatorApplication
+      - <source-symbol>
 ```
 
-Nested schema:
+Schema rules:
 
-- The top level contains exactly `meta`, `preconditions`, `integrations`, `steps`, `cleanup`, and `source`; unknown top-level or nested keys fail validation.
-- `meta` contains exactly non-empty string `id`, `name`, `status`, and `actor`. `id` matches `[A-Z][A-Z0-9_]+`; `status` is `ready`, `pending_environment`, or `contract_blocked`.
-- `preconditions` is a non-empty list of non-empty strings.
-- `integrations` contains exactly `http`, `kafka`, `mysql`, `redis`, and `emq`. `http` is a duplicate-free list of non-empty service names; every component value is a boolean.
-- `steps` is a non-empty list of mappings with exactly `id`, `action`, `expect`, and optional `data_ref`. Step IDs are unique non-empty strings; `action` is a non-empty business symbol; `expect` is a non-empty list of unique non-empty business symbols.
-- `data_ref`, when present, has the exact form `业务数据.json#/<pointer>`. After selecting the active environment object, resolve `<pointer>` with RFC 6901 rules. It must not point to credentials or connection data.
-- `cleanup` contains exactly non-empty string `strategy` and non-empty unique string list `actions`. Actions are source-confirmed and idempotent; generated code guarantees them with `finally`, pytest finalizers, or an equivalent context manager.
-- `source` is a non-empty list whose mappings contain exactly non-empty string `repo`, 40-character hexadecimal `commit`, and a non-empty unique string list `anchors`.
-- `meta.id` is stable and appears outside this file only in exactly one pytest marker. Actions and expectations are stable business symbols, not endpoint paths, error-code catalogs, URLs, or prose.
+- Unknown top-level or nested keys fail validation.
+- `meta` contains non-empty `id`, `name`, `status`, and `actor`. `id` matches `[A-Z][A-Z0-9_]+`; `status` is `ready`, `pending_environment`, or `contract_blocked`.
+- `generation` contains `mode`, `owner`, `write_scope`, and nullable `degradation_reason`, following the delegation rules in [discovery-and-control-policy.md](discovery-and-control-policy.md).
+- `readiness.source_contract` and `readiness.safe_control` are `confirmed` or `blocked`; `runtime_configuration` and `test_data` are `confirmed` or `missing`. `blockers` is a unique list of non-sensitive references. Pending blockers use exact canonical `config:`, `credential:`, `connection:`, or `business_data:` environment-variable references derived from the active configuration path and must equal the real missing set; authorization is forbidden here. Contract blockers use source-bound `control:<category>` or `contract:<repository>#<anchor>` values.
+- `preconditions` is a non-empty unique list of source-confirmed statements.
+- `integrations.services` is a unique list of discovery service IDs. `components` contains unique `id`, discovered `type`, and boolean `required`; every item resolves to `discovery/workspace.yaml`.
+- `controls` contains exactly the categories defined by the discovery policy plus `decision`. Capability entries have exact non-empty `assessment`, `status`, `evidence`, and `planned_use`; source evidence must match the control's semantic category. `observability` also has `correlation_keys`, `business_evidence`, and `recovery`, which exactly equal the isolation keys, all step expectations, and all cleanup actions/verifications. `database_control.safety` is null when unused and otherwise contains exactly `authorization_required`, `target_environment`, `purpose`, `consumer_source`, `exact_selector`, `expected_rows`, `snapshot`, `mutation`, `trigger`, `verification`, `restoration`, and `restoration_verification`; `purpose` is one of the four allowed preparation/advancement purposes and `expected_rows` is exactly `1`.
+- `isolation` contains exactly `namespace`, `correlation_keys`, `owned_resources`, `mutable_controls`, and `serial_lock`, which must be null. Every owned resource contains exact `kind`, `identity`, `cleanup`, `restore`, and `verify` symbols, all mapped into the cleanup contract. Every mutable control is also an owned resource identity. A write scenario has at least one owned resource, and every cross-scenario collision fails.
+- Steps have exact `id`, `action`, `control`, `side_effect`, `expect`, and optional `data_ref`. IDs are unique; `control` names a usable matrix category; `side_effect` is `none`, `read`, or `write`. Test/admin, mock/fault, dynamic-configuration, scheduled-job, message, and database controls are inherently writing and cannot claim `read` or `none`.
+- `data_ref`, when present, has exact form `业务数据.json#/<pointer>` and resolves by RFC 6901 only after selecting the active environment.
+- Every resolved `data_ref` subtree includes at least one source-valid non-placeholder literal. Environment placeholders are limited to pre-existing environment-owned data; scenario-owned unique strings are generated at runtime with `secrets` or `uuid` under source-confirmed format constraints.
+- `cleanup` contains non-empty `strategy`, unique `actions`, and unique `verifies`. Cleanup is source-confirmed, idempotent, and guaranteed by `finally`, a finalizer, `ExitStack`, or a context manager.
+- `source` is a non-empty list with exact `repo`, 40-character `commit`, and non-empty unique `anchors`. Every commit equals its discovery inventory snapshot, every relevant topology repository is covered, and every anchor resolves at that commit.
+- Stable scenario ID appears outside its definition only in exactly one pytest marker. Actions, expectations, controls, and cleanup use stable business symbols, not endpoint paths, table names, topic names, copied SQL, URLs, or narrative prose.
+
+## Deterministic status gate
+
+`check_scenarios.py --gate contracts` derives the permitted status:
+
+- `ready`: all four readiness fields are `confirmed`, blockers are empty, `safe_control_path` is true, observability and recovery are usable, required service/component mappings exist, active-environment business data exists, and every exact placeholder used by this scenario currently resolves.
+- `pending_environment`: source contract and safe control are `confirmed`; only runtime configuration or test data is `missing`; blockers exactly equal the missing active-environment placeholders/mappings or test-data placeholders. Per-run SQL/control authorization is not a status input.
+- `contract_blocked`: source contract or safe control is `blocked`, `safe_control_path` is false, readiness and decision blockers match, every blocker resolves to unavailable control evidence or a scenario source anchor, and every candidate API/configuration/job/message/database control is source-backed `unusable` or `not_found`; `not_applicable` cannot close the matrix.
+
+The checker fails a mismatched declared status. A missing HTTP interface alone cannot produce `contract_blocked`. A runtime failure after preflight never changes the static status and must remain a failed execution result.
 
 ## Business data
 
-Keep business inputs separate from Python orchestration and isolated by environment at the JSON root:
+Keep business inputs in strict JSON, keyed first by environment:
 
 ```json
 {
-  "local": {
-    "real_name": {
-      "carrier": 1,
-      "customer_type": 1,
-      "oper_type": 1
-    },
-    "activate": {
-      "plan_id": "${LOCAL_TEST_PLAN_ID}"
-    },
-    "threshold": {
-      "mobile_usage_mb": 2048,
-      "mobile_total_usage_mb": 20480,
-      "unicom_percent": 100
+  "<selected-test-environment>": {
+    "<step-data-key>": {
+      "<source-literal-field>": "<source-valid-synthetic-value>",
+      "<environment-owned-field>": "${<SELECTED_ENVIRONMENT_VALUE_REFERENCE>}"
     }
   },
-  "sit": {
-    "real_name": {
-      "carrier": 1,
-      "customer_type": 1,
-      "oper_type": 1
-    },
-    "activate": {
-      "plan_id": "${SIT_TEST_PLAN_ID}"
-    },
-    "threshold": {
-      "mobile_usage_mb": 4096,
-      "mobile_total_usage_mb": 30720,
-      "unicom_percent": 100
+  "<named-test-environment>": {
+    "<step-data-key>": {
+      "<source-literal-field>": "<source-valid-synthetic-value>",
+      "<environment-owned-field>": "${TEST_ENV_SCENARIO_VALUE}"
     }
   }
 }
 ```
 
-Environment names match `config/environments/<environment>.yaml` basenames and use `[a-z][a-z0-9_-]*`; `example` is forbidden. All environment objects present in one file expose the same logical paths, while values may differ. Select `active_environment` before resolving `data_ref`; never merge or fall back to another environment. A missing active key is missing environment test data and produces `pending_environment` during preflight.
+The placeholder names and angle-bracket literals shown are metavariables. Inspect source DTOs, validators, enums, and downstream correlation rules, then replace them with source-valid values. All environment objects in one file expose the same logical paths. Never merge or fall back across environments. A missing active root is `pending_environment` during preflight.
 
-Standard JSON comments and synthetic comment fields are not allowed. Keep source/protocol field semantics and placeholder format/source in the contract trace, explicit builders, focused tests, and environment-prefixed variable names. Unresolved placeholders remain inert during import and collection and resolve only during preflight. Do not store generated order numbers, credentials, endpoints, or mutable runtime results in this file.
+Do not turn every business field into an environment variable. Keep deterministic values that the test can safely construct as literals. Generate scenario-owned unique strings at runtime with `secrets` or `uuid` according to source-confirmed length/alphabet/format rules. Exact placeholders are only for pre-existing environment-owned values that cannot safely be constructed. Every subtree named by `data_ref` contains at least one non-placeholder literal; the checker rejects all-placeholder injection.
+
+Do not store credentials, endpoints, generated identifiers, mutable results, SQL, or configuration-center values here. Standard JSON comments and synthetic comment fields are forbidden. Builders explicitly map every source DTO or schema field rather than passing through an entire loaded object.
 
 ## YAML comment policy
 
-Every generated or maintained `.yaml`/`.yml` file in the E2E project must contain useful Chinese comments while preserving source and protocol field names:
+Every generated or maintained YAML file uses useful Chinese comments while preserving discovered source/protocol identifiers:
 
-- The first non-blank line states the file's purpose and whether sensitive values are allowed. Generated E2E YAML files normally prohibit usable secrets.
-- A meaningful comment immediately precedes every top-level block and explains its role rather than repeating its key.
-- Each exact environment placeholder documents its meaning, expected format, and source without showing a real value.
-- Traffic, capacity, time, ratio, count, and similar values state their units.
-- Enumerations, special values such as `-1`, association keys, and non-obvious constraints state their business semantics.
-- Do not require a comment on every line and reject comments that merely restate field names.
+- the first non-blank line states the file's purpose and whether sensitive values are forbidden;
+- a meaningful comment precedes each top-level block and explains its role;
+- each exact environment placeholder documents meaning, expected format, and source without exposing a value;
+- units, enums, special values, correlation keys, and non-obvious constraints retain their source-confirmed semantics;
+- comments that merely repeat a field name do not satisfy the rule.
 
-## Generation gates
+The static checker enforces file headers, top-level comments, and placeholder provenance. It checks units and other semantic comments only where such values occur; JSON remains comment-free.
 
-1. Source discovery establishes the public entrypoint, business steps, correlation keys, assertions, cleanup, and source anchors.
-2. `场景定义.yaml`, `业务数据.json`, and `业务流程图.md` exist before or with the generated test.
-3. Missing environment values do not block complete code generation or collection.
-4. `pytest --collect-only` succeeds before claiming the scenario is generated.
-5. Runtime execution performs non-destructive preflight before business side effects.
-6. Every side-effecting request verifies its business response before downstream polling. When an environment exists, focused execution verifies downstream evidence, field-level reconciliation, and cleanup.
-7. Incremental updates pass the source-impact gate in [version-sync-policy.md](version-sync-policy.md).
+## Generation and validation gates
 
-## Reconciliation
+The main agent and generated checker enforce this order:
 
-`scripts/check_scenarios.py` discovers `scenarios/*/场景定义.yaml` directly and checks at minimum:
+1. `workspace_inventory`, `dependency_topology`, `initial_configuration`, and `runtime_probe` run as four ordered checks with separate outcomes.
+2. `control_matrix`, `scenario_split`, `scenario_ownership`, and `shared_integration` run as four ordered checks with separate outcomes.
+3. `static`: full asset, AST, script, control-SQL, and diagram checks pass before any project test is imported; project `conftest.py` and alternate pytest configuration are forbidden. Then environment-independent shared-logic tests and source-version checks pass.
+4. `collect`: `python -m pytest --collect-only` succeeds with unresolved runtime placeholders inert.
+5. `smoke`: read-only calls run only when runtime access exists and emit one valid endpoint event per selected scenario.
+6. `business`: preflight authorizes scenario side effects and real scenario execution.
+7. `restore`: every declared owned resource is restored and verified.
 
-- the complete nested schema above, including rejection of unknown nested keys, required cardinalities, types, enum values, and uniqueness constraints;
-- `config/runtime.yaml` selects a safe environment name with a matching environment file; `example.yaml` and an `example` environment key are forbidden;
-- every environment file includes source-required service URLs, explicit authentication, custom headers, and declared middleware connection settings using inert placeholders rather than usable credentials, and does not redefine shared `enabled` switches;
-- every definition has sibling `业务数据.json`, `业务流程图.md`, and `test_<中文业务名称>.py`;
-- every business-data file parses as standard JSON, has only known environment keys, gives each present environment the same logical data paths, and contains the active key before runtime execution;
-- every `data_ref` targets the sibling `业务数据.json` and resolves within every environment object present in that file, after environment selection rather than before it;
-- every generated YAML file passes the file-header, top-level-block, and environment-placeholder comment rules above; also validate unit, enum, special-value, and association-key comments where those values occur;
-- `自动化测试流程图.md` is optional, but every diagram uses Mermaid `sequenceDiagram`, never `flowchart`; source-confirmed real branches use paired `alt`/`else`, and failure branches contain the exact source-confirmed business error code rather than an invented value;
-- the stable ID appears only in the definition and exactly one pytest marker, with no duplicate IDs;
-- source entries have `repo`, a 40-character hexadecimal commit, and non-empty anchors that resolve under the project's source-repository convention;
-- every scenario and all-scenario execution script exists, invokes the correct checks/test target, uses `python -m pytest`, and forwards caller arguments;
-- test files contain no hardcoded VIN, ICCID, order number, plan/package ID, payload block, or SQL statement;
-- Python files parse with `ast`, referenced local or installed imports resolve without importing application modules, and every module, class, and function has a Chinese docstring;
-- declared HTTP and Kafka/MySQL/Redis/EMQ integrations agree with clients, fixtures, and preflight validation; unused integrations are neither instantiated nor checked;
-- every scenario has guaranteed cleanup using `finally` or an equivalent pytest finalizer/context manager.
+No later gate runs after an earlier failure. Each smoke/business subprocess must produce JUnit containing at least one executed test and zero skipped, xfailed, failed, or errored tests. Missing runtime values may leave `smoke`, `business`, and `restore` as `N/A`, but cannot weaken collection or static gates. Runtime smoke failure is reported as failure, not as static success.
 
-`scripts/check_source_versions.py` reads the same definitions and emits an independent source-impact result per scenario/repository. Neither script reads, creates, or updates a global registry.
+## Static checker contract
 
-Use the existing YAML parser, the standard-library JSON parser, and Python `ast` before text heuristics. Mermaid branch/error validation must compare with source evidence resolved from the recorded anchors; if that evidence cannot be established, fail the check and keep the scenario `contract_blocked`. Heuristics are limited to rules such as sensitive literals, long payloads, SQL, and script text. Every heuristic diagnostic reports file and line, and suppressions are narrow, inline, rule-specific, and documented; there is no file-wide blanket suppression.
+Extend the generated project's single `scripts/check_scenarios.py`; do not create overlapping validators. It accepts each ordered stage name plus aggregate `--gate discovery|contracts|static|all`, and optional `--scenario <中文场景名称>`. Each ordered stage validates the preceding content-addressed seal. Aggregate discovery/contracts/all modes are diagnostic-only and cannot create those seals or authorize `static`. It checks at minimum:
 
-Add a small test module for `check_scenarios.py` using the project's existing test dependencies. One representative invalid fixture per rule class is enough; parameterize cases where convenient and assert a non-zero exit code plus the file-and-line diagnostic. Do not create another checker or introduce another test framework.
+- the discovery contract and all cross-references described in the discovery policy;
+- the complete scenario schema, status derivation, ownership, exact write scope, and unique multi-scenario delegated owners;
+- environment-file selection and no cross-environment configuration or business-data fallback;
+- control-matrix use, source evidence, write-step preconditions, correlation, cleanup, restoration, and database-control safeguards;
+- cross-scenario collision checks for correlation sources, namespaces, generated IDs, mutable settings, consumer/client IDs, owned records, and cleanup selectors;
+- sibling scenario artifacts, stable IDs, source anchors, all Mermaid diagrams, the unified execution scripts, and source-version entries;
+- Python AST validity, import resolution without connecting externally, Chinese docstrings, and guaranteed cleanup;
+- absence of copied credentials, concrete project-example identifiers, hardcoded endpoints, business IDs, topic/table names in generic helpers, raw SQL in tests, blind sleeps, unrestricted cache clearing, or unbounded publication.
 
-## Shared-logic tests
+Use YAML/JSON parsers and Python `ast` before narrow text heuristics. Use an installed SQL parser when available; otherwise conservatively reject control SQL that cannot be proven parameterized and exactly bounded. Every diagnostic includes file and line. Suppressions are inline, rule-specific, justified, and never file-wide.
 
-Add focused tests only for non-trivial reusable behavior:
+Add focused checker tests for each rule class, including the discovery and SQL cases in [discovery-and-control-policy.md](discovery-and-control-policy.md). Add shared-logic tests only for non-trivial reusable behavior: deep merge, exact-placeholder resolution, environment selection, integration gating, response validation, deadline polling, isolation, control authorization, row-count enforcement, original-value restoration, and preservation of an earlier exception.
 
-- recursive configuration merge and recursive exact-placeholder resolution;
-- missing and blank environment variables;
-- active-environment selection, unknown environments, and missing active business data;
-- the same `data_ref` returning isolated values for two environments with no cross-environment fallback;
-- builder field names, nesting, unit conversion, enums, and time formatting;
-- business-response validation for write requests;
-- cleanup failure handling when the test body has already raised.
+## Final report
 
-Use the project's existing test dependency. These environment-independent tests are mandatory before runtime E2E execution and are included by `run_all`; do not expand them into per-function suites or test scenario prose.
+The main agent reports, separately and without inferred success:
 
-## Result reporting
+- repositories, build modules, existing E2E projects, and the relevant dependency edges actually found;
+- configuration sources and precedence, with credential values redacted;
+- runtime processes/listeners associated with source modules and read-only probe results;
+- each scenario's owner, or the exact reason for sequential degradation;
+- each scenario's selected API, message, job, configuration, database observation, or controlled SQL capabilities;
+- each endpoint actually called, its method, redacted target identity, and result summary;
+- scenarios that stopped at static generation versus those that entered real business steps;
+- database, configuration, cache, message-client, and test-data restoration status;
+- environment-independent tests, `pytest --collect-only`, static validation, source synchronization, read-only smoke, real execution, business-step entry rate, semantic coverage, business correctness, and optional code coverage.
 
-Report these results independently:
-
-- scenario artifact coverage;
-- pytest collection;
-- static validation;
-- source synchronization;
-- percentage of attempted scenarios that entered business steps;
-- requirement-semantic coverage;
-- business correctness;
-- code coverage.
-
-Use `N/A` when no real business execution or coverage collection occurred. Collection and static validation cannot be reported as requirement coverage, correctness, or code coverage. Server-side coverage may be reported when available, but it is not a mandatory black-box E2E gate.
+Use `N/A` for every check not executed. Collection, generated code, diagrams, or static validation never substitute for requirement coverage or business correctness.

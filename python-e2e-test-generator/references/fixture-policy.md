@@ -2,174 +2,144 @@
 
 Use the narrowest fixture scope that preserves isolation:
 
-- **session:** parsed technical configuration and immutable service metadata;
-- **run:** active environment, unique run ID, isolation namespace, and report context;
-- **scenario:** actor/session, Kafka or EMQ observer, scenario-owned records, and mutable settings;
+- **session:** parsed technical configuration and immutable discovered metadata;
+- **run:** active environment, unique run ID, authorization context, isolation namespace, and report context;
+- **scenario:** actor/session, observers, owned records, mutable settings, snapshots, and cleanup stack;
 - **step:** short-lived values that cannot safely share scenario scope.
 
 ## Configuration split
 
-Keep shared technical defaults separate from environment-specific connectivity and business data.
+Keep generated E2E configuration separate from application-source configuration:
 
-`config/runtime.yaml`:
+- `discovery/workspace.yaml` records where application values originate and how they are overridden.
+- `config/config.yaml` selects one E2E environment and holds only shared technical defaults and default-off safety switches.
+- `config/environments/<environment>.yaml` maps discovered services/components to environment-specific addresses, authentication references, headers, TLS, and connection references.
+- `业务数据.json` contains environment-isolated scenario inputs only.
+
+Generated E2E keys such as `active_environment` are part of this skill's schema. Application ports, context paths, source configuration keys, profile names, endpoints, topics, table names, and authentication fields must be discovered; never copy a concrete example from this skill.
+
+`config/config.yaml` has this minimum shape:
 
 ```yaml
-# 用途：选择本次 E2E 运行环境并定义公共技术默认值；禁止保存凭据、地址或其他敏感值。
-# 激活环境：值必须对应 environments/<环境>.yaml 和业务数据.json 的同名根键。
-active_environment: local
+# 用途：选择 E2E 环境并定义公共技术默认值；禁止保存地址、凭据或业务数据。
+active_environment: <selected-test-environment>
 
-# 公共默认值：与激活环境配置递归深合并；enabled=false 时场景不得重新启用。
+# 公共默认值：环境文件只能覆盖对应叶子，不能开启默认关闭的危险能力。
 defaults:
-  integrations:
-    kafka:
-      enabled: true
-    mysql:
-      enabled: true
-    redis:
-      enabled: false
-    emq:
-      enabled: false
-  # 轮询时间单位均为秒。
   polling:
+    # 轮询间隔，单位为秒。
     interval_seconds: 1
+    # 单次有限等待上限，单位为秒。
     timeout_seconds: 60
+  safety:
+    database_control_enabled: false
+    mutable_configuration_enabled: false
+    message_publish_enabled: false
 ```
 
-`config/environments/local.yaml` is the placeholder-only example. Never generate `example.yaml`:
+The angle-bracket environment value is a metavariable and must be replaced with an environment discovered or explicitly selected for this task. Safety switches are false in committed files. A scenario cannot enable them. A runtime control requires explicit per-run authorization, exact environment identity, and the relevant source-backed control contract.
+
+Runtime authorization variables are process-only. Database control uses `E2E_ENABLE_DATABASE_CONTROL` and `E2E_CONTROL_AUTHORIZATION_REF`; mutable configuration uses `E2E_ENABLE_MUTABLE_CONFIGURATION` and `E2E_MUTABLE_CONFIGURATION_AUTHORIZATION_REF`; message publication uses `E2E_ENABLE_MESSAGE_PUBLISH` and `E2E_MESSAGE_PUBLISH_AUTHORIZATION_REF`; other dangerous test/admin, mock/fault, or job controls use `E2E_ENABLE_DANGEROUS_CONTROL` and `E2E_DANGEROUS_CONTROL_AUTHORIZATION_REF`. Every form also requires `E2E_CONTROL_ENVIRONMENT` to equal the active environment. Never persist these values.
+
+Each environment file contains only discovered entries. Conceptually:
 
 ```yaml
-# 用途：定义 local 环境的服务认证、请求 Header 和中间件连接；只允许保存环境变量占位符，不得保存真实敏感值。
-# HTTP 服务：服务名关联场景 integrations.http 和对应客户端。
+# 用途：将已发现的服务和组件映射到当前测试环境；敏感值只允许使用精确占位符。
 services:
-  mno-traffic:
-    # 服务根地址，格式为 http(s)://host[:port]，来源为 LOCAL_MNO_TRAFFIC_BASE_URL。
-    base_url: ${LOCAL_MNO_TRAFFIC_BASE_URL}
-    # 认证契约：type 与字段、Header 名必须由服务源码确认。
+  <discovered-service-id>:
+    base_url: ${<ENVIRONMENT_SPECIFIC_BASE_URL_REFERENCE>}
     auth:
-      # 认证枚举：ak_sk 表示使用访问密钥和签名密钥生成请求签名。
-      type: ak_sk
-      # 访问密钥文本，来源为 LOCAL_MNO_TRAFFIC_AK；真实值不得写入文件或日志。
-      ak: ${LOCAL_MNO_TRAFFIC_AK}
-      # 签名密钥文本，来源为 LOCAL_MNO_TRAFFIC_SK；真实值不得写入文件或日志。
-      sk: ${LOCAL_MNO_TRAFFIC_SK}
-      # 认证 Header 映射：值保持源码协议字段原名。
-      headers:
-        access_key: accesskey
-        signature: sign
-        timestamp: timestamp
-    # 自定义 Header：键保持源码协议字段原名，值来自 local 环境变量。
+      type: <source-confirmed-auth-type>
+      values:
+        <source-confirmed-auth-field>: ${<ENVIRONMENT_SPECIFIC_SECRET_REFERENCE>}
     headers:
-      # 租户标识文本，来源为 LOCAL_MNO_TRAFFIC_TENANT_ID。
-      x-tenant-id: ${LOCAL_MNO_TRAFFIC_TENANT_ID}
-  mno-operator:
-    # 服务根地址，格式为 http(s)://host[:port]，来源为 LOCAL_MNO_OPERATOR_BASE_URL。
-    base_url: ${LOCAL_MNO_OPERATOR_BASE_URL}
-    # 认证契约：none 表示源码确认该测试入口不需要认证信息。
-    auth:
-      type: none
-    # 源码确认无需自定义 Header 时保留显式空映射。
-    headers: {}
+      <source-confirmed-header-name>: ${<ENVIRONMENT_SPECIFIC_VALUE_REFERENCE>}
 
-# 中间件连接：仅保存精确环境变量占位符和非敏感协议选项。
-integrations:
-  kafka:
-    # Broker 列表，格式为 host:port[,host:port]，来源为 LOCAL_KAFKA_BOOTSTRAP_SERVERS。
-    bootstrap_servers: ${LOCAL_KAFKA_BOOTSTRAP_SERVERS}
-  mysql:
-    # 连接串格式由项目选定驱动定义，来源为 LOCAL_MYSQL_DSN；不得打印真实值。
-    dsn: ${LOCAL_MYSQL_DSN}
-  redis:
-    # Redis URI，格式为 redis(s)://...，来源为 LOCAL_REDIS_URL；凭据只能存在于环境变量。
-    url: ${LOCAL_REDIS_URL}
-    # 测试键前缀，格式为获批的非空命名空间，来源为 LOCAL_REDIS_TEST_KEY_PREFIX。
-    test_key_prefix: ${LOCAL_REDIS_TEST_KEY_PREFIX}
-  emq:
-    # Broker 主机名或 IP，来源为 LOCAL_EMQ_HOST。
-    host: ${LOCAL_EMQ_HOST}
-    # Broker 端口，格式为 1-65535 的十进制整数，来源为 LOCAL_EMQ_PORT。
-    port: ${LOCAL_EMQ_PORT}
-    # 测试账号，来源为 LOCAL_EMQ_USERNAME；不得打印真实值。
-    username: ${LOCAL_EMQ_USERNAME}
-    # 测试密码，来源为 LOCAL_EMQ_PASSWORD；不得打印真实值。
-    password: ${LOCAL_EMQ_PASSWORD}
-    # TLS 开关，格式为严格布尔值 true/false，来源为 LOCAL_EMQ_TLS_ENABLED。
-    tls: ${LOCAL_EMQ_TLS_ENABLED}
-    # MQTT 服务质量枚举：1 表示至少一次投递。
-    qos: 1
-    # retain=false 表示测试消息不由 Broker 保留。
-    retain: false
-    # 订阅主题前缀，格式为 MQTT 主题层级，来源为 LOCAL_EMQ_TOPIC_PREFIX。
-    topic_prefix: ${LOCAL_EMQ_TOPIC_PREFIX}
-    # 发布白名单前缀，格式为测试专属 MQTT 主题层级，来源为 LOCAL_EMQ_TEST_TOPIC_PREFIX。
-    test_topic_prefix: ${LOCAL_EMQ_TEST_TOPIC_PREFIX}
+components:
+  <discovered-component-id>:
+    type: <discovered-component-type>
+    connection:
+      <driver-defined-field>: ${<ENVIRONMENT_SPECIFIC_CONNECTION_REFERENCE>}
 ```
 
-Create additional `config/environments/<environment>.yaml` files only for real named environments such as `sit` or `staging`, using the same shape and environment-prefixed placeholders. Do not generate empty environment files. Capability `enabled` switches remain only in `runtime.yaml.defaults`; environment files provide connection values and cannot redefine them. Each service contains `base_url`, explicit `auth`, and `headers`; `headers` may be empty only when source confirms no custom headers. Supported `auth.type` values are source-confirmed `none`, `ak_sk`, `bearer`, `basic`, or `custom`. `ak_sk` requires non-blank `ak`, `sk`, and protocol Header mappings.
+Angle-bracket values are schema metavariables, not literal keys. Generate only entries that discovery found. Authentication shape, header names, client options, health path, OpenAPI path, broker settings, data-source names, and scheduler controls come from source/configuration evidence. Do not impose a fixed provider or protocol.
 
-Scenario definitions contain only HTTP service names and explicit component booleans:
+Create additional named environment files only for environments the user actually targets. Keep the same logical shape across files but use environment-specific exact placeholders. Do not generate empty example environments. Credentials remain environment variables or approved provider references and are never resolved into committed files or logs.
 
-```yaml
-# 用途：声明本场景实际依赖的客户端和组件；禁止保存连接参数或敏感值。
-# 依赖清单：HTTP 值关联客户端名；布尔值表示是否实例化并 preflight 对应组件。
-integrations:
-  http:
-    - mno-traffic
-    - mno-operator
-  kafka: true
-  mysql: true
-  redis: false
-  emq: false
-```
+## Selection and precedence
 
-Do not repeat endpoints, credentials, authentication, custom headers, topic prefixes, polling defaults, or shared `enabled` switches in `场景定义.yaml`. Keep environment-keyed business inputs in `业务数据.json`.
+Use one deterministic chain:
 
-Configuration and data selection use one deterministic chain:
+1. Parse `config.yaml` and validate `active_environment` against `[a-z][a-z0-9_-]*`.
+   Conventional production identifiers containing `prod`, `production`, `prd`, or `live` as a segment are rejected regardless of safety flags.
+2. Require exactly one matching environment file; never fall back to another environment.
+3. Recursively deep-merge E2E defaults with that environment mapping. Mapping values merge by key; a non-mapping replaces only its corresponding leaf.
+4. Ensure every referenced service/component exists in `discovery/workspace.yaml` and the scenario contract.
+5. Load the scenario's `业务数据.json`, select its exact active-environment root, and resolve `data_ref` only inside that object.
+6. During runtime preflight, recursively resolve only strings that exactly match `${ENV_NAME}`. Never interpolate partial strings.
 
-1. Parse `runtime.yaml` and validate `active_environment` against `[a-z][a-z0-9_-]*`.
-2. Require exactly one matching `environments/<active_environment>.yaml`; never fall back to `local` or another environment.
-3. Recursively deep-merge `runtime.yaml.defaults` with that environment mapping. Mapping values merge by key; a later non-mapping value replaces only its matching leaf.
-4. Load each scenario's `业务数据.json`, select its exact `<active_environment>` root object, and resolve `data_ref` inside that object. Never merge business values across environments.
-5. During preflight, recursively walk the selected configuration and business-data mappings/sequences and resolve only strings that exactly match `${ENV_NAME}`.
+Business data is not configuration. Inspect the source request models, validators, enums, length/range rules, and downstream correlation use before choosing each input:
 
-Treat an unset variable or a value whose trimmed text is empty as an explicit configuration failure, list the configuration/data key path without revealing the value, and report `pending_environment`. Do not interpolate partial strings or guess defaults. Convert values such as ports and booleans only under their schema-defined format.
+- keep source-valid constants, boundary values, prefixes, and request shapes as explicit JSON literals;
+- construct values that the scenario owns instead of adding an environment variable for each field;
+- generate unique random strings after preflight with the standard-library `secrets` module or `uuid`, preserving source-confirmed length, alphabet, and format constraints;
+- use exact `${ENV_NAME}` placeholders only for pre-existing environment-owned data that the test cannot safely create, such as an approved test account or seeded external identifier.
 
-## Collection before environment availability
+Every `data_ref` subtree must contain at least one constructible literal value. The contract gate rejects a referenced subtree made entirely from environment placeholders. A source-valid scenario that truly has no business input omits `data_ref` rather than inventing an empty injected object.
 
-Configuration and data modules may parse files at import time only if unresolved placeholders remain inert. They must not require environment variables, instantiate runtime clients, open sockets, or run health checks during module import, marker registration, or test collection.
+The contract gate also checks only the active scenario's required integrations and business data. A `ready` scenario fails when a required mapping is absent or an exact placeholder has no current value; unrelated service credentials never block it. `pending_environment` blockers are derived from and must exactly equal the missing active-environment values; they do not include per-run control authorization.
 
-Generate complete clients, builders, repositories, assertions, fixtures, scenario steps, and cleanup from source-confirmed contracts even when runtime values are missing. Use delayed imports for optional integration packages when importing them would otherwise break collection.
+This generated merge does not replace application configuration discovery. `discovery/workspace.yaml.configuration.precedence` records the application's actual low-to-high sources. A source default remains unresolved when a higher profile, environment variable, configuration center, command-line value, or local override may replace it.
 
-Resolve and validate runtime values in a preflight fixture or explicit preflight call before subscriptions, business requests, seed writes, or mutable configuration changes. Preflight:
+An unset or blank placeholder is a configuration failure. Report only the configuration/data path and placeholder name, never its resolved value. Parse ports, booleans, durations, and lists only according to the source-confirmed format.
 
-- validates the selected named environment and approved isolation;
-- checks values required by the scenario's `integrations` declaration;
-- validates service and component reachability without producing business data;
-- lists missing configuration keys without printing values or secrets;
-- reports `pending_environment` and fails clearly when requirements are unmet.
+## Collection without an environment
 
-Never call `pytest.skip`, `xfail`, or return a passing no-op for missing environment configuration. Use `contract_blocked` only for missing source contracts.
+Configuration and data modules may parse committed files at import time only while placeholders remain inert. They must not read secrets, instantiate clients, open sockets, inspect processes, run health checks, or connect to any component during module import, marker registration, or pytest collection.
+
+Generate complete source-confirmed clients, builders, repositories, controls, assertions, fixtures, steps, and cleanup when runtime values are missing. Delay imports of optional component libraries when importing them would otherwise break collection.
+
+`python -m pytest --collect-only` must succeed with no endpoint, credential, broker, database, cache, scheduler, or environment test value available.
+
+## Runtime preflight
+
+Resolve and validate runtime values immediately before the first runtime action. Preflight is scenario-aware and:
+
+- validates the selected environment and its allowed test/isolation boundary;
+- rejects contradictory `test_environment: true` plus `protected: true`, and rejects every write when `protected` is true, including API, message, job, mock/fault, dynamic-configuration, test/admin, and database controls;
+- checks only the services and components declared by that scenario;
+- verifies address and credential references without printing values;
+- runs non-destructive reachability checks before any subscription, seed write, message publication, job trigger, control SQL, or mutable configuration;
+- confirms unique run/scenario namespaces and exact correlation-key ownership;
+- confirms cleanup and restoration operations are registered and source-backed;
+- checks per-run authorization for every dangerous control;
+- reports missing values as `pending_environment` and fails clearly.
+
+Never call `pytest.skip`, `xfail`, `importorskip`, `unittest.SkipTest`, their aliases, or return a passing no-op for missing runtime configuration. Project `conftest.py` and implicit `usefixtures` are forbidden. Once preflight has resolved the environment and a real request is attempted, an unexpected runtime result is an ordinary failed test.
 
 ## Isolation and cleanup
 
 - Never fall back to a developer URL or implicit shared environment.
-- Use run- and scenario-derived namespaces, Kafka consumer groups, EMQ client IDs, cache prefixes, and object paths where contracts permit.
-- Register idempotent cleanup immediately after acquiring each owned resource.
-- Prefer business API cleanup. Direct database cleanup requires an approved test boundary and exact correlated keys.
-- Redis cleanup is permitted only for exact scenario-owned keys under the configured test prefix.
-- Snapshot and restore mutable settings under the project's approved lock; mark the scenario serial when isolation is impossible.
-- Guarantee cleanup through `finally`, `yield` fixture teardown, `request.addfinalizer`, `ExitStack`, or a context manager. A cleanup call placed only after assertions is insufficient.
-- When both the test body and cleanup fail, retain the test-body exception as the primary failure and record the cleanup exception through logging, notes, or another non-masking diagnostic. Raise a cleanup exception normally only when no earlier failure exists.
+- Derive namespaces, consumer groups, client IDs, cache/file prefixes, and other permitted identifiers from unique run and scenario IDs.
+- Register idempotent cleanup immediately after each resource is acquired.
+- Prefer the same business API for cleanup. Use a source-confirmed test/admin control only when the public contract cannot restore state safely.
+- Direct database cleanup or state control requires the policy in [discovery-and-control-policy.md](discovery-and-control-policy.md).
+- Cache cleanup is allowed only for exact scenario-owned keys under a configured test prefix. Never expose whole-database, wildcard, or business-key clearing.
+- Snapshot mutable configuration before change, require every mutable control identity to be an exact `owned_resources.identity`, and verify restoration under `finally` or a finalizer.
+- Pass the full preflight `scenario_context` to the shared restoration guard. It derives resource identities from the validated contract; scenario code never supplies restoration resource labels.
+- A cleanup call after the last assertion is insufficient unless guaranteed on every exception path.
+- When test and cleanup both fail, preserve the test exception and attach cleanup/restoration failure as a separate diagnostic. Raise cleanup failure normally only if no earlier failure exists.
 
-Cover deep merge, active-environment selection, authentication validation, isolated JSON data lookup, recursive placeholder resolution, missing/blank variables, and original-exception preservation with the focused shared-logic tests specified in [e2e-workflow.md](e2e-workflow.md). Use the project's existing test dependency.
+The main agent compares isolation resources across all scenarios before runtime. A collision blocks execution until identifiers are unique; declaring the same lock name does not bypass the gate.
 
-## Headers and signing
+## Request construction and signing
 
-Transport helpers expose per-request headers. Unless source says otherwise, merge ordinary headers in this order:
+Transport helpers expose per-request headers and preserve raw request bytes when source contracts require them. Merge ordinary headers according to the discovered application/client precedence; do not assume a universal order.
 
-```text
-runtime defaults < active environment < scenario < request
-```
+Implement authentication or signing only after source confirms its algorithm, canonicalization, encoding, timestamp/nonce, body handling, and reserved fields. Keep it scenario-owned until a second scenario truly shares the same contract. Add a fixed-vector unit test for non-trivial signing. Never log secrets, canonical strings containing secrets, authorization headers, or complete sensitive payloads.
 
-Apply signing after the merge. The signer removes stale reserved headers, then owns their final values. Signing settings and key references come from the active environment file, never from scenario definitions or hardcoded constants.
+Do not retain provider-specific signing templates in this generic skill.
 
-For the Seres contract, use [request-signing-template.md](request-signing-template.md). When disabled, send no `sign`, `timestamp`, or `accesskey`. When enabled, require the source-confirmed raw-body SHA-256 contract and never log the secret, access key, canonical string, authorization headers, or complete sensitive payload.
+## Focused shared tests
+
+Use the project's existing test dependencies to cover recursive merge, exact placeholder resolution, missing/blank variables, strict type parsing, active-environment selection, no cross-environment fallback, declared-integration gating, preflight-before-side-effect ordering, isolation collisions, authorization checks, original-exception preservation, and verified restoration. One representative test per invariant is enough.

@@ -1,4 +1,4 @@
 interface:
   display_name: "Python E2E Test Generator"
-  short_description: "Generate source-tracked pytest business E2E scenarios"
-  default_prompt: "Use $python-e2e-test-generator to generate or incrementally update self-contained Chinese business scenarios with per-scenario source-version impact checks and collectable pytest code."
+  short_description: "Discover and generate executable cross-service pytest E2E"
+  default_prompt: "Use $python-e2e-test-generator to discover the workspace and runtime configuration, map each scenario's safe controls, then generate, validate, execute, and restore source-tracked Python/pytest E2E scenarios."

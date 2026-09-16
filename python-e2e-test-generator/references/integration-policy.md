@@ -1,157 +1,88 @@
 # Cross-Service Integration Policy
 
-Read this reference when a scenario crosses a service boundary or uses Kafka, MySQL, Redis, EMQ/EMQX, XXL-JOB, or another observable component.
+Read this reference when a scenario crosses a service boundary or uses messages, a data store, cache, scheduler, configuration center, device gateway, or another observer/control.
 
 ## Boundaries
 
 Keep these concerns separate:
 
-1. `common/clients/` calls public business interfaces.
-2. `common/builders/` builds reusable source-confirmed payloads.
-3. `common/repositories/` owns read-only SQL and maps rows into stable records.
-4. `common/integrations/` provides generic component adapters.
-5. `common/fixtures/` owns adapter lifecycle and scenario isolation.
-6. `common/assertions/` compares protocol, message, and persistence evidence.
-7. Scenario modules express business actions, mappings, scenario-only assertions, and cleanup.
+1. `common/clients/` calls public or approved test/admin interfaces.
+2. `common/builders/` explicitly maps reusable source-confirmed payloads.
+3. `common/repositories/` owns parameterized read-only queries and stable record mapping.
+4. `common/controls/` owns default-off authorized and reversible controls.
+5. `common/integrations/` provides generic adapters for discovered component types.
+6. `common/fixtures/` owns adapter lifecycle, authorization, snapshots, and isolation.
+7. `common/assertions/` compares protocol, message, persistence, and observable evidence.
+8. Scenario modules express scenario-only actions, mappings, assertions, and cleanup.
 
-Generic modules accept environment configuration and scenario mappings. Do not embed business topic names, table names, credentials, or environment addresses in them. Reuse an approved pinned dependency; do not add an integration client silently.
+Generic modules accept discovered configuration and scenario mappings. Never embed a project name, business endpoint, table, topic, configuration key, credential, enum, state, or environment address. Reuse an already approved pinned dependency; do not add a client library silently.
 
-Shared integration capability defaults are configured in `config/runtime.yaml.defaults`. Connection details live only in the file selected by `runtime.yaml.active_environment`: `config/environments/<environment>.yaml`. A scenario declares `true` or `false` for Kafka, MySQL, Redis, and EMQ under `integrations`. Instantiate and preflight only components declared `true`; never fall back to another environment's middleware configuration.
+Instantiate and preflight only the services and components declared by the scenario. No adapter construction, connection, subscription, process inspection, or health check occurs during import or collection.
 
-No adapter construction, connection, subscription, or health check occurs during module import or pytest collection. Missing required runtime access produces `pending_environment` and a preflight failure, never a skip or weaker fallback.
+## HTTP and RPC
 
-## Kafka and database evidence
+- Derive base address, context path, protocol, authentication, headers, serialization, timeout, and TLS from discovery and the active environment.
+- Use health, OpenAPI, query, or guaranteed-miss requests for read-only smoke.
+- Direct `requests`, `httpx`, and `urllib` calls use an explicit positive timeout. `urlopen` with request data is a write and is forbidden in smoke. An arbitrary fixture method such as `client.get()` is not transport proof.
+- A read-only RPC smoke call goes through a common `read_only_rpc` adapter that declares `READ`/`RPC`, a source anchor from discovery, one bounded non-write operation, and a returned real result.
+- Validate transport status and the source-defined business envelope separately.
+- Record `verified=True` only from a validation expression that consumes that call's result. HTTP smoke status is an integer and 5xx always fails.
+- A successful transport with a failed business result is a failure.
+- Do not retry a non-idempotent call unless source declares an idempotency key and semantics.
+- Redact credentials and sensitive payload fields in diagnostics while retaining method, non-secret target identity, correlation key name, status, and bounded response summary.
 
-For Kafka publication evidence:
+## Messages
 
-1. Create a unique consumer group and subscribe to the exact source-confirmed topic before the business request.
-2. Wait for partition assignment and capture starting offsets.
-3. Invoke the public business action.
-4. Consume only from the bounded starting-offset/time window.
-5. Match with source-confirmed keys such as `orderNo`, `taskId`, `orderId`, atomic order ID, or `iccid`.
-6. Assert topic, key, relevant headers, schema/version, and business payload fields.
-7. Close the consumer even after a failure.
+For any discovered broker or gateway:
 
-For database evidence, use a repository method with a parameterized, read-only query. Poll by the same correlation key with a bounded deadline and report the last observed row. Assert ownership, state, meaningful columns, and relationships.
+1. create a unique run/scenario consumer identity;
+2. subscribe or capture starting position before the business action and wait for readiness;
+3. observe only a bounded offset/time window;
+4. match with source-confirmed correlation fields;
+5. assert channel identity, key/headers, schema/version, and relevant business fields;
+6. close deterministically after success or failure.
 
-Kafka proves publication; the database proves downstream processing and persistence. When both are declared, assert them independently and then compare every shared source-confirmed field. Define an explicit field map when names differ, normalize only source-confirmed representation differences, and report field name, Kafka value, and database value on mismatch. A broad topic match, a row found by time range alone, or equality of correlation IDs alone is insufficient.
+Publishing is disabled by default. It requires a source-confirmed simulation contract, per-run authorization, and a configured test-only destination prefix or exact allowlist. Reject retained messages, unrestricted wildcards, or business destinations unless the source-backed test contract explicitly requires them and the user authorized the exact test environment.
 
-## Redis
+For Kafka-like logs, wait for assignment and capture starting offsets. For MQTT-like brokers, use a unique client ID, source-confirmed QoS/TLS/session behavior, and deterministic disconnect. For other systems, preserve the same readiness, bounded observation, exact correlation, and cleanup invariants without forcing Kafka or MQTT terminology into generated code.
 
-When any scenario declares `integrations.redis: true`, provide these reusable modules:
+## Database observation
 
-```text
-common/integrations/redis.py
-common/fixtures/redis_observer.py
-```
+Observation repositories expose only parameterized read methods. Poll by the same scenario correlation key with a monotonic deadline and report the last observed record. Assert ownership, the requested business state/fields, and relevant relationships.
 
-Expose the minimum read-oriented contract:
+A message proves publication; a database record proves persistence or consumption. When both are evidence sources, assert them independently, then compare every shared source-confirmed field. Define explicit mappings for different field names or representations. A time-range-only row, broad message match, or equal correlation ID alone is insufficient.
 
-```python
-"""提供只读 Redis 业务证据观察能力。"""
+Database control follows [discovery-and-control-policy.md](discovery-and-control-policy.md). Keep control operations out of read repositories and test entrypoints. Never use control SQL as the business action under test.
 
+## Cache observation
 
-class RedisObserver:
-    """读取并等待场景声明的 Redis 证据。"""
+Expose the smallest source-required read surface, such as exact-key value, existence, TTL, or exact hash fields. Cache evidence is secondary when a public API, event, operation record, or database provides stronger business evidence.
 
-    def get_json(self, key: str) -> dict | None:
-        """读取并解码 JSON 值。"""
-        ...
+Load endpoint, credentials, logical database/index, TLS, serialization, and test prefix from the active environment. Bounded waits use monotonic deadlines and last-state diagnostics.
 
-    def exists(self, key: str) -> bool:
-        """判断指定键是否存在。"""
-        ...
+If cleanup is necessary, a fixture may delete only an exact scenario-owned key under the configured test prefix. Reject wildcard deletion, namespace-wide clearing, database flushing, and deletion of pre-existing business keys.
 
-    def ttl(self, key: str) -> int:
-        """读取指定键的剩余有效期。"""
-        ...
+## Schedulers and jobs
 
-    def hash_get_all(self, key: str) -> dict:
-        """读取并解码哈希字段。"""
-        ...
+Prefer an approved trigger or admin interface discovered in source. Correlate trigger arguments, execution record, and downstream state. A scheduler acknowledgement does not prove the job's business result.
 
-    def wait_for_key(self, key: str, timeout_seconds: int) -> dict | None:
-        """在限定时间内等待指定键出现。"""
-        ...
-```
+If time advancement or expiry simulation is needed, use a source-confirmed clock/configuration control or the controlled SQL policy. Snapshot the original state, isolate the target from other scenarios, trigger or await the job with a bounded deadline, verify its result, and restore the state.
 
-Requirements:
+Do not invoke an uncontrolled production schedule, alter global time, or call an undocumented scheduler endpoint.
 
-- Default to read-only operations and do not expose `flushdb`, wildcard deletion, or business-key cleanup.
-- Redis evidence is secondary when API, Kafka, or database evidence is available.
-- Validate exact key namespace, decoded value, and relevant TTL/version semantics from source.
-- If cleanup of an owned key is required, expose it only through a fixture that enforces the configured test prefix and rejects every other key.
-- Use a bounded monotonic deadline and useful last-state diagnostics for `wait_for_key`.
-- Load endpoints, credentials, database index, TLS, and test-key prefix only from the active environment file.
+## Dynamic configuration, mocks, and failure injection
 
-Do not generate these modules as empty scaffolding when Redis is unused.
+- Use only controls found in application source/configuration and present in the scenario matrix.
+- Record the control scope, affected component, correlation/isolation method, prior value, intended value, and restoration evidence.
+- Default controls off. Enabling requires the exact target test environment and per-run authorization.
+- Apply controls as narrowly as the platform permits; reject global changes when unrelated traffic can be affected.
+- Snapshot before mutation, verify that the application consumed the change, and restore in guaranteed cleanup.
+- A mock response or injected failure must still be verified through the public business result and downstream evidence relevant to the scenario.
 
-## EMQ/EMQX
+## Runtime diagnostics
 
-When any scenario declares `integrations.emq: true`, provide:
+Every adapter reports only non-secret endpoint identity, component type, correlation-key name, bounded deadline, and last observed state. Never include credential values, complete connection strings, authorization headers, raw sensitive messages, or full database rows.
 
-```text
-common/integrations/emq.py
-common/fixtures/emq_observer.py
-```
+Control and endpoint evidence is adapter-owned. Record it immediately after the real external call in the same straight-line block, derive endpoint status, summary, and verification from the returned object, and pass the same scenario-owned correlation value in a resource/key/selector or request-payload argument to both a write operation and its control event. Logging, headers, or tracing metadata do not establish isolation. Scenario steps and test entrypoints cannot emit these events.
 
-Expose these contracts:
-
-```python
-"""提供测试主题发布和 MQTT 业务消息观察能力。"""
-
-from collections.abc import Callable
-
-
-class EmqPublisher:
-    """仅向测试专属主题发布场景消息。"""
-
-    def publish(
-        self,
-        topic: str,
-        payload: dict,
-        qos: int = 1,
-        retain: bool = False,
-    ) -> None:
-        """向通过测试前缀校验的主题发布消息。"""
-        ...
-
-
-class EmqObserver:
-    """订阅并等待与场景关联的 MQTT 消息。"""
-
-    def start(self, topics: list[str]) -> None:
-        """订阅主题并等待订阅就绪。"""
-        ...
-
-    def wait_for_message(
-        self,
-        matcher: Callable[[dict], bool],
-        timeout_seconds: int,
-    ) -> dict | None:
-        """在限定时间内等待匹配的业务消息。"""
-        ...
-
-    def close(self) -> None:
-        """断开连接并释放客户端资源。"""
-        ...
-```
-
-Requirements:
-
-- Build a unique client ID from the run and scenario IDs to avoid session collisions.
-- Subscribe and confirm readiness before the business action.
-- Support configured TLS, account, QoS, retain behavior, and topic prefix.
-- Load broker addresses, credentials, TLS, and topic prefixes only from the active environment file.
-- Validate every publisher topic against the configured test-topic prefix. Never default to publishing into a business topic.
-- Match messages with a source-confirmed correlation key and bounded deadline.
-- Disconnect deterministically through a fixture finalizer or context manager.
-
-Do not generate these modules as empty scaffolding when EMQ is unused.
-
-## Other observers
-
-- **XXL-JOB:** use an approved trigger, correlate arguments and execution records, assert both job outcome and downstream state, and restore owned configuration.
-- **Other stores or brokers:** preserve the same rules: preflight, pre-observation setup, exact correlation, bounded wait, useful diagnostics, and deterministic cleanup.
-
-Each observer reports its non-secret endpoint identifier, correlation key, deadline, and last observed state with sensitive values redacted.
+Connection or runtime failures after preflight are failed smoke/business checks. They cannot be converted to `pending_environment`, `contract_blocked`, `skip`, or `xfail`.
