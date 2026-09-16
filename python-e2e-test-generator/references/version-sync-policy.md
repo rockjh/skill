@@ -5,14 +5,20 @@ Every `scenarios/*/场景定义.yaml` records its own compact source basis. Ther
 ## Source contract
 
 ```yaml
+# 用途：记录本场景完成契约审查时的源码基线；禁止保存凭据、地址或其他敏感值。
+# 源码关联：每项对应一个被场景依赖的仓库，repo 是项目约定中的稳定关联键。
 source:
   - repo: mno-traffic
+    # 40 位 Git SHA，表示已完成场景影响审查的提交，不代表未提交改动。
     commit: 61604f3dd84cea56cc29732faea2dbd727a6e906
+    # 高价值源码符号，用于重新定位入口、模型、状态变化和消息链路；列表不得为空。
     anchors:
       - SoftwareSaleSubscriptionController
       - OperatorThresholdFulfillmentService
   - repo: mno-operator
+    # 40 位 Git SHA，格式和语义与上一仓库相同。
     commit: 16640b8fb5dd10c7d1e94eed16b3e35a3cb09077
+    # 与该仓库直接相关且可解析的源码符号。
     anchors:
       - OperatorBusinessOperatorApplication
 ```
@@ -49,6 +55,15 @@ Relevant dirty source cannot be represented by the compact commit field. Do not 
 
 ## Script behavior
 
-`scripts/check_source_versions.py` discovers `scenarios/*/场景定义.yaml` and emits one result per scenario/repository with recorded/current commits, dirty state, relevant files, affected anchors, decision, and concise reason.
+`scripts/check_source_versions.py` discovers `scenarios/*/场景定义.yaml`. It accepts optional `--scenario <中文场景名称>` to inspect exactly one scenario directory; an unknown or ambiguous name is an error. Without the option it inspects all scenarios.
+
+Emit one concise human-readable result per scenario/repository containing:
+
+- recorded commit and current commit;
+- clean/dirty state;
+- relevant changed files;
+- affected or unresolved anchors;
+- exactly one decision: `unchanged`, `no_relevant_change`, `affected`, `full_rediscovery_required`, or `dirty_review_required`;
+- a concise reason for that decision.
 
 The check command is read-only. It must not silently update definitions, regenerate tests, discard working-tree changes, fetch or rewrite Git history, or collapse multiple scenarios into one project-level result. An explicit update workflow may write `source.commit` only after content inspection and impact analysis finish.

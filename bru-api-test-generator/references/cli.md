@@ -36,6 +36,8 @@ and execution assets.
 `--source-root` arguments for source enhancement. `check` performs strict
 static reconciliation. `preflight` builds a fresh static report and evaluates
 runtime readiness. `reconcile` requires both normalized results and preflight
-results. `run` performs the complete version and QA-lock checks, scope-wide
-risk confirmation, preflight, Bruno execution, normalization, reconciliation,
-and global completion pipeline.
+results. `run` defaults to all modules and accepts only the optional `--module`
+scope selector. It performs version and QA-lock checks, preflight, Bruno
+execution, normalization, reconciliation, per-case reporting, timestamped
+logging, and the global completion pipeline. Version drift warns without
+blocking execution.

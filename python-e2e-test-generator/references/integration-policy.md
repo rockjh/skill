@@ -16,7 +16,7 @@ Keep these concerns separate:
 
 Generic modules accept environment configuration and scenario mappings. Do not embed business topic names, table names, credentials, or environment addresses in them. Reuse an approved pinned dependency; do not add an integration client silently.
 
-Shared integration capability is configured in `config/common.yaml`. Connection details live only in `config/environments/<profile>.yaml`. A scenario declares `true` or `false` for Kafka, MySQL, Redis, and EMQ under `integrations`. Instantiate and preflight only components declared `true`.
+Shared integration capability defaults are configured in `config/runtime.yaml.defaults`. Connection details live only in the file selected by `runtime.yaml.active_environment`: `config/environments/<environment>.yaml`. A scenario declares `true` or `false` for Kafka, MySQL, Redis, and EMQ under `integrations`. Instantiate and preflight only components declared `true`; never fall back to another environment's middleware configuration.
 
 No adapter construction, connection, subscription, or health check occurs during module import or pytest collection. Missing required runtime access produces `pending_environment` and a preflight failure, never a skip or weaker fallback.
 
@@ -82,7 +82,7 @@ Requirements:
 - Validate exact key namespace, decoded value, and relevant TTL/version semantics from source.
 - If cleanup of an owned key is required, expose it only through a fixture that enforces the configured test prefix and rejects every other key.
 - Use a bounded monotonic deadline and useful last-state diagnostics for `wait_for_key`.
-- Load endpoints, credentials, database index, TLS, and test-key prefix only from the selected environment profile.
+- Load endpoints, credentials, database index, TLS, and test-key prefix only from the active environment file.
 
 Do not generate these modules as empty scaffolding when Redis is unused.
 
@@ -142,7 +142,7 @@ Requirements:
 - Build a unique client ID from the run and scenario IDs to avoid session collisions.
 - Subscribe and confirm readiness before the business action.
 - Support configured TLS, account, QoS, retain behavior, and topic prefix.
-- Load broker addresses, credentials, TLS, and topic prefixes only from the selected environment profile.
+- Load broker addresses, credentials, TLS, and topic prefixes only from the active environment file.
 - Validate every publisher topic against the configured test-topic prefix. Never default to publishing into a business topic.
 - Match messages with a source-confirmed correlation key and bounded deadline.
 - Disconnect deterministically through a fixture finalizer or context manager.

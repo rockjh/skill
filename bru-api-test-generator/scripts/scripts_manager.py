@@ -27,6 +27,7 @@ README_FALLBACK = """# QA 脚本工具链
 SCRIPT_NAMES = (
     "analyze_java_logic.py",
     "analyze_source_logic.py",
+    "command_execution.py",
     "check_api_coverage.py",
     "check_artifact_safety.py",
     "check_version_compatibility.py",

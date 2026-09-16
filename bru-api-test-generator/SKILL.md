@@ -1,6 +1,6 @@
 ---
 name: bru-api-test-generator
-description: Generate and maintain auditable Bruno HTTP API tests in a business-code repository from an offline OpenAPI contract, optional source evidence, and environment configuration. Use for module-partitioned API case generation, execution, risk confirmation, and strict coverage reconciliation; do not use for browser or database-heavy system E2E workflows.
+description: Generate and maintain auditable Bruno HTTP API tests in a business-code repository from an offline OpenAPI contract, optional source evidence, and environment configuration. Use for module-partitioned API case generation, execution, risk reporting, and strict coverage reconciliation; do not use for browser or database-heavy system E2E workflows.
 ---
 
 # Bruno API Test Generator
@@ -53,6 +53,7 @@ qa/
     run.bat
     run.sh
     README.md
+  logs/
   scripts/
 ```
 
@@ -90,6 +91,7 @@ Read [references/offline-swagger.md](references/offline-swagger.md) for acquisit
 ## Scenario Matrix
 
 Every endpoint records decisions for `success`, `authentication`, `authorization`, `validation`, `business_error`, `query`, `safety`, and `file`. An applicable decision links at least one dedicated case. A confirmed false decision includes concrete evidence and a reason.
+Every applicable contract constraint also has a stable `coverage_id` such as `VALIDATION:POST /users:body.name:minLength`, `FILE:POST /imports:body.file:mime`, or `QUERY:GET /users:pageSize:maximum`. Each ID must be linked by a case or an approved exclusion.
 
 - `success`: at least one distinct case for every reachable endpoint.
 - `authentication`: distinguish `auth-token` authentication from `admin-operator-context` audit context. Generate missing/invalid-token cases only after representative probes establish actual status and response shape.
@@ -100,17 +102,19 @@ Every endpoint records decisions for `success`, `authentication`, `authorization
 - `business_error`: generate only from API-reachable source exceptions and real error codes.
 - `safety`: generate only from declared idempotency, concurrency, or repeat-submission semantics.
 
-Cases keep a `risk` field, concrete request data, expected HTTP status, expected business code when known, and exact response assertions. A status-only assertion is incomplete. Draft placeholders may use an existence assertion for review, but they cannot pass verified completion.
+Cases keep a confirmed `risk` field, concrete request data, expected HTTP status, expected business code when known, and exact response assertions. A status-only assertion is incomplete. Success cases assert an exact business-success value plus a concrete result field or request/response relationship. `$ exists`, `review-*`, unresolved variables, and unconfirmed risks are draft-only and block runnable state.
 
 ## Source Evidence
 
 Source scanners produce candidates, not proof. For Java, trace API-reachable calls through:
 
 ```text
-Controller -> Application -> Domain Service -> Repository / Integration
+Controller -> ApplicationDelegator.apply -> Application.doServe -> Domain Service -> Repository / Integration
 ```
 
-Follow calls to `MnoTrafficApplicationException` and `MnoTrafficErrorCodeEnum`. Do not substitute unrelated exception or error-code types. Exclude `src/test`, architecture tests, Javadoc, error-enum definitions, constant-only classes, generated/build directories, and branches not reachable from an API mapping.
+Discover the project exception family in this order: exception types handled by `ControllerAdvice`, exception constructors that accept an ErrorCode type, then a unique `XxxApplicationException` plus `XxxErrorCode` pair. Multiple candidates are blocking unless `--exception-type` and `--error-code-type` select one explicitly. Never exclude or prefer a project name in reusable scanner code.
+
+Identify an endpoint by HTTP method plus its full class-and-method mapping path and controller method. Duplicate `operationId` values are not endpoint identity. `throws`, multiline generics, and multiline annotations are valid method declarations. If source contains Spring Mapping annotations but the scanner finds zero entrypoints, stop as blocked.
 
 Every coverage-required candidate must map to exactly one endpoint and one or more real case IDs. Ambiguous mapping is immediately blocking:
 
@@ -126,41 +130,36 @@ Never summarize unresolved candidates as non-blocking review output.
 - Keep only the case risk in `.bru` `meta.tags`; never generate `plan-*` tags and never use tags to select execution scope.
 - Use a two-or-more-digit stable sequence plus the sanitized Chinese `case.title` for each business filename. Keep the stable English case ID in `meta.name` and manifests.
 - Preserve exact method, path, query, body, Header omission, assertions, captures, and flow variables from `cases.yaml`.
+- Serialize query arrays and objects according to OpenAPI `style` and `explode`. Resolve every path parameter from a concrete OpenAPI example or a declared environment/capture variable.
 - Inject common Headers and optional signing once in `collection.bru`; request-local Headers win.
+- A normal materialization fully synchronizes an unmodified `.bru` from `cases.yaml`. Concurrent edits to the case and `.bru` produce a structured diff and block. `materialize --check` is read-only and reports drift.
 
 ## Execution
 
-There are exactly two execution scopes:
+The generated launcher accepts only one optional execution selector:
 
 ```bat
-qa\execution\run.bat --all
-qa\execution\run.bat --module "APP车辆用量查询"
+qa\execution\run.bat
+qa\execution\run.bat --module "AC-信息"
 ```
 
-`--all` and `--module` are mutually exclusive. A module can be selected by module ID, display name, directory, or OpenAPI Tag. There is no `--plan` entry and no `--risk` case filter. The selected collection or module always runs all registered business requests.
+No argument runs every module. `--module` accepts a module ID, display name, directory, or OpenAPI Tag and runs every registered request in that module. Do not generate `--all`, read/write, destructive, external-confirmation, `--plan`, or `--risk` parameters. Add usage comments directly to `run.bat` and `run.sh`.
 
-Before any request, derive the selected scope's actual risks from `cases.yaml`:
+Before any request, validate every `{{variable}}` against the active environment or a declared capture and validate file variables as real files. Never synthesize credentials, `operatorInfo`, fixtures, or upload files. Risk remains case metadata for reporting; it does not require an execution flag.
 
-| Included risk | Required confirmation |
-| --- | --- |
-| `read-only` only | none |
-| `isolated-write` | `--confirm-write` |
-| `destructive` | `--confirm-write --confirm-destructive` |
-| `external-side-effect` | `--confirm-external` |
+The runner prints each stage, then one `PASS` or `FAIL` line per selected case. After reconciliation it prints total, success count, failure count, failed case IDs, and version warnings. Mirror all console output to a new plain-text file under `qa/logs/` on every invocation; name it with a high-resolution timestamp and the selected scope.
 
-Missing confirmation fails before preflight or Bruno sends a request. After confirmation, run compatibility and QA-lock checks, preflight, the selected directory, evidence normalization, artifact-safety checks where evidence is retained, and strict reconciliation.
+Run compatibility and QA-lock checks, preflight, the selected directory, evidence normalization, artifact-safety checks where evidence is retained, and strict reconciliation. A version mismatch, missing version lock, stale local source version, unreachable version endpoint, or unverifiable remote deployment prints a red warning immediately and again in the final summary, but never blocks the current execution. Structural, configuration, connectivity, assertion, and coverage failures still block or fail normally.
 
-Run all modules with:
-
-```bat
-qa\execution\run.bat --all --confirm-write --confirm-destructive --confirm-external
-```
+For a remote `baseUrl`, optionally configure `versionPath` in the active Bruno environment. The runner reads a scalar version from common JSON fields and compares it with `version-lock.yaml`; `expectedVersion` overrides the expected value, while `versionJsonPath` or `versionHeader` selects a non-standard response. Keep the version URL on the same origin as `baseUrl`. If no endpoint is configured, warn that the remote version is unverifiable and continue.
 
 Read [references/execution-evidence.md](references/execution-evidence.md) for evidence requirements and [references/version-management.md](references/version-management.md) for lock handling.
 
 ## Completion Gates
 
-Global `status: verified` is valid only after an `--all` run proves:
+State meanings are fixed: `draft` is editable and makes no execution claim; `blocked` has a coverage or runtime configuration gap; `runnable` is deterministic for the selected scope; `verified` has passed complete execution and cleanup evidence. Any applicable scenario/constraint gap, review placeholder, ambiguous source mapping, stale QA lock, or failed execution is blocking. Business/deployment version drift is warning-only.
+
+Global `status: verified` is valid only after a default all-module run proves:
 
 - every endpoint has a success case;
 - every applicable scenario has a linked case;
@@ -169,7 +168,7 @@ Global `status: verified` is valid only after an `--all` run proves:
 - every case has exact assertions and passed execution evidence;
 - every declared flow has ordered, passed evidence and verified cleanup;
 - preflight passed;
-- the offline OpenAPI, generation state, QA lock, and business version lock are current.
+- the offline OpenAPI, generation state, and QA lock are current; business/deployment version warnings are retained in the run log.
 
 A module run reports `module_status: verified` and `module_completion_ok: true` when its scope passes. It must not write `version-lock.yaml`, global `generation-state.yaml`, global index completion, or global verified state.
 
@@ -184,8 +183,9 @@ python qa/scripts/check_artifact_safety.py qa/bruno qa/contracts
 - Do not modify business code to make a test pass.
 - Do not relax coverage, source mapping, exact assertion, flow, preflight, or lock checks.
 - Do not guess credentials, authentication envelopes, permission behavior, business errors, file constraints, or destructive fixtures.
-- Do not execute writes, destructive cases, or external side effects without their explicit confirmations.
 - Do not update global completion or version locks from a module run.
+- `check` is read-only by default. Only explicit `--write-status` may update `index.yaml`; generation and materialization own generated assets.
+- Preflight accepts only a `full-matrix-strict` report with all strict-check metadata, matching OpenAPI SHA, and a current QA lock. `static_ok: true` alone is insufficient. Business/deployment version drift remains a visible warning.
 - Do not ignore malformed JSON, invalid UTF-8, mojibake, duplicate IDs, duplicate case mappings, unregistered `.bru` files, or stale evidence.
 - Keep cases deterministic, independently runnable where possible, and safe to rerun.
 

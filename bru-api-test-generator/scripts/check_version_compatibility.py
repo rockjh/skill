@@ -21,10 +21,15 @@ from manifest_io import load_data
 DEFAULT_API_PATTERNS = [
     "**/controller/**",
     "*Controller.java",
+    "**/application/**",
     "**/service/**",
     "*Service.java",
     "**/dto/**",
     "**/domain/**",
+    "**/repository/**",
+    "**/integration/**",
+    "**/infrastructure/**",
+    "**/adapter/**",
     "**/validation/**",
     "**/security/**",
     "**/error/**",
@@ -108,6 +113,19 @@ DEFAULT_API_PATTERNS = [
     "pubspec.yaml",
 ]
 DEFAULT_IGNORE_PATTERNS = ["qa/**", "**/qa/**"]
+DEFAULT_NON_API_PATTERNS = [
+    "**/test/**", "**/tests/**", "test/**", "tests/**",
+    "**/*.md", "*.md", "docs/**", "**/docs/**",
+]
+STRICT_COMPLETION_FIELDS = (
+    "scenario_matrix_checked",
+    "constraint_obligations_checked",
+    "exact_assertions_checked",
+    "variables_checked",
+    "source_mapping_checked",
+    "qa_lock_checked",
+    "business_version_checked",
+)
 
 
 def git(repo: Path, *args: str) -> str:
@@ -149,12 +167,28 @@ def git_available(repo: Path) -> bool:
 
 
 def changed_files(repo: Path, old_sha: str, current_sha: str) -> list[str]:
-    raw = git(repo, "diff", "--name-status", f"{old_sha}..{current_sha}")
+    try:
+        raw = subprocess.check_output(
+            ["git", "-C", str(repo), "diff", "--name-status", "-z", f"{old_sha}..{current_sha}"],
+            encoding="utf-8", errors="strict", stderr=subprocess.STDOUT,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(f"git diff failed in {repo}: {exc.output.strip()}") from exc
+    fields = raw.split("\0")
     paths: list[str] = []
-    for line in raw.splitlines():
-        parts = line.split("\t")
-        if len(parts) >= 2:
-            paths.append(parts[-1])
+    index = 0
+    while index < len(fields) and fields[index]:
+        status = fields[index]
+        index += 1
+        if index >= len(fields):
+            break
+        first = fields[index]
+        index += 1
+        if status[:1] in {"R", "C"} and index < len(fields):
+            paths.append(fields[index])
+            index += 1
+        else:
+            paths.append(first)
     return paths
 
 
@@ -165,7 +199,7 @@ def dirty_files(repo: Path) -> list[str]:
         # Do not use git(), whose strip() would remove the leading porcelain
         # status column and shift the path by one character.
         raw = subprocess.check_output(
-            ["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=all"],
+            ["git", "-C", str(repo), "status", "--porcelain=v1", "-z", "--untracked-files=all"],
             text=True,
             encoding="utf-8",
             errors="strict",
@@ -174,14 +208,17 @@ def dirty_files(repo: Path) -> list[str]:
     except subprocess.CalledProcessError as exc:
         raise SystemExit(f"git status failed in {repo}: {exc.output.strip()}") from exc
     paths: list[str] = []
-    for line in raw.splitlines():
-        if len(line) < 4:
+    fields = raw.split("\0")
+    index = 0
+    while index < len(fields) and fields[index]:
+        record = fields[index]
+        index += 1
+        if len(record) < 4:
             continue
-        value = line[3:]
-        # Rename/copy status is rendered as "old -> new"; the new path is the
-        # observable file that needs impact classification.
-        if " -> " in value:
-            value = value.rsplit(" -> ", 1)[-1]
+        status = record[:2]
+        value = record[3:]
+        if ("R" in status or "C" in status) and index < len(fields):
+            index += 1
         if not is_qa_path(value):
             paths.append(value)
     return paths
@@ -222,10 +259,14 @@ def source_digest(repo: Path) -> str:
 def classify(paths: list[str], rules: dict[str, Any]) -> str:
     api_patterns = rules.get("api_patterns", DEFAULT_API_PATTERNS)
     ignored = [*DEFAULT_IGNORE_PATTERNS, *rules.get("ignore_patterns", [])]
+    non_api = rules.get("non_api_patterns", DEFAULT_NON_API_PATTERNS)
     for path in paths:
-        if any(fnmatch.fnmatch(path, pattern) for pattern in ignored):
+        normalized = path.replace("\\", "/").lower()
+        if any(fnmatch.fnmatch(normalized, str(pattern).lower()) for pattern in ignored):
             continue
-        if any(fnmatch.fnmatch(path, pattern) for pattern in api_patterns):
+        if any(fnmatch.fnmatch(normalized, str(pattern).lower()) for pattern in api_patterns):
+            return "api-impact"
+        if not any(fnmatch.fnmatch(normalized, str(pattern).lower()) for pattern in non_api):
             return "api-impact"
     return "non-api"
 
@@ -233,13 +274,17 @@ def classify(paths: list[str], rules: dict[str, Any]) -> str:
 def change_classes(paths: list[str], rules: dict[str, Any]) -> dict[str, list[str]]:
     ignored = [*DEFAULT_IGNORE_PATTERNS, *rules.get("ignore_patterns", [])]
     api_patterns = rules.get("api_patterns", DEFAULT_API_PATTERNS)
+    non_api = rules.get("non_api_patterns", DEFAULT_NON_API_PATTERNS)
     groups = {"business_code": [], "qa_assets": [], "unrelated": []}
     for path in paths:
+        normalized = path.replace("\\", "/").lower()
         if is_qa_path(path):
             groups["qa_assets"].append(path)
-        elif any(fnmatch.fnmatch(path, pattern) for pattern in ignored):
+        elif any(fnmatch.fnmatch(normalized, str(pattern).lower()) for pattern in ignored):
             groups["unrelated"].append(path)
-        elif any(fnmatch.fnmatch(path, pattern) for pattern in api_patterns):
+        elif any(fnmatch.fnmatch(normalized, str(pattern).lower()) for pattern in api_patterns) or not any(
+            fnmatch.fnmatch(normalized, str(pattern).lower()) for pattern in non_api
+        ):
             groups["business_code"].append(path)
         else:
             groups["unrelated"].append(path)
@@ -318,10 +363,18 @@ def main() -> int:
         if not isinstance(loaded, dict):
             raise SystemExit("completion report must contain an object")
         completion_report = loaded
-    if (args.phase == "complete" or args.write) and (
-        not completion_report or completion_report.get("completion_ok") is not True or completion_report.get("status") != "verified"
-    ):
-        print("ERROR: completion phase requires a coverage report with completion_ok=true and status=verified")
+    strict_completion = bool(
+        completion_report
+        and completion_report.get("report_version") == 2
+        and completion_report.get("check_profile") == "full-matrix-strict"
+        and all(completion_report.get(field) is True for field in STRICT_COMPLETION_FIELDS)
+        and completion_report.get("execution_scope") == "all"
+        and completion_report.get("completion_ok") is True
+        and completion_report.get("status") == "verified"
+        and not completion_report.get("errors")
+    )
+    if (args.phase == "complete" or args.write) and not strict_completion:
+        print("ERROR: completion phase requires a successful full-matrix-strict v2 all-scope coverage report")
         return 3
     if args.phase in {"before-generate", "before-execute"} and args.write:
         print("ERROR: version lock cannot be written during a pre-generation or pre-execution phase")
@@ -333,6 +386,10 @@ def main() -> int:
     lock = load_data(lock_path)
     if not isinstance(lock, dict):
         raise SystemExit("version-lock.yaml must contain an object")
+    lock_status = str(lock.get("status", "")).strip().lower()
+    if args.phase in {"before-execute", "complete"} and lock_status != "current":
+        print(f"ERROR: business version lock status is {lock_status or '<missing>'}; expected current")
+        return 3
     business = lock.get("business", {})
     locked_sha = business.get("commit") if isinstance(business, dict) else None
     if not locked_sha:
@@ -489,6 +546,8 @@ def main() -> int:
                 }
             )
             updated["version"] = updated.get("version", 1)
+            updated["status"] = "current"
+            updated_business["baseline_status"] = "current"
             updated["business"] = updated_business
             dump_lock(lock_path, updated)
             report["status"] = "updated"

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import difflib
+import hashlib
 import json
 import re
 import sys
@@ -22,6 +24,7 @@ from execution_config import (
     load_execution_config,
 )
 from parse_openapi import display_directory, render_manifest, update_module_document
+from qa_lock import write as write_qa_lock
 
 
 LEGACY_AUTH_MARKER = "bru-api-test-generator: auth-start"
@@ -111,13 +114,48 @@ def display_case_file(
 
 def request_url(endpoint: dict[str, Any], request: dict[str, Any], base_env: str = "baseUrl") -> str:
     path = str(request.get("path") or endpoint.get("path") or "/")
+    path_parameters = request.get("path_parameters", {})
+    if isinstance(path_parameters, dict):
+        for name, value in path_parameters.items():
+            rendered = str(value)
+            if not re.fullmatch(r"\{\{[^}]+\}\}", rendered):
+                rendered = urllib.parse.quote(rendered, safe="")
+            path = path.replace("{" + str(name) + "}", rendered)
     path = re.sub(r"(?<!\{)\{([^{}]+)\}(?!\})", lambda match: "{{" + match.group(1) + "}}", path)
     query = request.get("query")
     if isinstance(query, dict) and query:
-        pairs = []
+        pairs: list[tuple[str, Any]] = []
+        parameters = {
+            str(item.get("name")): item
+            for item in endpoint.get("parameters", [])
+            if isinstance(item, dict) and item.get("in") == "query" and item.get("name")
+        }
         for key, value in query.items():
-            if isinstance(value, (dict, list)):
-                raise ValueError(f"query field {key} must be flattened or declare a supported serialization")
+            parameter = parameters.get(str(key), {})
+            style = str(parameter.get("style") or "form")
+            explode = parameter.get("explode")
+            explode = style == "form" if explode is None else bool(explode)
+            if isinstance(value, list):
+                if style == "form" and explode:
+                    pairs.extend((str(key), item) for item in value)
+                else:
+                    delimiter = {"spaceDelimited": " ", "pipeDelimited": "|"}.get(style, ",")
+                    pairs.append((str(key), delimiter.join(str(item) for item in value)))
+                continue
+            if isinstance(value, dict):
+                if style == "deepObject":
+                    pairs.extend((f"{key}[{name}]", item) for name, item in value.items())
+                elif style == "form" and explode:
+                    pairs.extend((str(name), item) for name, item in value.items())
+                elif style == "form":
+                    flattened = ",".join(str(item) for pair in value.items() for item in pair)
+                    pairs.append((str(key), flattened))
+                else:
+                    raise ValueError(f"query field {key} uses unsupported object serialization style {style}")
+                continue
+            pairs.append((str(key), value))
+        rendered_pairs = []
+        for key, value in pairs:
             if isinstance(value, bool):
                 rendered = str(value).lower()
             elif value is None:
@@ -126,8 +164,8 @@ def request_url(endpoint: dict[str, Any], request: dict[str, Any], base_env: str
                 rendered = str(value)
             if not re.fullmatch(r"\{\{[^}]+\}\}", rendered):
                 rendered = urllib.parse.quote(rendered, safe="")
-            pairs.append(f"{urllib.parse.quote(str(key), safe='')}={rendered}")
-        path += "?" + "&".join(pairs)
+            rendered_pairs.append(f"{urllib.parse.quote(str(key), safe='')}={rendered}")
+        path += "?" + "&".join(rendered_pairs)
     return "{{" + base_env + "}}" + path
 
 
@@ -332,7 +370,7 @@ def render_case(
             request["content_type"] = inferred_content_type
     kind = body_kind(request, body)
     sequence = sequence if sequence is not None else case.get("sequence", case.get("seq", 1))
-    risk = str(case.get("risk") or ("read-only" if method.upper() in {"GET", "HEAD", "OPTIONS"} else "isolated-write"))
+    risk = str(case.get("risk") or ("read-only" if method.upper() in {"GET", "HEAD", "OPTIONS"} else "unconfirmed"))
     lines = [
         "meta {",
         f"  name: {case.get('id')}",
@@ -485,7 +523,7 @@ def case_risk(case: dict[str, Any], endpoint: dict[str, Any]) -> str:
     declared = str(case.get("risk", "")).strip()
     if declared:
         return declared
-    return "read-only" if str(endpoint.get("method", "GET")).upper() in {"GET", "HEAD", "OPTIONS"} else "isolated-write"
+    return "read-only" if str(endpoint.get("method", "GET")).upper() in {"GET", "HEAD", "OPTIONS"} else "unconfirmed"
 
 
 def contract_signature(content: str) -> str:
@@ -494,6 +532,28 @@ def contract_signature(content: str) -> str:
         content,
     )
     return "\n".join(re.sub(r"\s+", " ", block).strip() for block in blocks)
+
+
+def _case_fingerprint(case: dict[str, Any]) -> str:
+    payload = {
+        key: value
+        for key, value in case.items()
+        if key not in {"bru", "bru_file", "file_name", "manual_review"}
+    }
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _conflict(case_id: str, actual: str, expected: str) -> SystemExit:
+    difference = list(difflib.unified_diff(
+        actual.splitlines(), expected.splitlines(), fromfile="current.bru", tofile="cases.yaml rendered", lineterm=""
+    ))[:80]
+    return SystemExit(json.dumps({
+        "error": "materialize_conflict",
+        "case_id": case_id,
+        "message": ".bru and cases.yaml both changed since the last materialization",
+        "diff": difference,
+    }, ensure_ascii=False, indent=2))
 
 
 def sync_index_counts(contracts_root: Path) -> None:
@@ -528,6 +588,7 @@ def materialize(
     module_filter: str | None = None,
     sync_index: bool = True,
     check: bool = False,
+    verify: bool = True,
 ) -> list[Path]:
     modules_root = contracts_root / "modules"
     if not modules_root.is_dir():
@@ -554,6 +615,10 @@ def materialize(
         for item in module_map.get("modules", [])
         if isinstance(item, dict) and item.get("id")
     } if isinstance(module_map, dict) and isinstance(module_map.get("modules"), list) else {}
+    state_path = contracts_root / "generation-state.yaml"
+    generation_state = load_data(state_path) if state_path.is_file() else {}
+    state_cases = generation_state.get("cases", {}) if isinstance(generation_state, dict) and isinstance(generation_state.get("cases"), dict) else {}
+    materialized_state: dict[str, dict[str, Any]] = {}
     for module_dir in sorted(path for path in modules_root.iterdir() if path.is_dir()):
         endpoints_doc = load_data(module_dir / "endpoints.yaml")
         endpoints = first_list(endpoints_doc, "endpoints")
@@ -660,6 +725,10 @@ def materialize(
         for case, endpoint, target, tags in planned:
             case_id = str(case["id"])
             rendered_case = dict(case)
+            expected_sequence = int(target.stem.split("-", 1)[0])
+            expected = render_case(rendered_case, endpoint, expected_sequence)
+            current_case_fingerprint = _case_fingerprint(case)
+            baseline = state_cases.get(case_id, {}) if isinstance(state_cases.get(case_id), dict) else {}
             if target.exists():
                 try:
                     existing = target.read_text(encoding="utf-8", errors="strict")
@@ -671,27 +740,57 @@ def materialize(
                         f"Bruno filename collision: case {case_id} maps to {target}, "
                         f"whose meta.name is {actual_id or '<missing>'}"
                     )
+                actual_hash = hashlib.sha256(existing.encode("utf-8")).hexdigest()
+                case_changed = bool(
+                    baseline.get("materialized_case_fingerprint")
+                    and baseline.get("materialized_case_fingerprint") != current_case_fingerprint
+                )
+                bru_changed = bool(
+                    baseline.get("bru_sha256")
+                    and baseline.get("bru_sha256") != actual_hash
+                )
+                if case_changed and bru_changed:
+                    raise _conflict(case_id, existing, expected)
                 if check:
-                    expected_sequence = int(target.stem.split("-", 1)[0])
-                    expected = render_case(rendered_case, endpoint, expected_sequence)
-                    if (
-                        contract_signature(existing) != contract_signature(expected)
-                        or ensure_request_script(ensure_execution_tags(existing, tags), case) != existing
-                    ):
+                    if existing != expected:
                         created.append(target)
+                    materialized_state[case_id] = {
+                        "materialized_case_fingerprint": current_case_fingerprint,
+                        "bru_sha256": actual_hash,
+                    }
                     continue
-                updated = ensure_request_script(ensure_execution_tags(existing, tags), case)
-                if updated == existing:
+                if bru_changed and not case_changed and existing != expected:
+                    raise SystemExit(json.dumps({
+                        "error": "manual_bru_drift",
+                        "case_id": case_id,
+                        "message": ".bru was modified outside materialization; reconcile it with cases.yaml",
+                        "diff": list(difflib.unified_diff(
+                            existing.splitlines(), expected.splitlines(),
+                            fromfile="current.bru", tofile="cases.yaml rendered", lineterm="",
+                        ))[:80],
+                    }, ensure_ascii=False, indent=2))
+                if expected == existing:
+                    materialized_state[case_id] = {
+                        "materialized_case_fingerprint": current_case_fingerprint,
+                        "bru_sha256": actual_hash,
+                    }
                     continue
                 created.append(target)
                 if not dry_run:
-                    target.write_text(updated, encoding="utf-8")
+                    target.write_text(expected, encoding="utf-8")
+                materialized_state[case_id] = {
+                    "materialized_case_fingerprint": current_case_fingerprint,
+                    "bru_sha256": hashlib.sha256(expected.encode("utf-8")).hexdigest(),
+                }
                 continue
             created.append(target)
             if not dry_run:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target_sequence = int(target.stem.split("-", 1)[0])
-                target.write_text(render_case(rendered_case, endpoint, target_sequence), encoding="utf-8")
+                target.write_text(expected, encoding="utf-8")
+            materialized_state[case_id] = {
+                "materialized_case_fingerprint": current_case_fingerprint,
+                "bru_sha256": hashlib.sha256(expected.encode("utf-8")).hexdigest(),
+            }
         if module_bru.is_dir():
             for existing_path in sorted(module_bru.rglob("*.bru")):
                 try:
@@ -738,6 +837,30 @@ def materialize(
                     existing_path.write_text(updated, encoding="utf-8")
     if not dry_run and sync_index and not module_filter:
         sync_index_counts(contracts_root)
+    if not dry_run and isinstance(generation_state, dict) and materialized_state:
+        updated_state = dict(generation_state)
+        updated_cases = dict(state_cases)
+        for case_id, values in materialized_state.items():
+            current = dict(updated_cases.get(case_id, {})) if isinstance(updated_cases.get(case_id), dict) else {}
+            current.update(values)
+            current["fingerprint"] = values["materialized_case_fingerprint"]
+            updated_cases[case_id] = current
+        updated_state["cases"] = updated_cases
+        state_path.write_text(render_manifest(updated_state, state_path), encoding="utf-8")
+        write_qa_lock(contracts_root)
+    if not dry_run and verify:
+        drift = materialize(
+            contracts_root,
+            bruno_root,
+            dry_run=True,
+            execution_config_path=execution_config_path,
+            module_filter=module_filter,
+            sync_index=False,
+            check=True,
+            verify=False,
+        )
+        if drift:
+            raise SystemExit("materialize consistency check failed: " + ", ".join(str(path) for path in drift))
     return list(dict.fromkeys(created))
 
 

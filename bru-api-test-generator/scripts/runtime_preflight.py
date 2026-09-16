@@ -4,11 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -27,6 +27,9 @@ from execution_config import (
     load_execution_config,
     required_environment_names,
 )
+from command_execution import command_argv
+from qa_lock import check as check_qa_lock
+from manifest_io import load_data
 
 
 def validate_base_url(value: str) -> str:
@@ -41,6 +44,11 @@ def validate_base_url(value: str) -> str:
 def join_url(base: str, path: str) -> str:
     parsed = urllib.parse.urlsplit(base)
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, f"{parsed.path.rstrip('/')}/{path.lstrip('/')}", "", ""))
+
+
+def is_remote_url(value: str) -> bool:
+    hostname = (urllib.parse.urlsplit(value).hostname or "").casefold()
+    return hostname not in {"localhost", "127.0.0.1", "::1"}
 
 
 def parse_statuses(value: str) -> set[int]:
@@ -92,20 +100,58 @@ def body_code(body: Any) -> Any:
 
 
 MIN_BRUNO_VERSION = (4, 1, 0)
+STRICT_REPORT_VERSION = 2
+STRICT_STATIC_FIELDS = (
+    "scenario_matrix_checked",
+    "constraint_obligations_checked",
+    "exact_assertions_checked",
+    "variables_checked",
+    "source_mapping_checked",
+    "qa_lock_checked",
+    "business_version_checked",
+)
 
 
-def bruno_cli_version(executable: str) -> tuple[tuple[int, int, int] | None, str]:
-    resolved = shutil.which(executable)
-    if not resolved:
+def process_is_running(pid: Any) -> bool:
+    try:
+        process_id = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if process_id <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(process_id, 0)
+            return True
+        except OSError:
+            return False
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = (ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong)
+    open_process.restype = ctypes.c_void_p
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (ctypes.c_void_p,)
+    close_handle.restype = ctypes.c_int
+    handle = open_process(0x1000, False, process_id)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return False
+    close_handle(handle)
+    return True
+
+
+def bruno_cli_version(executable: str, timeout: float = 10.0) -> tuple[tuple[int, int, int] | None, str]:
+    try:
+        command = command_argv(executable, "--version")
+    except FileNotFoundError:
         return None, ""
     try:
         completed = subprocess.run(
-            [resolved, "--version"],
+            command,
             check=False,
             capture_output=True,
             text=True,
             encoding="utf-8",
-            timeout=10,
+            timeout=timeout,
         )
     except (OSError, subprocess.SubprocessError):
         return None, ""
@@ -150,6 +196,7 @@ def main() -> int:
     parser.add_argument("--fixture", action="append", type=Path, default=[])
     parser.add_argument("--timeout", type=float, default=3.0)
     parser.add_argument("--bruno-cli", default="bru", help="Bruno CLI executable checked for execution readiness")
+    parser.add_argument("--cli-timeout", type=float, default=10.0, help="seconds allowed for the Bruno version probe")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
@@ -157,6 +204,7 @@ def main() -> int:
     static_failures: list[str] = []
     context_failures: list[str] = []
     execution_failures: list[str] = []
+    warnings: list[str] = []
     config_path = args.execution_config or (Path(__file__).resolve().parents[1] / "execution" / "config.yaml")
     config: dict[str, Any] | None = None
     environment_values: dict[str, str] = {}
@@ -186,12 +234,16 @@ def main() -> int:
             static_failures.append(f"cannot read static coverage results {args.static_results}: {exc}")
         else:
             static_report = loaded_static_report if isinstance(loaded_static_report, dict) else None
-            static_ok = static_report is not None and (
-                static_report.get("static_ready") is True or static_report.get("static_ok") is True
+            static_ok = bool(
+                static_report is not None
+                and static_report.get("report_version") == STRICT_REPORT_VERSION
+                and static_report.get("check_profile") == "full-matrix-strict"
+                and static_report.get("static_ok") is True
+                and all(static_report.get(field) is True for field in STRICT_STATIC_FIELDS)
             )
             checks.append({"name": "static_coverage", "ok": static_ok, "file": str(args.static_results)})
             if not static_ok:
-                static_failures.append("static coverage results did not pass")
+                static_failures.append("static coverage results are not a full-matrix-strict version 2 report")
     base_url: str | None = None
     base_url_value = environment_values.get("baseUrl") or environment_values.get("BASE_URL")
     if base_url_value:
@@ -203,8 +255,10 @@ def main() -> int:
         execution_failures.append("base URL is missing; configure baseUrl in the active Bruno environment")
     if args.timeout <= 0:
         execution_failures.append("timeout must be positive")
+    if args.cli_timeout <= 0:
+        execution_failures.append("CLI timeout must be positive")
 
-    cli_version, cli_output = bruno_cli_version(args.bruno_cli)
+    cli_version, cli_output = bruno_cli_version(args.bruno_cli, args.cli_timeout)
     cli_available = cli_version is not None
     cli_supported = cli_version is not None and cli_version >= MIN_BRUNO_VERSION
     checks.append({
@@ -254,6 +308,19 @@ def main() -> int:
             checks.append({"name": "openapi_fingerprint", "ok": match, "sha256": digest})
             if not expected_match:
                 static_failures.append(f"offline OpenAPI fingerprint mismatch: expected {args.expected_openapi_sha256}, got {digest}")
+            qa_lock_errors = check_qa_lock(args.openapi.parent)
+            checks.append({"name": "qa_lock", "ok": not qa_lock_errors})
+            static_failures.extend(f"QA lock is not current: {error}" for error in qa_lock_errors)
+            openapi_document = load_data(args.openapi)
+            provenance = openapi_document.get("provenance", {}) if isinstance(openapi_document, dict) else {}
+            application_pid = provenance.get("application_pid") if isinstance(provenance, dict) else None
+            if base_url and is_remote_url(base_url):
+                checks.append({"name": "openapi_application_pid", "ok": True, "skipped": "remote target"})
+            else:
+                pid_ok = process_is_running(application_pid)
+                checks.append({"name": "openapi_application_pid", "ok": pid_ok, "pid": application_pid})
+                if not pid_ok:
+                    warnings.append("OpenAPI provenance application PID is missing or no longer running")
 
     if base_url and args.public_path:
         result = request(join_url(base_url, args.public_path), args.public_method, args.timeout)
@@ -289,16 +356,23 @@ def main() -> int:
     failures = [*static_failures, *context_failures, *execution_failures]
 
     report = {
-        "version": 1,
+        "version": 2,
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "base_url": base_url,
         "environment": active_environment,
-        "status": "runnable" if static_ready and context_ready and execution_ready else ("draft" if static_ready else "blocked"),
+        "status": "runnable" if static_ready and context_ready and execution_ready else "blocked",
         "static_ready": static_ready,
         "context_ready": context_ready,
         "execution_ready": execution_ready,
+        "check_profile": static_report.get("check_profile") if static_report else None,
+        "static_report_version": static_report.get("report_version") if static_report else None,
+        "openapi_sha256": (
+            hashlib.sha256(args.openapi.read_bytes()).hexdigest()
+            if args.openapi and args.openapi.is_file() else None
+        ),
         "checks": checks,
         "errors": failures,
+        "warnings": warnings,
     }
     rendered = json.dumps(report, ensure_ascii=True, indent=2) + "\n"
     if args.output:

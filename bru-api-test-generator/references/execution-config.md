@@ -60,44 +60,47 @@ When `sign.provider` is `seres`, `collection.bru` reads `ACCESS_KEY` and `SECRET
 
 ## Execution Scope
 
-There are only two scopes:
+The launcher has one optional scope selector:
 
 ```bat
-qa\execution\run.bat --all
-qa\execution\run.bat --module ac
-qa\execution\run.bat --module "APP车辆用量查询"
+qa\execution\run.bat
+qa\execution\run.bat --module "AC-信息"
 ```
 
-`--all` and `--module` are mutually exclusive. Module selection accepts module ID, display name, directory, or OpenAPI Tag. The selected scope always runs all registered business requests. There are no named plans and risk is not a filter.
+No argument runs every module. `--module` accepts a module ID, display name, directory, or OpenAPI Tag and runs every registered request in that module. The generated launchers contain these examples as comments. There are no all/read/write/external-confirmation, named-plan, or risk-filter parameters.
 
-## Risk Confirmation
-
-Before preflight or any HTTP request, the runner reads all selected `cases.yaml` files and computes the included risks:
-
-| Risk | Required flags |
-| --- | --- |
-| `read-only` | none |
-| `isolated-write` | `--confirm-write` |
-| `destructive` | `--confirm-write --confirm-destructive` |
-| `external-side-effect` | `--confirm-external` |
-
-Example full confirmation:
-
-```bat
-qa\execution\run.bat --all --confirm-write --confirm-destructive --confirm-external
-qa\execution\run.bat --module ac --confirm-write --confirm-destructive --confirm-external
-```
-
-Missing flags fail the whole scope before any request. The runner never executes a safe subset first.
+Risk is retained in case metadata and the run report. It never changes the selected scope or requires an execution flag.
 
 Bruno executes a directory directly instead of using tag filtering:
 
 ```text
---all       -> bru run qa/bruno -r
+no argument -> bru run qa/bruno -r
 --module x  -> bru run qa/bruno/<module-directory> -r
 ```
 
 `.bru` tags contain only the case risk for inspection and reporting.
+
+## Output And Logs
+
+The runner prints stage progress and a `PASS` or `FAIL` line for every selected case. Its final summary contains total, success count, failure count, failed case IDs, and version warnings. Every invocation creates a plain-text log under `qa/logs/`, named with a high-resolution timestamp and `run-bruno-<scope>`.
+
+## Local And Remote Versions
+
+Local source and `version-lock.yaml` compatibility are checked before execution. Any mismatch is a red warning, repeated in the summary, and does not block the run.
+
+For a remote target, add the version endpoint to the active environment:
+
+```bru
+vars {
+  baseUrl: https://api.example.com
+  versionPath: /actuator/info
+  expectedVersion: 1.8.2
+  versionJsonPath: build.version
+  versionHeader: ""
+}
+```
+
+`expectedVersion` is optional and defaults to the business commit in `version-lock.yaml`. `versionJsonPath` and `versionHeader` are optional selectors; without them the runner tries common JSON version and Git commit fields. `versionPath` may be relative or absolute but must remain on the `baseUrl` origin so environment credentials are not sent elsewhere. Missing configuration, unreachable endpoints, and mismatches warn and continue. Remote execution skips the local OpenAPI producer PID check.
 
 ## Tooling Modes And Migration
 

@@ -159,7 +159,10 @@ def parameter_summary(parameter: Any) -> dict[str, Any]:
         result["schema"] = parameter["schema"]
     elif "type" in parameter:
         result["type"] = parameter["type"]
-    for key in ("enum", "minimum", "maximum", "minLength", "maxLength", "pattern", "format", "example", "default", "items"):
+    for key in (
+        "enum", "minimum", "maximum", "minLength", "maxLength", "pattern", "format",
+        "example", "default", "items", "style", "explode", "allowReserved",
+    ):
         if key in parameter:
             result[key] = parameter[key]
     return result
@@ -209,13 +212,14 @@ def extract(path: Path, document: dict[str, Any]) -> dict[str, Any]:
             }
             for extension in (
                 "x-permissions", "x-permission", "x-roles", "x-role",
-                "x-idempotent", "x-safety",
+                "x-idempotent", "x-safety", "x-risk", "x-side-effect",
             ):
                 if extension in operation:
                     endpoint[extension] = resolve_value(document, operation[extension])
             explicit_primary = operation.get("x-primary-tag") or operation.get("primary_tag")
             if isinstance(explicit_primary, str) and explicit_primary.strip():
                 endpoint["primary_tag"] = explicit_primary.strip()
+            endpoint["obligations"] = constraint_obligations(endpoint)
             endpoints.append(endpoint)
 
     endpoints.sort(key=lambda item: (item["path"], item["method"]))
@@ -562,6 +566,181 @@ def request_body_schema(endpoint: dict[str, Any]) -> tuple[str | None, dict[str,
     return media_type, schema
 
 
+CONSTRAINT_KEYS = ("enum", "pattern", "minimum", "maximum", "minLength", "maxLength", "format")
+
+
+def constraint_obligations(endpoint: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return stable, independently checkable OpenAPI constraint obligations."""
+
+    endpoint_key = f"{str(endpoint.get('method', '')).upper()} {endpoint.get('path', '')}"
+    obligations: list[dict[str, Any]] = []
+
+    def add(kind: str, target: str, constraint: str, evidence: Any = True) -> None:
+        obligations.append({
+            "id": f"{kind}:{endpoint_key}:{target}:{constraint}",
+            "kind": kind.lower(),
+            "target": target,
+            "constraint": constraint,
+            "evidence": copy.deepcopy(evidence),
+        })
+
+    for parameter in (item for item in endpoint.get("parameters", []) if isinstance(item, dict)):
+        location = str(parameter.get("in", "query"))
+        name = str(parameter.get("name", "parameter"))
+        schema = parameter.get("schema", {}) if isinstance(parameter.get("schema"), dict) else parameter
+        kind = "QUERY" if location == "query" else "VALIDATION"
+        if parameter.get("required") is True and location != "path":
+            add(kind, f"{location}.{name}", "required")
+        for key in CONSTRAINT_KEYS:
+            if key in schema:
+                add(kind, f"{location}.{name}", key, schema[key])
+
+    media_type, body_schema = request_body_schema(endpoint)
+
+    def walk_schema(schema: dict[str, Any], prefix: str) -> None:
+        properties = schema.get("properties", {}) if isinstance(schema.get("properties"), dict) else {}
+        required = schema.get("required", []) if isinstance(schema.get("required"), list) else []
+        for name, child in properties.items():
+            if not isinstance(child, dict):
+                continue
+            target = f"{prefix}.{name}"
+            is_file = child.get("format") == "binary"
+            if name in required:
+                add("FILE" if is_file else "VALIDATION", target, "missing")
+            for key in CONSTRAINT_KEYS:
+                if key in child and not (is_file and key in {"format", "minLength", "maxLength"}):
+                    add("VALIDATION", target, key, child[key])
+            if is_file:
+                for constraint, keys in (
+                    ("empty", ("minLength", "x-min-size")),
+                    ("extension", ("x-allowed-extensions",)),
+                    ("mime", ("contentMediaType", "x-allowed-mime-types")),
+                    ("size", ("maxLength", "x-max-size")),
+                ):
+                    evidence = next((child[key] for key in keys if key in child), None)
+                    if evidence is not None:
+                        add("FILE", target, constraint, evidence)
+            walk_schema(child, target)
+            items = child.get("items")
+            if isinstance(items, dict):
+                walk_schema(items, target + "[]")
+
+    walk_schema(body_schema, "body")
+    if media_type and str(media_type) != "multipart/form-data":
+        add("VALIDATION", "Content-Type", "content-type", media_type)
+    return obligations
+
+
+def _response_evidence(endpoint: dict[str, Any], status: int) -> tuple[dict[str, Any], Any]:
+    responses = endpoint.get("responses", {}) if isinstance(endpoint.get("responses"), dict) else {}
+    response = responses.get(str(status), responses.get(status, {}))
+    response = response if isinstance(response, dict) else {}
+    content = response.get("content", {}) if isinstance(response.get("content"), dict) else {}
+    media = next((item for item in content.values() if isinstance(item, dict)), {})
+    schema = media.get("schema", {}) if isinstance(media.get("schema"), dict) else {}
+    if not schema and isinstance(response.get("schema"), dict):
+        schema = response["schema"]
+    example = media.get("example", response.get("example"))
+    examples = media.get("examples")
+    if example is None and isinstance(examples, dict):
+        first = next((item for item in examples.values() if isinstance(item, dict)), None)
+        example = first.get("value") if first else None
+    return schema, example
+
+
+def _fixed_schema_value(schema: Any) -> Any:
+    if not isinstance(schema, dict):
+        return None
+    for key in ("const", "example", "default"):
+        if key in schema:
+            return copy.deepcopy(schema[key])
+    enum = schema.get("enum")
+    return copy.deepcopy(enum[0]) if isinstance(enum, list) and len(enum) == 1 else None
+
+
+def exact_response_assertions(endpoint: dict[str, Any], status: int) -> list[dict[str, Any]]:
+    """Derive exact response assertions only from explicit contract values."""
+
+    schema, example = _response_evidence(endpoint, status)
+    properties = schema.get("properties", {}) if isinstance(schema.get("properties"), dict) else {}
+    fixed: dict[str, Any] = {}
+    if isinstance(example, dict):
+        fixed.update({str(key): value for key, value in example.items() if not isinstance(value, (dict, list))})
+    for key, value_schema in properties.items():
+        value = _fixed_schema_value(value_schema)
+        if value is not None:
+            fixed.setdefault(str(key), value)
+    business_key = next((key for key in ("errorCode", "code", "status") if key in fixed), None)
+    if business_key is None:
+        return []
+    success_values = {0, "0", 200, "200", True, "true", "ok", "success", "SUCCESS", "OK"}
+    if fixed[business_key] not in success_values:
+        return []
+    envelope_keys = {"status", "errorCode", "code", "errorMsg", "msg", "message"}
+    detail = next(
+        ((f"$.{key}", value) for key, value in fixed.items() if key not in envelope_keys),
+        None,
+    )
+    if detail is None and isinstance(example, dict):
+        for key, value in example.items():
+            if key in envelope_keys:
+                continue
+            if isinstance(value, list):
+                detail = (f"$.{key}", value)
+                break
+            if not isinstance(value, dict):
+                continue
+            detail = next(
+                ((f"$.{key}.{name}", item) for name, item in value.items() if not isinstance(item, (dict, list))),
+                None,
+            )
+            if detail:
+                break
+    if detail is None:
+        return []
+    return [
+        {"path": f"$.{business_key}", "equals": fixed[business_key]},
+        {"path": detail[0], "equals": detail[1]},
+    ]
+
+
+def exact_error_assertions(endpoint: dict[str, Any], status: int) -> list[dict[str, Any]]:
+    schema, example = _response_evidence(endpoint, status)
+    properties = schema.get("properties", {}) if isinstance(schema.get("properties"), dict) else {}
+    fixed: dict[str, Any] = {}
+    if isinstance(example, dict):
+        fixed.update({str(key): value for key, value in example.items() if not isinstance(value, (dict, list))})
+    for key, value_schema in properties.items():
+        value = _fixed_schema_value(value_schema)
+        if value is not None:
+            fixed.setdefault(str(key), value)
+    keys = [key for key in ("status", "errorCode", "code", "errorMsg", "msg", "message") if key in fixed]
+    return [{"path": f"$.{key}", "equals": fixed[key]} for key in keys[:2]]
+
+
+def response_business_code_path(endpoint: dict[str, Any], status: int) -> str | None:
+    schema, example = _response_evidence(endpoint, status)
+    properties = schema.get("properties", {}) if isinstance(schema.get("properties"), dict) else {}
+    example = example if isinstance(example, dict) else {}
+    return next((f"$.{key}" for key in ("errorCode", "code", "status") if key in properties or key in example), None)
+
+
+def response_array_path(endpoint: dict[str, Any], status: int) -> str | None:
+    schema, _ = _response_evidence(endpoint, status)
+    if schema.get("type") == "array":
+        return "$"
+    properties = schema.get("properties", {}) if isinstance(schema.get("properties"), dict) else {}
+    for first in ("data", "result", "items", "list", "records"):
+        value = properties.get(first)
+        if isinstance(value, dict) and value.get("type") == "array":
+            return f"$.{first}"
+        nested = value.get("properties", {}) if isinstance(value, dict) and isinstance(value.get("properties"), dict) else {}
+        for second in ("items", "list", "records", "content"):
+            if isinstance(nested.get(second), dict) and nested[second].get("type") == "array":
+                return f"$.{first}.{second}"
+    return None
+
+
 def inferred_scenario_matrix(endpoint: dict[str, Any]) -> dict[str, dict[str, Any]]:
     parameters = [item for item in endpoint.get("parameters", []) if isinstance(item, dict)]
     media_type, body_schema = request_body_schema(endpoint)
@@ -871,6 +1050,19 @@ def seed_contract_cases(
     responses = endpoint.get("responses", {}) if isinstance(endpoint.get("responses"), dict) else {}
     success_status = next((int(code) for code in responses if str(code).isdigit() and 200 <= int(code) < 300), None)
     error_status = next((int(code) for code in responses if str(code) in {"400", "422"}), None)
+    obligations = {
+        str(item.get("id")): item
+        for item in endpoint.get("obligations", constraint_obligations(endpoint))
+        if isinstance(item, dict) and item.get("id")
+    }
+
+    def obligation_ids(target: str, *constraints: str) -> list[str]:
+        wanted = set(constraints)
+        return [
+            obligation_id
+            for obligation_id, item in obligations.items()
+            if item.get("target") == target and item.get("constraint") in wanted
+        ]
 
     def schema_value(schema: dict[str, Any], name: str = "value") -> Any:
         for key in ("example", "default"):
@@ -879,6 +1071,8 @@ def seed_contract_cases(
         enum = schema.get("enum")
         if isinstance(enum, list) and enum:
             return copy.deepcopy(enum[0])
+        if schema.get("format") == "binary":
+            return {"file": "{{UPLOAD_FILE}}"}
         kind = str(schema.get("type", "string")).lower()
         if kind == "integer":
             return max(int(schema.get("minimum", 1)), 1)
@@ -897,8 +1091,6 @@ def seed_contract_cases(
                 str(field): schema_value(properties.get(field, {}) if isinstance(properties.get(field), dict) else {}, str(field))
                 for field in names
             }
-        if schema.get("format") == "binary":
-            return {"file": "{{UPLOAD_FILE}}"}
         return f"review-{name}"
 
     def set_parameter(request: dict[str, Any], parameter: dict[str, Any], value: Any) -> None:
@@ -908,33 +1100,91 @@ def seed_contract_cases(
             request.setdefault("query", {})[name] = value
         elif location == "header":
             request.setdefault("headers", {})[name] = value
+        elif location == "path":
+            request.setdefault("path_parameters", {})[name] = value
 
     parameters = [item for item in endpoint.get("parameters", []) if isinstance(item, dict)]
     success_request: dict[str, Any] = {}
     for parameter in parameters:
-        if parameter.get("required") is True or parameter.get("example") is not None:
+        if parameter.get("required") is True or parameter.get("example") is not None or parameter.get("examples"):
             schema = parameter.get("schema", {}) if isinstance(parameter.get("schema"), dict) else parameter
-            set_parameter(success_request, parameter, schema_value(schema, str(parameter.get("name", "parameter"))))
+            name = str(parameter.get("name", "parameter"))
+            examples = parameter.get("examples") if isinstance(parameter.get("examples"), dict) else {}
+            example = next(
+                (
+                    item.get("value") if isinstance(item, dict) and "value" in item else item
+                    for item in examples.values()
+                ),
+                None,
+            )
+            if parameter.get("in") == "header" and name.casefold() in {"operatorinfo", "authorization", "cookie"}:
+                variable = {
+                    "operatorinfo": "OPERATOR_INFO",
+                    "authorization": "AUTH_TOKEN",
+                    "cookie": "SESSION_COOKIE",
+                }[name.casefold()]
+                value = "{{" + variable + "}}"
+            elif parameter.get("example") is not None:
+                value = copy.deepcopy(parameter["example"])
+            elif example is not None:
+                value = copy.deepcopy(example)
+            elif parameter.get("in") == "path" and not any(key in schema for key in ("example", "default", "enum")):
+                value = "{{PATH_" + re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").upper() + "}}"
+            else:
+                value = schema_value(schema, name)
+            set_parameter(success_request, parameter, value)
 
     media_type, body_schema = request_body_schema(endpoint)
     if body_schema:
         success_request["body_type"] = media_type or "application/json"
         success_request["body"] = schema_value(body_schema, "body")
 
-    def build(suffix: str, scenario: str, detail: str, status: int, request: dict[str, Any]) -> dict[str, Any]:
+    success_assertions = exact_response_assertions(endpoint, success_status) if success_status is not None else []
+    error_assertions = exact_error_assertions(endpoint, error_status) if error_status is not None else []
+
+    def build(
+        suffix: str,
+        scenario: str,
+        detail: str,
+        status: int,
+        request: dict[str, Any],
+        coverage_ids: list[str] | None = None,
+        assertions: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        case_assertions = copy.deepcopy(
+            assertions if assertions is not None else (success_assertions if 200 <= status < 300 else error_assertions)
+        )
+        write_method = str(endpoint.get("method", "GET")).upper() not in {"GET", "HEAD", "OPTIONS"}
+        declared_risk = endpoint.get("x-risk")
+        if declared_risk not in {"read-only", "isolated-write", "destructive", "external-side-effect"}:
+            declared_risk = (
+                "external-side-effect" if endpoint.get("x-side-effect")
+                else "read-only" if not write_method
+                else "unconfirmed"
+            )
+        exact = bool(case_assertions)
+        if scenario == "query" and 200 <= status < 300:
+            result_roots = ("$.data", "$.result", "$.items", "$.list", "$.records", "$.content", "$.page", "$.total")
+            exact = exact and any(
+                str(item.get("path", "")) == "$"
+                or any(str(item.get("path", "")).startswith(root) for root in result_roots)
+                for item in case_assertions
+                if isinstance(item, dict)
+            )
         return {
             "id": f"{endpoint_id}_{suffix}",
             "title": business_case_title(endpoint, scenario, detail, status),
             "description": f"验证{endpoint_business_action(endpoint)}的{detail or '正常'}场景。",
             "endpoint_id": endpoint_id,
             "scenario": scenario,
-            "status": "draft",
+            "status": "runnable" if exact and declared_risk != "unconfirmed" else "draft",
             "source": "openapi",
-            "review_required": True,
-            "risk": "read-only" if str(endpoint.get("method", "GET")).upper() in {"GET", "HEAD", "OPTIONS"} else "isolated-write",
+            "review_required": not exact or declared_risk == "unconfirmed",
+            "risk": declared_risk,
             "request": copy.deepcopy(request),
             "expected": {"http_status": status},
-            "assertions": [{"path": "$", "exists": True}],
+            "coverage_ids": list(dict.fromkeys(coverage_ids or [])),
+            "assertions": case_assertions,
         }
 
     seeded = [build("SUCCESS", "success", "", success_status, success_request)] if success_status is not None else []
@@ -952,15 +1202,24 @@ def seed_contract_cases(
                     name,
                 ]))
             detail = f"缺少必填 Header {name}" if location == "header" else f"缺少必填参数 {name}"
-            seeded.append(build(f"MISSING_{suffix}", "validation", detail, error_status, request))
+            seeded.append(build(
+                f"MISSING_{suffix}", "validation", detail, error_status, request,
+                obligation_ids(f"{location}.{name}", "required"),
+            ))
         if error_status is not None and isinstance(schema.get("enum"), list):
             request = copy.deepcopy(success_request)
             set_parameter(request, parameter, "__INVALID_ENUM__")
-            seeded.append(build(f"INVALID_{suffix}", "validation", f"参数 {name} 使用非法枚举值", error_status, request))
+            seeded.append(build(
+                f"INVALID_{suffix}", "validation", f"参数 {name} 使用非法枚举值", error_status, request,
+                obligation_ids(f"{location}.{name}", "enum"),
+            ))
         if error_status is not None and schema.get("pattern"):
             request = copy.deepcopy(success_request)
             set_parameter(request, parameter, "__INVALID_PATTERN__")
-            seeded.append(build(f"INVALID_PATTERN_{suffix}", "validation", f"参数 {name} 不符合格式", error_status, request))
+            seeded.append(build(
+                f"INVALID_PATTERN_{suffix}", "validation", f"参数 {name} 不符合格式", error_status, request,
+                obligation_ids(f"{location}.{name}", "pattern"),
+            ))
         for keyword, delta, label in (
             ("minimum", -1, "小于最小值"),
             ("maximum", 1, "大于最大值"),
@@ -980,6 +1239,7 @@ def seed_contract_cases(
             seeded.append(build(
                 f"INVALID_{keyword.upper()}_{suffix}", "validation",
                 f"参数 {name} {label}", error_status, request,
+                obligation_ids(f"{location}.{name}", keyword),
             ))
         if error_status is not None and schema.get("format"):
             request = copy.deepcopy(success_request)
@@ -987,6 +1247,7 @@ def seed_contract_cases(
             seeded.append(build(
                 f"INVALID_FORMAT_{suffix}", "validation",
                 f"参数 {name} 格式非法", error_status, request,
+                obligation_ids(f"{location}.{name}", "format"),
             ))
         if name.lower() in {"page", "pagenum", "pagesize", "pageindex", "limit", "offset"}:
             status = error_status if error_status is not None else success_status
@@ -997,57 +1258,111 @@ def seed_contract_cases(
                 set_parameter(request, parameter, value)
                 seeded.append(build(f"BOUNDARY_{suffix}", "query", f"分页参数 {name} 取边界值 {value}", status, request))
 
-    properties = body_schema.get("properties", {}) if isinstance(body_schema.get("properties"), dict) else {}
-    required = body_schema.get("required", []) if isinstance(body_schema.get("required"), list) else []
-    for field in required:
+    def body_members(
+        schema: dict[str, Any],
+        target_prefix: str = "body",
+        access_prefix: tuple[str | int, ...] = (),
+    ) -> list[tuple[str, tuple[str | int, ...], dict[str, Any], bool]]:
+        result: list[tuple[str, tuple[str | int, ...], dict[str, Any], bool]] = []
+        members = schema.get("properties", {}) if isinstance(schema.get("properties"), dict) else {}
+        required_names = set(schema.get("required", [])) if isinstance(schema.get("required"), list) else set()
+        for name, child in members.items():
+            if not isinstance(child, dict):
+                continue
+            target = f"{target_prefix}.{name}"
+            access = (*access_prefix, str(name))
+            result.append((target, access, child, name in required_names))
+            result.extend(body_members(child, target, access))
+            items = child.get("items")
+            if isinstance(items, dict):
+                result.extend(body_members(items, target + "[]", (*access, 0)))
+        return result
+
+    def mutate_body(request: dict[str, Any], access: tuple[str | int, ...], value: Any = None, omit: bool = False) -> None:
+        current: Any = request.get("body")
+        if not isinstance(current, (dict, list)):
+            return
+        for index, part in enumerate(access[:-1]):
+            following = access[index + 1]
+            if isinstance(part, int):
+                if not isinstance(current, list):
+                    return
+                while len(current) <= part:
+                    current.append({} if isinstance(following, str) else [])
+                current = current[part]
+            else:
+                if not isinstance(current, dict):
+                    return
+                expected = [] if isinstance(following, int) else {}
+                if not isinstance(current.get(part), type(expected)):
+                    current[part] = expected
+                current = current[part]
+        leaf = access[-1]
+        if isinstance(leaf, int):
+            if not isinstance(current, list):
+                return
+            while len(current) <= leaf:
+                current.append(None)
+            if omit:
+                current.pop(leaf)
+            else:
+                current[leaf] = value
+        elif isinstance(current, dict):
+            if omit:
+                current.pop(leaf, None)
+            else:
+                current[leaf] = value
+
+    members = body_members(body_schema)
+    for target, access, field_schema, is_required in members:
+        if not is_required:
+            continue
         if error_status is None:
             break
-        field_schema = properties.get(field, {}) if isinstance(properties.get(field), dict) else {}
         if media_type == "multipart/form-data" and field_schema.get("format") == "binary":
             continue
         request = copy.deepcopy(success_request)
-        if isinstance(request.get("body"), dict):
-            request["body"].pop(str(field), None)
-        suffix = slugify_tag(str(field)).replace("-", "_").upper()
-        seeded.append(build(f"MISSING_BODY_{suffix}", "validation", f"缺少必填字段 {field}", error_status, request))
-    for field, field_schema in properties.items():
+        mutate_body(request, access, omit=True)
+        suffix = slugify_tag(target.removeprefix("body.").replace("[]", " item ")).replace("-", "_").upper()
+        seeded.append(build(
+            f"MISSING_BODY_{suffix}", "validation", f"缺少必填字段 {target}", error_status, request,
+            obligation_ids(target, "missing"),
+        ))
+    for target, access, field_schema, _ in members:
         if error_status is None or not isinstance(field_schema, dict):
             continue
-        invalid: Any = None
-        detail = ""
+        variants: list[tuple[str, Any, str]] = []
         if isinstance(field_schema.get("enum"), list):
-            invalid, detail = "__INVALID_ENUM__", f"字段 {field} 使用非法枚举值"
-        elif field_schema.get("pattern"):
-            invalid, detail = "__INVALID_PATTERN__", f"字段 {field} 不符合格式"
-        elif isinstance(field_schema.get("minimum"), (int, float)):
-            invalid, detail = field_schema["minimum"] - 1, f"字段 {field} 小于最小值"
-        elif isinstance(field_schema.get("maximum"), (int, float)):
-            invalid, detail = field_schema["maximum"] + 1, f"字段 {field} 大于最大值"
-        elif isinstance(field_schema.get("minLength"), int):
-            invalid = "x" * max(0, field_schema["minLength"] - 1)
-            detail = f"字段 {field} 短于最小长度"
-        elif isinstance(field_schema.get("maxLength"), int):
-            invalid = "x" * (field_schema["maxLength"] + 1)
-            detail = f"字段 {field} 超过最大长度"
-        elif field_schema.get("format"):
-            invalid = "__INVALID_FORMAT__"
-            detail = f"字段 {field} 格式非法"
-        if detail:
+            variants.append(("enum", "__INVALID_ENUM__", f"字段 {target} 使用非法枚举值"))
+        if field_schema.get("pattern"):
+            variants.append(("pattern", "__INVALID_PATTERN__", f"字段 {target} 不符合格式"))
+        if isinstance(field_schema.get("minimum"), (int, float)):
+            variants.append(("minimum", field_schema["minimum"] - 1, f"字段 {target} 小于最小值"))
+        if isinstance(field_schema.get("maximum"), (int, float)):
+            variants.append(("maximum", field_schema["maximum"] + 1, f"字段 {target} 大于最大值"))
+        if isinstance(field_schema.get("minLength"), int):
+            variants.append(("minLength", "x" * max(0, field_schema["minLength"] - 1), f"字段 {target} 短于最小长度"))
+        if isinstance(field_schema.get("maxLength"), int):
+            variants.append(("maxLength", "x" * (field_schema["maxLength"] + 1), f"字段 {target} 超过最大长度"))
+        if field_schema.get("format") and field_schema.get("format") != "binary":
+            variants.append(("format", "__INVALID_FORMAT__", f"字段 {target} 格式非法"))
+        for constraint, invalid, detail in variants:
             request = copy.deepcopy(success_request)
-            if isinstance(request.get("body"), dict):
-                request["body"][str(field)] = invalid
-            suffix = slugify_tag(str(field)).replace("-", "_").upper()
-            seeded.append(build(f"INVALID_BODY_{suffix}", "validation", detail, error_status, request))
-    binary_fields = [
-        str(name) for name, schema in properties.items()
-        if isinstance(schema, dict) and schema.get("format") == "binary"
-    ]
+            mutate_body(request, access, invalid)
+            suffix = slugify_tag(target.removeprefix("body.").replace("[]", " item ")).replace("-", "_").upper()
+            seeded.append(build(
+                f"INVALID_BODY_{constraint.upper()}_{suffix}", "validation", detail, error_status, request,
+                obligation_ids(target, constraint),
+            ))
+    binary_fields = [item for item in members if item[2].get("format") == "binary"]
     if media_type == "multipart/form-data" and binary_fields and error_status is not None:
         request = copy.deepcopy(success_request)
-        if isinstance(request.get("body"), dict):
-            for name in binary_fields:
-                request["body"].pop(name, None)
-        seeded.append(build("MISSING_UPLOAD_FILE", "file", "缺少上传文件", error_status, request))
+        for _, access, _, _ in binary_fields:
+            mutate_body(request, access, omit=True)
+        seeded.append(build(
+            "MISSING_UPLOAD_FILE", "file", "缺少上传文件", error_status, request,
+            [item for target, _, _, _ in binary_fields for item in obligation_ids(target, "missing")],
+        ))
     if coverage_profile == "full-matrix":
         query_parameters = [item for item in parameters if item.get("in") == "query"]
         paging_names = {"page", "pagenum", "pageindex", "pagesize", "limit", "offset"}
@@ -1097,7 +1412,10 @@ def seed_contract_cases(
         if media_type and media_type != "multipart/form-data" and "415" in responses:
             request = copy.deepcopy(success_request)
             request["body_type"] = "text/plain" if media_type != "text/plain" else "application/json"
-            seeded.append(build("INVALID_CONTENT_TYPE", "validation", "Content-Type 错误", 415, request))
+            seeded.append(build(
+                "INVALID_CONTENT_TYPE", "validation", "Content-Type 错误", 415, request,
+                obligation_ids("Content-Type", "content-type"), exact_error_assertions(endpoint, 415),
+            ))
 
         profile = security_profile or {}
         auth_profile = profile.get("auth-token", {}) if isinstance(profile, dict) else {}
@@ -1128,28 +1446,58 @@ def seed_contract_cases(
             seeded.append(build("FORBIDDEN", "authorization", "权限不足", 403, request))
 
         if binary_fields and error_status is not None:
-            file_schema = properties.get(binary_fields[0], {})
-            constraints = file_schema if isinstance(file_schema, dict) else {}
             file_cases = (
                 ("EMPTY_UPLOAD_FILE", "上传空文件", "{{EMPTY_UPLOAD_FILE}}", ("minLength", "x-min-size")),
                 ("INVALID_FILE_EXTENSION", "文件扩展名非法", "{{INVALID_EXTENSION_FILE}}", ("x-allowed-extensions",)),
                 ("INVALID_FILE_MIME", "文件 MIME 类型非法", "{{INVALID_MIME_FILE}}", ("contentMediaType", "x-allowed-mime-types")),
                 ("OVERSIZED_UPLOAD_FILE", "文件超过声明大小", "{{OVERSIZED_UPLOAD_FILE}}", ("maxLength", "x-max-size")),
             )
-            for suffix, detail, value, evidence_keys in file_cases:
-                if not any(key in constraints for key in evidence_keys):
-                    continue
-                request = copy.deepcopy(success_request)
-                if isinstance(request.get("body"), dict):
-                    request["body"][binary_fields[0]] = {"file": value}
-                seeded.append(build(suffix, "file", detail, error_status, request))
+            for target, access, constraints, _ in binary_fields:
+                field_suffix = "" if len(binary_fields) == 1 else "_" + slugify_tag(target).replace("-", "_").upper()
+                for suffix, detail, value, evidence_keys in file_cases:
+                    if not any(key in constraints for key in evidence_keys):
+                        continue
+                    request = copy.deepcopy(success_request)
+                    mutate_body(request, access, {"file": value})
+                    constraint = {
+                        "EMPTY_UPLOAD_FILE": "empty",
+                        "INVALID_FILE_EXTENSION": "extension",
+                        "INVALID_FILE_MIME": "mime",
+                        "OVERSIZED_UPLOAD_FILE": "size",
+                    }[suffix]
+                    seeded.append(build(
+                        suffix + field_suffix, "file", detail, error_status, request,
+                        obligation_ids(target, constraint),
+                    ))
 
         if endpoint.get("x-idempotent") or endpoint.get("x-safety"):
             seeded.append(build(
                 "SAFETY_REPEAT", "safety", "重复提交",
                 success_status or 200, success_request,
             ))
-    return seeded
+    empty_path = response_array_path(endpoint, success_status) if success_status is not None else None
+    for case in seeded:
+        if case["id"].endswith("QUERY_EMPTY_RESULT") and empty_path:
+            case["assertions"] = [*success_assertions, {"path": empty_path, "length": 0}]
+            case["review_required"] = False
+            case["status"] = "runnable" if case["risk"] == "read-only" else "draft"
+
+    deduplicated: dict[str, dict[str, Any]] = {}
+    for case in seeded:
+        key = canonical_fingerprint({
+            "endpoint_id": case.get("endpoint_id"),
+            "scenario": case.get("scenario"),
+            "request": case.get("request"),
+            "assertions": case.get("assertions"),
+        })
+        if key in deduplicated:
+            deduplicated[key]["coverage_ids"] = list(dict.fromkeys([
+                *deduplicated[key].get("coverage_ids", []),
+                *case.get("coverage_ids", []),
+            ]))
+        else:
+            deduplicated[key] = case
+    return list(deduplicated.values())
 
 
 def write_partitioned(

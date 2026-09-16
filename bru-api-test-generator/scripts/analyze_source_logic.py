@@ -20,7 +20,7 @@ from typing import Any
 sys.dont_write_bytecode = True
 
 from manifest_io import first_list, load_data
-from parse_openapi import business_case_title
+from parse_openapi import business_case_title, response_business_code_path
 from analyze_java_logic import scan as scan_java_logic
 
 
@@ -75,8 +75,13 @@ def candidate_id(kind: str, path: Path, line_no: int, evidence: str) -> str:
     return f"{kind.upper()}_{hashlib.sha1(key.encode('utf-8')).hexdigest()[:12]}"
 
 
-def scan(roots: list[Path], include_patterns: list[str] | None = None) -> dict[str, Any]:
-    java_result = scan_java_logic(roots)
+def scan(
+    roots: list[Path],
+    include_patterns: list[str] | None = None,
+    exception_type: str | None = None,
+    error_code_type: str | None = None,
+) -> dict[str, Any]:
+    java_result = scan_java_logic(roots, exception_type, error_code_type)
     candidates: list[dict[str, Any]] = [
         item for item in java_result.get("candidates", [])
         if not include_patterns
@@ -144,8 +149,14 @@ def scan(roots: list[Path], include_patterns: list[str] | None = None) -> dict[s
                 )
                 candidates.append(candidate)
     return {
-        "version": 1,
+        "version": 2,
         "source": {"roots": [str(root) for root in roots], "languages": sorted(languages)},
+        "java": {
+            "exception_family": java_result.get("exception_family"),
+            "mapping_annotation_count": java_result.get("mapping_annotation_count", 0),
+            "entrypoint_count": java_result.get("entrypoint_count", 0),
+        },
+        "errors": list(java_result.get("errors", [])),
         "candidates": candidates,
     }
 
@@ -180,26 +191,44 @@ def apply_candidates(result: dict[str, Any], contracts_root: Path) -> list[str]:
         if not isinstance(candidate, dict) or candidate.get("coverage_required") is not True:
             continue
         haystack = _normalized(f"{candidate.get('file', '')} {candidate.get('evidence', '')}")
+        endpoint_keys = {
+            str(value).strip()
+            for value in candidate.get("endpoint_keys", [])
+            if str(value).strip()
+        }
         operation_hints = {
             _normalized(str(value))
             for value in candidate.get("endpoint_operation_ids", [])
             if str(value).strip()
         }
-        endpoint_matches = [
-            (module_dir, document, endpoint)
-            for module_dir, document, endpoint in endpoint_records
-            if (
-                _normalized(str(endpoint.get("operation_id", ""))) in operation_hints
-                if operation_hints
-                else any(
+        endpoint_matches = []
+        if endpoint_keys:
+            endpoint_matches = [
+                (module_dir, document, endpoint)
+                for module_dir, document, endpoint in endpoint_records
+                if (
+                    f"{str(endpoint.get('method', '')).upper()} {endpoint.get('path')}" in endpoint_keys
+                    or f"* {endpoint.get('path')}" in endpoint_keys
+                )
+            ]
+        elif operation_hints:
+            endpoint_matches = [
+                (module_dir, document, endpoint)
+                for module_dir, document, endpoint in endpoint_records
+                if _normalized(str(endpoint.get("operation_id", ""))) in operation_hints
+            ]
+        else:
+            endpoint_matches = [
+                (module_dir, document, endpoint)
+                for module_dir, document, endpoint in endpoint_records
+                if any(
                     token and token in haystack
                     for token in (
                         _normalized(str(endpoint.get("operation_id", ""))),
                         _normalized(str(endpoint.get("path", ""))),
                     )
                 )
-            )
-        ]
+            ]
         if not endpoint_matches and len(endpoint_records) == 1:
             endpoint_matches = endpoint_records
         if len(endpoint_matches) != 1:
@@ -282,7 +311,9 @@ def apply_candidates(result: dict[str, Any], contracts_root: Path) -> list[str]:
                         "scenario": scenario,
                         "review_required": True,
                         "status": "draft",
-                        "risk": "read-only" if str(endpoint.get("method", "GET")).upper() in {"GET", "HEAD", "OPTIONS"} else "isolated-write",
+                        "risk": candidate.get("suggested_risk") or (
+                            "read-only" if str(endpoint.get("method", "GET")).upper() in {"GET", "HEAD", "OPTIONS"} else "unconfirmed"
+                        ),
                         "logic_ids": [logic_id],
                         "request": {"omit_common_headers": [required_header]},
                         "expected": {"http_status": error_status},
@@ -313,7 +344,7 @@ def apply_candidates(result: dict[str, Any], contracts_root: Path) -> list[str]:
             responses = endpoint.get("responses", {}) if isinstance(endpoint.get("responses"), dict) else {}
             error_status = next(
                 (int(status) for status in responses if str(status) in {"400", "401", "403", "409", "422"}),
-                next((int(status) for status in responses if str(status).isdigit() and 200 <= int(status) < 300), None),
+                None,
             )
             if error_status is not None:
                 for code in codes:
@@ -332,10 +363,19 @@ def apply_candidates(result: dict[str, Any], contracts_root: Path) -> list[str]:
                             "scenario": "business_error",
                             "review_required": True,
                             "status": "draft",
-                            "risk": "read-only" if str(endpoint.get("method", "GET")).upper() in {"GET", "HEAD", "OPTIONS"} else "isolated-write",
+                            "risk": candidate.get("suggested_risk") or (
+                                "read-only" if str(endpoint.get("method", "GET")).upper() in {"GET", "HEAD", "OPTIONS"} else "unconfirmed"
+                            ),
                             "logic_ids": [logic_id],
-                            "expected": {"http_status": error_status, "business_code": str(code)},
-                            "assertions": [{"path": "$.code", "equals": str(code)}],
+                            "expected": {
+                                "http_status": error_status,
+                                "business_code": str(code),
+                                "business_code_path": response_business_code_path(endpoint, error_status) or "$.code",
+                            },
+                            "assertions": [{
+                                "path": response_business_code_path(endpoint, error_status) or "$.code",
+                                "equals": str(code),
+                            }],
                         })
                         updated_cases = dict(cases_document) if isinstance(cases_document, dict) else {}
                         updated_cases.update({
@@ -416,15 +456,20 @@ def main() -> int:
     parser.add_argument("source_roots", type=Path, nargs="+")
     parser.add_argument("-o", "--output", type=Path, required=True)
     parser.add_argument("--include", action="append", help="source-file glob owned by the selected module or endpoint; may be repeated")
+    parser.add_argument("--exception-type")
+    parser.add_argument("--error-code-type")
     parser.add_argument("--contracts-root", type=Path, help="apply coverage-required candidates to module logic.yaml")
     args = parser.parse_args()
     missing = [str(root) for root in args.source_roots if not root.is_dir()]
     if missing:
         parser.error(f"source root(s) do not exist: {', '.join(missing)}")
-    result = scan(args.source_roots, args.include)
+    result = scan(args.source_roots, args.include, args.exception_type, args.error_code_type)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    if args.contracts_root:
+    scan_errors = [str(error) for error in result.get("errors", [])]
+    for error in scan_errors:
+        print(f"ERROR: {error}", file=sys.stderr)
+    if args.contracts_root and not scan_errors:
         unresolved = apply_candidates(result, args.contracts_root)
         if unresolved:
             for candidate_id in unresolved:
@@ -434,7 +479,7 @@ def main() -> int:
                 )
             return 2
     print(f"wrote {len(result['candidates'])} cross-language logic candidates to {args.output}")
-    return 0
+    return 2 if scan_errors else 0
 
 
 if __name__ == "__main__":

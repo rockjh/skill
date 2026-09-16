@@ -103,7 +103,7 @@ request:
 ```
 
 See [execution-config.md](execution-config.md) for the schema, Header format,
-signing behavior, scope confirmations, and script/shared-CLI modes.
+signing behavior, execution scope, and script/shared-CLI modes.
 
 ## Request and response payloads
 

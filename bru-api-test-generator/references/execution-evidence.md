@@ -6,7 +6,7 @@ The checker reports independent gates:
 - `static_ok`: OpenAPI, manifests, UTF-8, Bruno registration, complete JSON
   bodies, request structure, exact assertions, scenario decisions, QA lock, and
   source-logic links reconcile.
-- `completion_ok`: every case in the complete `--all` scope executed and passed,
+- `completion_ok`: every case in the default all-module scope executed and passed,
   required flow cleanup passed, and no pending exclusion remains.
 
 States are `draft`, `runnable`, `verified`, or `blocked`. Inventory counts are
@@ -37,17 +37,22 @@ redacted evidence. Bruno's top-level request status alone is insufficient.
 Use the platform launchers or shared CLI:
 
 ```bash
-mno-bruno-qa run --all --confirm-write --confirm-destructive --confirm-external
-mno-bruno-qa run --module ac
+mno-bruno-qa run
+mno-bruno-qa run --module "AC-信息"
 mno-bruno-qa reconcile --all --results execution-evidence.json \
   --preflight-results preflight.json
 ```
 
 The runner validates the business version, project script version or shared
-CLI mode, QA lock, execution config, active environment, scope-wide risk
-confirmations, offline OpenAPI fingerprint, Bruno CLI, and a representative
-route before execution. Module evidence remains module-local and never updates
-the global business lock.
+CLI mode, QA lock, execution config, active environment, offline OpenAPI
+fingerprint, Bruno CLI, and a representative route before execution. Business
+and deployment version mismatches are red warnings rather than execution
+blockers. Module evidence remains module-local and never updates the global
+business lock.
+
+The console and `qa/logs/` record stage progress, every case status, final
+success/failure totals, failed case IDs, and repeated version warnings. Each
+invocation creates a new timestamped log.
 
 Every newly generated request uses `{{baseUrl}}` (legacy `{{BASE_URL}}` remains
 readable). The CLI parses environment

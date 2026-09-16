@@ -7,7 +7,7 @@ Each Chinese-named directory under `scenarios/` owns one complete business journ
 ```text
 scenarios/<中文业务名称>/
   场景定义.yaml
-  业务数据.yaml
+  业务数据.json
   业务流程图.md
   test_<中文业务名称>.py
 ```
@@ -22,7 +22,11 @@ Add `自动化测试流程图.md` only when executable orchestration materially 
 
 Do not generate `场景说明.md`, `版本变更记录.md`, placeholder modules, or a global manifest. Put the former scenario explanation into the introduction of `业务流程图.md`; keep source commits and anchors in `场景定义.yaml`, with history provided by Git.
 
+Apply the YAML comment rules in [e2e-workflow.md](e2e-workflow.md) to `场景定义.yaml`. `业务数据.json` is strict JSON keyed by environment and contains neither comments nor synthetic comment fields. Preserve business meaning, units, enums, association keys, and placeholder provenance through source-confirmed field names, builders, environment configuration, and focused tests.
+
 When migrating an existing scenario, first preserve its useful purpose, preconditions, and outcome text in the business-diagram introduction, then delete `场景说明.md`. Move the reviewed source baseline and anchors into `source`, then delete `版本变更记录.md`; Git retains its prior contents. Delete an existing automated-test diagram only when it adds no material orchestration beyond the updated business diagram.
+
+Under explicit authorization to migrate a generated E2E project, convert `业务数据.yaml` once into environment-keyed `业务数据.json`, update every `data_ref`, validate all environment paths, and then remove the old file. Do not keep dual YAML/JSON readers or silently migrate an existing project during an unrelated update.
 
 The stable ID appears only in `场景定义.yaml` and exactly one pytest marker:
 
@@ -111,7 +115,7 @@ When the distinction is small, omit this file; do not duplicate the business dia
 
 ## Data and Python ownership
 
-- `业务数据.yaml` owns static business inputs and environment placeholders.
+- `业务数据.json` owns environment-isolated business inputs and exact placeholders under root environment keys.
 - `common/builders/` owns reusable payload construction.
 - `common/repositories/` owns reusable read-only SQL and row mapping.
 - `common/assertions/` owns reusable protocol and cross-system assertions.
@@ -119,3 +123,13 @@ When the distinction is small, omit this file; do not duplicate the business dia
 - `test_*.py` owns only readable orchestration and guaranteed cleanup.
 
 Every Python module, class, and function has a concise Chinese docstring. Add Chinese comments before business branches, asynchronous waits, and cleanup when intent is not self-evident. Keep protocol fields and source identifiers unchanged.
+
+## Contract mapping and proof
+
+Before implementing a builder, inspect the source DTO or an offline OpenAPI document and map every field explicitly. Preserve source field names on the wire and write deliberate conversions for different JSON names, nesting, units, enum representations, and time formats. Never use `dict(data)`, `payload.update(data)`, `Model(**data)`, or equivalent whole-object pass-through, even when the current names happen to match.
+
+Every request that may create, update, cancel, unsubscribe, fulfill, or publish first validates the transport result and source-defined business response. Only a successful business response permits downstream polling.
+
+Prove cancellation, unsubscription, fulfillment, and message publication with at least one direct state, operation-log, message, or persistence observation justified by the contract trace. Finding the resource or its correlation key proves identity, not the requested state transition.
+
+Register idempotent cleanup immediately after each resource is acquired, before later assertions or polling can fail. Cleanup may log or attach its own exception, but when the test body already failed it must preserve that original exception as the primary failure.

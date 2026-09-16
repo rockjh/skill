@@ -95,9 +95,12 @@ from execution_config import (
     COLLECTION_END_MARKER,
     COLLECTION_MARKER,
     HEADER_NAME_RE,
+    environment_file,
+    load_bruno_environment_document,
     load_execution_config,
 )
 from qa_lock import check as check_qa_lock
+from materialize_missing_bru import request_url as materialized_request_url
 
 SCENARIO_CATEGORIES = (
     "success",
@@ -110,6 +113,16 @@ SCENARIO_CATEGORIES = (
     "file",
 )
 RISK_CLASSES = {"read-only", "isolated-write", "destructive", "external-side-effect"}
+STRICT_REPORT_VERSION = 2
+STRICT_REPORT_FIELDS = (
+    "scenario_matrix_checked",
+    "constraint_obligations_checked",
+    "exact_assertions_checked",
+    "variables_checked",
+    "source_mapping_checked",
+    "qa_lock_checked",
+)
+VARIABLE_RE = re.compile(r"\{\{([^{}]+)\}\}")
 
 INTEGRITY_SUFFIXES = {".yaml", ".yml", ".md", ".bru"}
 MOJIBAKE_RE = re.compile(r"(?:\ufffd|(?:Ã|Â|å|æ|ç)[\x80-\xBF]|â(?:€|™|œ|€�))")
@@ -257,6 +270,108 @@ def case_completion_errors(case: dict[str, Any]) -> list[str]:
         for item in assertions
     ):
         errors.append(f"case {case_id} has no exact assertion eligible for verified completion")
+    if isinstance(assertions, list) and any(
+        isinstance(item, dict) and item.get("exists") is True and not _assertion_is_exact(item)
+        for item in assertions
+    ):
+        errors.append(f"case {case_id} contains an existence-only assertion")
+    return errors
+
+
+def _assertion_is_exact(assertion: Any) -> bool:
+    return isinstance(assertion, dict) and bool({
+        "equals", "eq", "contains", "matches", "length", "minimum", "maximum",
+        "equals_variable", "items", "item_type",
+    } & set(assertion))
+
+
+def success_assertion_errors(case: dict[str, Any]) -> list[str]:
+    if not case_covers_scenario(case, "success"):
+        return []
+    case_id = str(case.get("id", "<unknown>"))
+    assertions = [item for item in case.get("assertions", []) if isinstance(item, dict)]
+    expected = case.get("expected", {}) if isinstance(case.get("expected"), dict) else {}
+    business_path = str(expected.get("business_code_path", "$.code"))
+    business_value = expected.get("business_code")
+    business_assertions = [
+        item for item in assertions
+        if str(item.get("path")) in {"$.status", "$.errorCode", "$.code", business_path}
+        and ("equals" in item or "eq" in item)
+    ]
+    if business_value is not None:
+        business_assertions.append({"path": business_path, "equals": business_value})
+    success_values = {0, "0", 200, "200", True, "true", "ok", "success", "SUCCESS", "OK"}
+    if not business_assertions or any(
+        item.get("equals", item.get("eq")) not in success_values
+        for item in business_assertions
+    ):
+        return [f"success case {case_id} has no exact business-success assertion"]
+    business_paths = {str(item.get("path")) for item in business_assertions}
+    if not any(_assertion_is_exact(item) and str(item.get("path")) not in business_paths for item in assertions):
+        return [f"success case {case_id} has no exact result-field or request/response assertion"]
+    return []
+
+
+def query_assertion_errors(case: dict[str, Any]) -> list[str]:
+    if not case_covers_scenario(case, "query"):
+        return []
+    expected = case.get("expected", {}) if isinstance(case.get("expected"), dict) else {}
+    status = expected.get("http_status")
+    if isinstance(status, int) and status >= 400:
+        return []
+    case_id = str(case.get("id", "<unknown>"))
+    assertions = [item for item in case.get("assertions", []) if isinstance(item, dict)]
+    if "__NO_MATCH__" in canonical_json(case.get("request", {})) and not any(
+        item.get("length") == 0 for item in assertions
+    ):
+        return [f"query case {case_id} has no exact empty-result assertion"]
+    result_roots = ("$.data", "$.result", "$.items", "$.list", "$.records", "$.content", "$.page", "$.total")
+    if not any(
+        _assertion_is_exact(item)
+        and (
+            str(item.get("path", "")) == "$"
+            or any(str(item.get("path", "")).startswith(root) for root in result_roots)
+        )
+        for item in assertions
+    ):
+        return [f"query case {case_id} has no exact result or pagination assertion"]
+    return []
+
+
+def _variables(value: Any) -> set[str]:
+    if isinstance(value, str):
+        return {item.strip() for item in VARIABLE_RE.findall(value) if item.strip() and not item.strip().startswith("$")}
+    if isinstance(value, dict):
+        return set().union(*(_variables(item) for item in value.values()), set())
+    if isinstance(value, list):
+        return set().union(*(_variables(item) for item in value), set())
+    return set()
+
+
+def case_context_errors(
+    case: dict[str, Any],
+    available_variables: set[str],
+    captured_variables: set[str],
+) -> list[str]:
+    case_id = str(case.get("id", "<unknown>"))
+    errors: list[str] = []
+    variables = _variables({
+        "request": case.get("request"),
+        "assertions": case.get("assertions"),
+        "expected": case.get("expected"),
+    })
+    missing = sorted(variables - available_variables - captured_variables)
+    if missing:
+        errors.append(f"case {case_id} references undefined variable(s): {', '.join(missing)}")
+    request_text = json.dumps(case.get("request", {}), ensure_ascii=False, sort_keys=True)
+    if re.search(r"review-[A-Za-z0-9_.-]+", request_text, re.IGNORECASE):
+        errors.append(f"case {case_id} contains review-* placeholder data")
+    endpoint_path = str(case.get("resolved_endpoint_path", ""))
+    request = case.get("request", {}) if isinstance(case.get("request"), dict) else {}
+    request_path = str(request.get("path") or endpoint_path)
+    for name in re.findall(r"(?<!\{)\{([^{}]+)\}(?!\})", request_path):
+        if name not in request.get("path_parameters", {}):
+            errors.append(f"case {case_id} has unresolved path parameter: {name}")
     return errors
 
 
@@ -845,7 +960,7 @@ def case_risk(case: dict[str, Any], endpoint: dict[str, Any] | None = None) -> s
     if declared:
         return declared
     method = str((endpoint or {}).get("method", "GET")).upper()
-    return "read-only" if method in {"GET", "HEAD", "OPTIONS"} else "isolated-write"
+    return "read-only" if method in {"GET", "HEAD", "OPTIONS"} else "unconfirmed"
 
 
 def normalized_request_path(url: str) -> str:
@@ -958,7 +1073,13 @@ def case_files(
                 errors.append(f"case {case_id} Bruno meta.tags contains obsolete plan tag(s): {', '.join(obsolete)}")
             actual_request = bruno_request(contents[matched])
             expected_method = str(endpoint.get("method", "GET")).upper()
-            expected_path = str((case.get("request") or {}).get("path") or endpoint.get("path") or "/")
+            request = case.get("request") if isinstance(case.get("request"), dict) else {}
+            try:
+                expected_url = materialized_request_url(endpoint, request)
+            except ValueError as exc:
+                errors.append(f"case {case_id} query serialization is invalid: {exc}")
+                expected_url = ""
+            expected_path = normalized_request_path(expected_url) if expected_url else str(request.get("path") or endpoint.get("path") or "/")
             if actual_request.get("method") != expected_method:
                 errors.append(f"case {case_id} Bruno method is {actual_request.get('method')}, expected {expected_method}")
             if normalized_request_path(str(actual_request.get("url", ""))) != expected_path:
@@ -966,28 +1087,12 @@ def case_files(
                     f"case {case_id} Bruno URL path is {normalized_request_path(str(actual_request.get('url', '')))}, "
                     f"expected {expected_path}"
                 )
-            request = case.get("request") if isinstance(case.get("request"), dict) else {}
-            expected_query = request.get("query") if isinstance(request.get("query"), dict) else {}
             actual_url = str(actual_request.get("url", ""))
-            actual_query = {
-                urllib.parse.unquote(key): urllib.parse.unquote(value)
-                for key, value in re.findall(r"[?&]([^=&\s]+)=([^&\s]*)", actual_url)
-            }
-            expected_query_rendered = {
-                str(key): (
-                    str(value).lower() if isinstance(value, bool)
-                    else "" if value is None
-                    else str(value)
-                )
-                for key, value in expected_query.items()
-                if not isinstance(value, (dict, list))
-            }
-            for key, value in expected_query.items():
-                if isinstance(value, (dict, list)):
-                    errors.append(f"case {case_id} query field {key} must be flattened or declare supported serialization")
-            if actual_query != expected_query_rendered:
+            actual_query = urllib.parse.parse_qsl(urllib.parse.urlsplit(actual_url).query, keep_blank_values=True)
+            expected_query = urllib.parse.parse_qsl(urllib.parse.urlsplit(expected_url).query, keep_blank_values=True) if expected_url else []
+            if actual_query != expected_query:
                 errors.append(
-                    f"case {case_id} Bruno query is {actual_query}, expected {expected_query_rendered}"
+                    f"case {case_id} Bruno query is {actual_query}, expected {expected_query}"
                 )
             expected_headers = request.get("headers") if isinstance(request.get("headers"), dict) else {}
             actual_headers = bruno_headers(contents[matched])
@@ -1323,6 +1428,36 @@ def check_module(
         )
 
     cases_by_id = {str(case["id"]): case for case in cases if case.get("id")}
+    obligation_ids = {
+        str(obligation.get("id"))
+        for endpoint in endpoints
+        for obligation in endpoint.get("obligations", [])
+        if isinstance(obligation, dict) and obligation.get("id")
+    }
+    covered_obligation_ids = {
+        str(coverage_id)
+        for case in cases
+        for coverage_id in (case.get("coverage_ids", []) if isinstance(case.get("coverage_ids"), list) else [])
+    }
+    excluded_obligation_ids = {
+        str(coverage_id)
+        for exclusion in exclusions
+        if is_approved_exclusion(exclusion)
+        for coverage_id in (
+            exclusion.get("coverage_ids", [])
+            if isinstance(exclusion.get("coverage_ids"), list)
+            else [exclusion.get("coverage_id")]
+        )
+        if coverage_id
+    }
+    errors.extend(
+        f"constraint obligation {obligation_id} has no case or approved exclusion"
+        for obligation_id in sorted(obligation_ids - covered_obligation_ids - excluded_obligation_ids)
+    )
+    errors.extend(
+        f"case or exclusion references unknown constraint obligation {obligation_id}"
+        for obligation_id in sorted((covered_obligation_ids | excluded_obligation_ids) - obligation_ids)
+    )
     fingerprint_ids: dict[str, str] = {}
     duplicate_fingerprints: set[str] = set()
     for case in cases:
@@ -1353,8 +1488,14 @@ def check_module(
             errors.append(f"case {case.get('id')} Swagger tag does not match module {module_id}")
         endpoint_for_case = next((item for item in endpoints if item.get("id") == endpoint_id), None)
         risk = case_risk(case, endpoint_for_case)
+        if require_scenarios and not str(case.get("risk", "")).strip():
+            errors.append(f"case {case.get('id')} has no confirmed risk class")
         if risk not in RISK_CLASSES:
             errors.append(f"case {case.get('id')} has invalid risk class {risk}")
+        if require_scenarios:
+            errors.extend(case_completion_errors(case))
+            errors.extend(success_assertion_errors(case))
+            errors.extend(query_assertion_errors(case))
     for endpoint in endpoints:
         endpoint_cases = endpoint.get("case_ids", [])
         if not endpoint_cases:
@@ -1398,9 +1539,16 @@ def check_module(
                 if inapplicable and any(not str(item.get("reason", "")).strip() for item in inapplicable):
                     errors.append(f"endpoint {endpoint.get('id')} scenario {category}=false has no reason")
                 if applicable and not any(case_covers_scenario(case, category) for case in endpoint_case_objects):
-                    errors.append(
-                        f"endpoint {endpoint.get('id')} scenario {category}=true has no dedicated linked case"
+                    approved_scenario_exclusion = any(
+                        is_approved_exclusion(item)
+                        and str(item.get("endpoint_id")) == str(endpoint.get("id"))
+                        and str(item.get("scenario")) == category
+                        for item in exclusions
                     )
+                    if not approved_scenario_exclusion:
+                        errors.append(
+                            f"endpoint {endpoint.get('id')} scenario {category}=true has no dedicated linked case or approved exclusion"
+                        )
 
         success_decision = None
         endpoint_decisions = endpoint.get("scenario_matrix") or endpoint.get("scenarios")
@@ -1667,50 +1815,67 @@ def main() -> int:
     scope.add_argument("--all", action="store_true", help="check all modules and all registered cases")
     scope.add_argument("--module", help="check one module id, display name, Tag, or directory")
     parser.add_argument("--json", action="store_true", dest="as_json")
+    parser.add_argument("--write-status", action="store_true", help="update generated counts/status in index.yaml")
     args = parser.parse_args()
 
     results = execution_evidence(load_data(args.results)) if args.results else None
     preflight = load_data(args.preflight_results) if args.preflight_results else None
     preflight_ok = (
         isinstance(preflight, dict)
-        and (
-            (
-                preflight.get("static_ready") is True
-                and preflight.get("context_ready") is True
-                and preflight.get("execution_ready") is True
-            )
-            or preflight.get("status") in {"runnable", "passed", "ok"}
-        )
+        and preflight.get("version") == 2
+        and preflight.get("check_profile") == "full-matrix-strict"
+        and preflight.get("static_report_version") == STRICT_REPORT_VERSION
+        and preflight.get("static_ready") is True
+        and preflight.get("context_ready") is True
+        and preflight.get("execution_ready") is True
+        and preflight.get("status") == "runnable"
         and not preflight.get("errors")
     )
     execution_config_path = args.execution_config or (args.contracts_root.parent / "execution" / "config.yaml")
     execution_config = None
     execution_config_error: str | None = None
+    available_variables: set[str] = set()
+    environment_errors: list[str] = []
+    environment_headers: dict[str, str] = {}
     if execution_config_path.is_file():
         try:
             execution_config = load_execution_config(execution_config_path)
+            environment = load_bruno_environment_document(environment_file(execution_config_path, execution_config))
+            available_variables = {
+                name for name, value in environment["vars"].items() if str(value).strip()
+            }
+            environment_headers = environment["headers"]
+            for name in sorted(available_variables & {
+                "UPLOAD_FILE", "EMPTY_UPLOAD_FILE", "INVALID_EXTENSION_FILE",
+                "INVALID_MIME_FILE", "OVERSIZED_UPLOAD_FILE",
+            }):
+                if not Path(environment["vars"][name]).is_file():
+                    environment_errors.append(f"environment fixture variable {name} is not a file: {environment['vars'][name]}")
         except ValueError as exc:
             execution_config_error = str(exc)
     errors: list[str] = text_integrity_errors(args.contracts_root, args.bru_root)
+    warnings: list[str] = []
+    qa_lock_errors: list[str] = []
+    business_version_checked = False
+    if args.require_scenarios:
+        qa_lock_errors = check_qa_lock(args.contracts_root)
+        errors.extend(f"QA lock is not current: {error}" for error in qa_lock_errors)
+        business_version_checked = True
+        version_check = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).resolve().parent / "check_version_compatibility.py"),
+                str(args.contracts_root.parent.parent),
+                str(args.contracts_root),
+                "--phase", "before-execute",
+            ],
+            check=False, capture_output=True, text=True, encoding="utf-8",
+        )
+        if version_check.returncode:
+            detail = (version_check.stdout or version_check.stderr).strip()
+            warnings.append(f"business version lock is not current: {detail or version_check.returncode}")
     if args.results:
         errors.extend(check_qa_lock(args.contracts_root))
-        if args.all:
-            version_check = subprocess.run(
-                [
-                    sys.executable,
-                    str(Path(__file__).resolve().parent / "check_version_compatibility.py"),
-                    str(args.contracts_root.parent.parent),
-                    str(args.contracts_root),
-                    "--phase", "before-execute",
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-            )
-            if version_check.returncode:
-                detail = (version_check.stdout or version_check.stderr).strip()
-                errors.append(f"business version lock is not current: {detail or version_check.returncode}")
         if args.openapi is None:
             errors.append("completion requires explicit --openapi")
         if not args.require_scenarios:
@@ -1732,6 +1897,7 @@ def main() -> int:
             errors.append(f"invalid execution config {execution_config_path}: {execution_config_error}")
         elif execution_config is None:
             errors.append(f"invalid execution config {execution_config_path}")
+        errors.extend(environment_errors)
     totals = {
         "endpoints": 0,
         "inventory_endpoints": 0,
@@ -1786,9 +1952,55 @@ def main() -> int:
     source_candidate_links: set[str] = set()
     offline_inventory_count: int | None = None
     contract_provenance_unverified = False
+    global_captured_variables: set[str] = set()
+    for _, directory in modules:
+        case_document = load_data(directory / "cases.yaml") if (directory / "cases.yaml").is_file() else {}
+        for case in manifest_cases(case_document):
+            captures = case.get("captures", [])
+            if isinstance(captures, dict):
+                global_captured_variables.update(str(name) for name in captures)
+            elif isinstance(captures, list):
+                global_captured_variables.update(
+                    str(item.get("name")) for item in captures if isinstance(item, dict) and item.get("name")
+                )
+            global_captured_variables.update(
+                str(item.get("capture_as") or item.get("capture"))
+                for item in (case.get("assertions", []) if isinstance(case.get("assertions"), list) else [])
+                if isinstance(item, dict) and (item.get("capture_as") or item.get("capture"))
+            )
+        flow_document = load_data(directory / "flows.yaml") if (directory / "flows.yaml").is_file() else {}
+        global_captured_variables.update(
+            str(value)
+            for flow in first_list(flow_document, "flows")
+            for step in (flow.get("steps", []) if isinstance(flow.get("steps"), list) else [])
+            if isinstance(step, dict)
+            for value in ([step.get("capture")] if isinstance(step.get("capture"), str) else step.get("capture", []) or [])
+            if value
+        )
     for module_id, module_dir in modules:
         endpoint_doc = load_data(module_dir / "endpoints.yaml")
         endpoint_lookup = {str(item.get("id")): item for item in first_list(endpoint_doc, "endpoints")}
+        if args.require_auth:
+            required_headers = {
+                str(parameter.get("name"))
+                for endpoint in endpoint_lookup.values()
+                for parameter in endpoint.get("parameters", [])
+                if isinstance(parameter, dict)
+                and parameter.get("in") == "header"
+                and parameter.get("required") is True
+            }
+            if any(endpoint.get("security") for endpoint in endpoint_lookup.values()):
+                required_headers.add("Authorization")
+            for header in sorted(required_headers):
+                template = environment_headers.get(header)
+                if not template:
+                    errors.append(f"required environment Header is missing: {header}")
+                    continue
+                missing = sorted(_variables(template) - available_variables)
+                if missing:
+                    errors.append(
+                        f"required environment Header {header} references undefined or empty variable(s): {', '.join(missing)}"
+                    )
         for endpoint in endpoint_lookup.values():
             if endpoint.get("module") and str(endpoint.get("module")) != module_id:
                 errors.append(
@@ -1819,6 +2031,26 @@ def main() -> int:
             ]
             selected_case_ids_by_module[module_id] = set(eligible_case_ids)
             required_case_ids_global.update(eligible_case_ids)
+            captured_variables = {
+                str(capture.get("name"))
+                for case in module_cases
+                for capture in (
+                    case.get("captures", [])
+                    if isinstance(case.get("captures"), list)
+                    else [
+                        {"name": name}
+                        for name in case.get("captures", {})
+                    ] if isinstance(case.get("captures"), dict) else []
+                )
+                if isinstance(capture, dict) and capture.get("name")
+            }
+            captured_variables.update(
+                str(assertion.get("capture_as") or assertion.get("capture"))
+                for case in module_cases
+                for assertion in (case.get("assertions", []) if isinstance(case.get("assertions"), list) else [])
+                if isinstance(assertion, dict) and (assertion.get("capture_as") or assertion.get("capture"))
+            )
+            captured_variables.update(global_captured_variables)
             for case in module_cases:
                 case_id = str(case.get("id", ""))
                 if not case_id:
@@ -1834,6 +2066,11 @@ def main() -> int:
                         f"cases {previous_fingerprint} and {case_id} duplicate endpoint/scenario/request/assertions"
                     )
                 all_case_fingerprints[fingerprint] = case_id
+                if args.require_scenarios:
+                    endpoint = endpoint_lookup.get(str(case.get("endpoint_id")), {})
+                    checked_case = dict(case)
+                    checked_case["resolved_endpoint_path"] = endpoint.get("path", "")
+                    errors.extend(case_context_errors(checked_case, available_variables, captured_variables))
                 if args.results and case_id in selected_case_ids_by_module[module_id]:
                     errors.extend(case_completion_errors(case))
         flow_path = module_dir / "flows.yaml"
@@ -1861,7 +2098,17 @@ def main() -> int:
         errors.extend(validate_cross_module_flows(args.contracts_root, all_case_ids))
         candidates_path = args.contracts_root / "source-logic-candidates.yaml"
         if candidates_path.is_file():
-            candidates = first_list(load_data(candidates_path), "candidates")
+            candidate_document = load_data(candidates_path)
+            candidates = first_list(candidate_document, "candidates")
+            if isinstance(candidate_document, dict):
+                errors.extend(
+                    f"source scan failed: {error}"
+                    for error in candidate_document.get("errors", [])
+                    if str(error).strip()
+                )
+                java = candidate_document.get("java", {}) if isinstance(candidate_document.get("java"), dict) else {}
+                if java.get("mapping_annotation_count", 0) and not java.get("entrypoint_count", 0):
+                    errors.append("source contains Mapping annotations but the scanner recognized 0 entrypoints")
             for candidate in candidates:
                 if candidate.get("coverage_required") is True and str(candidate.get("id")) not in source_candidate_links:
                     errors.append(
@@ -1895,7 +2142,17 @@ def main() -> int:
             try:
                 offline_document = load_document(openapi_path)
                 provenance = offline_document.get("provenance") if isinstance(offline_document, dict) else None
-                contract_provenance_unverified = isinstance(provenance, dict) and provenance.get("status") == "contract_provenance_unverified"
+                version_lock = load_data(args.contracts_root / "version-lock.yaml")
+                locked_business = version_lock.get("business", {}) if isinstance(version_lock, dict) and isinstance(version_lock.get("business"), dict) else {}
+                locked_sha = locked_business.get("commit")
+                contract_provenance_unverified = not (
+                    isinstance(provenance, dict)
+                    and provenance.get("status") in {"verified", "current"}
+                    and provenance.get("application_sha")
+                    and provenance.get("application_pid")
+                    and locked_sha
+                    and str(provenance.get("application_sha")) == str(locked_sha)
+                )
                 offline = extract(openapi_path, offline_document)
                 offline_endpoints = offline["endpoints"]
                 offline_inventory_count = len(offline["endpoints"])
@@ -1950,6 +2207,10 @@ def main() -> int:
                 errors.append(f"cannot reconcile offline OpenAPI {openapi_path}: {exc}")
     if offline_endpoints and not args.module:
         errors.extend(validate_tag_partition(module_map_doc, endpoint_records, offline_endpoints))
+    if args.preflight_results and openapi_sha256 and (
+        not isinstance(preflight, dict) or preflight.get("openapi_sha256") != openapi_sha256
+    ):
+        errors.append("runtime preflight OpenAPI fingerprint does not match the checked contract")
     index_path = args.contracts_root / "index.yaml"
     if not index_path.is_file() and global_contracts and not args.module:
         errors.append(f"missing global index.yaml: {index_path}")
@@ -2012,12 +2273,11 @@ def main() -> int:
 
     if offline_inventory_count is not None:
         totals["inventory_endpoints"] = offline_inventory_count
+    if args.require_scenarios and contract_provenance_unverified:
+        warnings.append("offline OpenAPI provenance or business version is not aligned")
     runtime_error_re = re.compile(r"(?:^|\]) case [^ ]+ (?:was not executed|failed)$")
     errors = list(dict.fromkeys(errors))
     static_errors = [error for error in errors if not runtime_error_re.search(error)]
-    if args.results and contract_provenance_unverified:
-        errors.append("offline OpenAPI provenance is unverified; completion evidence is blocked")
-        errors = list(dict.fromkeys(errors))
     static_ok = not static_errors
     module_completion_ok = False
     module_status: str | None = None
@@ -2051,9 +2311,19 @@ def main() -> int:
         status = "draft"
     report = {
         **totals,
+        "report_version": STRICT_REPORT_VERSION,
+        "check_profile": "full-matrix-strict" if args.require_scenarios and args.require_auth else "custom",
+        "scenario_matrix_checked": bool(args.require_scenarios),
+        "constraint_obligations_checked": bool(args.require_scenarios),
+        "exact_assertions_checked": bool(args.require_scenarios),
+        "variables_checked": bool(args.require_scenarios and args.require_auth),
+        "source_mapping_checked": bool(args.require_scenarios),
+        "qa_lock_checked": bool(args.require_scenarios),
+        "business_version_checked": business_version_checked,
         "modules": module_reports,
         "blocked_modules": sum(value.get("status") == "blocked" for value in module_reports.values()),
         "errors": errors,
+        "warnings": list(dict.fromkeys(warnings)),
         "static_ok": static_ok,
         "static_ready": static_ok,
         "context_ready": bool(isinstance(preflight, dict) and preflight.get("context_ready") is True),
@@ -2083,7 +2353,7 @@ def main() -> int:
             for module_id, report in module_reports.items()
         },
     }
-    if not args.module:
+    if not args.module and args.write_status:
         sync_global_index(args.contracts_root / "index.yaml", status, totals, module_reports)
     if args.as_json:
         print(json.dumps(report, ensure_ascii=True, indent=2))

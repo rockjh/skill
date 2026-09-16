@@ -71,6 +71,8 @@ def generate_command(argv: list[str]) -> int:
     parser.add_argument("--incremental", action="store_true")
     parser.add_argument("--no-seed-cases", action="store_true")
     parser.add_argument("--source-root", action="append", type=Path, default=[])
+    parser.add_argument("--exception-type")
+    parser.add_argument("--error-code-type")
     parser.add_argument("--coverage-profile", choices=("contract-draft", "full-matrix"))
     parser.add_argument("--shared-cli", action="store_true", help="do not copy project-local Python scripts")
     args = parser.parse_args(argv)
@@ -106,7 +108,11 @@ def generate_command(argv: list[str]) -> int:
         missing = [str(path) for path in args.source_root if not path.is_dir()]
         if missing:
             parser.error("source root(s) do not exist: " + ", ".join(missing))
-        candidates = scan_source_logic(args.source_root)
+        candidates = scan_source_logic(args.source_root, None, args.exception_type, args.error_code_type)
+        if candidates.get("errors"):
+            for error in candidates["errors"]:
+                print(f"ERROR: {error}", file=sys.stderr)
+            return 2
         unresolved = apply_candidates(candidates, contracts)
         if unresolved:
             for candidate_id in unresolved:
@@ -137,6 +143,7 @@ def coverage_command(argv: list[str], reconcile: bool) -> int:
     scope.add_argument("--module")
     parser.add_argument("--results", type=Path)
     parser.add_argument("--preflight-results", type=Path)
+    parser.add_argument("--write-status", action="store_true")
     args = parser.parse_args(argv)
     if reconcile and (not args.results or not args.preflight_results):
         parser.error("reconcile requires --results and --preflight-results")
@@ -173,6 +180,8 @@ def coverage_command(argv: list[str], reconcile: bool) -> int:
         command.extend(["--results", str(args.results)])
     if args.preflight_results:
         command.extend(["--preflight-results", str(args.preflight_results)])
+    if args.write_status:
+        command.append("--write-status")
     return subprocess.run(command, check=False).returncode
 
 

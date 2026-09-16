@@ -19,7 +19,7 @@ Generate decisions from OpenAPI, source, security configuration, and probe evide
 
 `full-matrix` generates every applicable scenario supported by contract, source, security profile, or probe evidence. It does not invent missing evidence. A true scenario without enough evidence to build a precise case remains a blocking gap.
 
-`verified` is not a generation profile. It is available only after the complete `--all` scope passes strict reconciliation and execution.
+`verified` is not a generation profile. It is available only after the default all-module scope passes strict reconciliation and execution.
 
 ## Authentication And Audit Context
 
@@ -74,7 +74,7 @@ For multipart or binary inputs always cover a missing required file. Cover empty
 
 ## Business Errors And Safety
 
-Generate business errors only from API-reachable implementation evidence. In the MNO traffic project, trace `MnoTrafficApplicationException` and resolve `MnoTrafficErrorCodeEnum` values. Do not map unrelated exception families such as `MnoRcpApplicationException`.
+Generate business errors only from API-reachable implementation evidence. Discover the exception/error-code family from `ControllerAdvice`, constructor types, or one unique name-matched pair; block ambiguous families until explicitly configured.
 
 Scanners exclude tests, architecture checks, Javadoc, error-enum definitions, constant-only classes, build output, and branches that are not reachable from a controller mapping. A candidate that maps to zero or multiple endpoints is a blocker.
 

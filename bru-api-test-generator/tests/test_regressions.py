@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import yaml
 
@@ -36,9 +38,35 @@ def load_script(name: str):
 def static_preflight_inputs(root: Path) -> tuple[Path, Path]:
     openapi = root / "openapi.json"
     static_results = root / "static-coverage.json"
-    openapi.write_text('{"openapi":"3.0.0","paths":{}}', encoding="utf-8")
+    openapi.write_text(json.dumps({
+        "openapi": "3.0.0",
+        "paths": {},
+        "provenance": {
+            "status": "verified",
+            "application_sha": "test",
+            "application_pid": os.getpid(),
+        },
+    }), encoding="utf-8")
     digest = hashlib.sha256(openapi.read_bytes()).hexdigest()
-    static_results.write_text(json.dumps({"static_ready": True, "openapi_sha256": digest}), encoding="utf-8")
+    (root / "generation-state.yaml").write_text(json.dumps({
+        "openapi_sha256": digest,
+        "modules": {},
+        "cases": {},
+    }), encoding="utf-8")
+    load_script("qa_lock").write(root)
+    static_results.write_text(json.dumps({
+        "report_version": 2,
+        "check_profile": "full-matrix-strict",
+        "static_ok": True,
+        "openapi_sha256": digest,
+        "scenario_matrix_checked": True,
+        "constraint_obligations_checked": True,
+        "exact_assertions_checked": True,
+        "variables_checked": True,
+        "source_mapping_checked": True,
+        "qa_lock_checked": True,
+        "business_version_checked": True,
+    }), encoding="utf-8")
     return openapi, static_results
 
 
@@ -69,6 +97,167 @@ def execution_fixture(
 
 
 class RegressionTests(unittest.TestCase):
+    def test_process_liveness_probe_does_not_terminate_current_windows_process(self):
+        preflight = load_script("runtime_preflight")
+        self.assertTrue(preflight.process_is_running(os.getpid()))
+        self.assertFalse(preflight.process_is_running(-1))
+
+    def test_success_rejects_http_style_status_when_error_code_is_business_failure(self):
+        coverage = load_script("check_api_coverage")
+        case = {
+            "id": "THING_GET_SUCCESS",
+            "scenario": "success",
+            "expected": {"http_status": 200},
+            "assertions": [
+                {"path": "$.status", "equals": 200},
+                {"path": "$.errorCode", "equals": 100009},
+                {"path": "$.data.id", "equals": "thing-1"},
+            ],
+        }
+        self.assertTrue(coverage.success_assertion_errors(case))
+        case["assertions"][1]["equals"] = 0
+        self.assertEqual(coverage.success_assertion_errors(case), [])
+
+    def test_exists_assertion_is_draft_only_even_with_an_exact_assertion(self):
+        coverage = load_script("check_api_coverage")
+        errors = coverage.case_completion_errors({
+            "id": "THING_GET",
+            "status": "runnable",
+            "assertions": [
+                {"path": "$.data.id", "equals": "thing-1"},
+                {"path": "$.data.name", "exists": True},
+            ],
+        })
+        self.assertTrue(any("existence-only" in error for error in errors), errors)
+
+    def test_response_envelope_prefers_error_code_and_requires_result_evidence(self):
+        parser = load_script("parse_openapi")
+        endpoint = {
+            "responses": {"200": {"content": {"application/json": {"example": {
+                "status": 200,
+                "errorCode": 100009,
+                "errorMsg": "failed",
+                "data": {"id": "thing-1"},
+            }}}}},
+        }
+        self.assertEqual(parser.exact_response_assertions(endpoint, 200), [])
+        endpoint["responses"]["200"]["content"]["application/json"]["example"].update({
+            "errorCode": 0,
+            "errorMsg": "success",
+        })
+        self.assertEqual(parser.exact_response_assertions(endpoint, 200), [
+            {"path": "$.errorCode", "equals": 0},
+            {"path": "$.data.id", "equals": "thing-1"},
+        ])
+
+    def test_nested_body_and_file_obligations_are_all_seeded(self):
+        parser = load_script("parse_openapi")
+        endpoint = {
+            "id": "IMPORT_CREATE",
+            "method": "POST",
+            "path": "/imports",
+            "x-risk": "isolated-write",
+            "request_body": {"content": {"multipart/form-data": {"schema": {
+                "type": "object",
+                "required": ["profile", "file"],
+                "properties": {
+                    "profile": {
+                        "type": "object",
+                        "required": ["name"],
+                        "properties": {"name": {
+                            "type": "string", "pattern": "^[a-z]+$", "minLength": 2, "maxLength": 8,
+                        }},
+                    },
+                    "file": {
+                        "type": "string", "format": "binary", "x-min-size": 1,
+                        "x-max-size": 1024, "x-allowed-extensions": ["csv"],
+                        "x-allowed-mime-types": ["text/csv"],
+                    },
+                },
+            }}}},
+            "responses": {
+                "200": {
+                    "content": {"application/json": {"example": {"code": 0, "data": {"id": "1"}}}},
+                },
+                "400": {
+                    "content": {"application/json": {"example": {"code": 4001, "msg": "invalid"}}},
+                },
+            },
+        }
+        endpoint["obligations"] = parser.constraint_obligations(endpoint)
+        cases = parser.seed_contract_cases(endpoint, "full-matrix")
+        obligations = {item["id"] for item in endpoint["obligations"]}
+        covered = {coverage_id for case in cases for coverage_id in case.get("coverage_ids", [])}
+        self.assertEqual(obligations - covered, set())
+        success = next(case for case in cases if case["scenario"] == "success")
+        self.assertEqual(success["request"]["body"]["file"], {"file": "{{UPLOAD_FILE}}"})
+
+    def test_query_cases_require_result_specific_assertions(self):
+        coverage = load_script("check_api_coverage")
+        case = {
+            "id": "THING_QUERY",
+            "scenario": "query",
+            "expected": {"http_status": 200},
+            "request": {"query": {"name": "x"}},
+            "assertions": [{"path": "$.code", "equals": 0}, {"path": "$.msg", "equals": "ok"}],
+        }
+        self.assertTrue(coverage.query_assertion_errors(case))
+        case["assertions"].append({"path": "$.data.records", "length": 1})
+        self.assertEqual(coverage.query_assertion_errors(case), [])
+
+    @unittest.skipUnless(os.name == "nt", "Windows command wrapper regression")
+    def test_windows_cmd_execution_preserves_spaces_json_and_shell_metacharacters(self):
+        command_execution = load_script("command_execution")
+        with tempfile.TemporaryDirectory(prefix="bru cmd ") as directory:
+            root = Path(directory)
+            helper = root / "args.py"
+            helper.write_text("import json, sys; print(json.dumps(sys.argv[1:]))\n", encoding="utf-8")
+            wrapper = root / "bru.cmd"
+            wrapper.write_text(f'@echo off\r\npython "{helper}" %*\r\n', encoding="ascii")
+            arguments = ["--env-var", 'RUNTIME={"name":"a b&c"}']
+            with mock.patch.dict(os.environ, {"PATH": str(root) + os.pathsep + os.environ["PATH"]}):
+                completed = subprocess.run(
+                    command_execution.command_argv("bru", *arguments),
+                    check=False, capture_output=True, text=True, encoding="utf-8",
+                )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(json.loads(completed.stdout), arguments)
+
+    def test_git_z_parsers_preserve_unicode_spaces_and_rename_destinations(self):
+        checker = load_script("check_version_compatibility")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.email", "qa@example.invalid"], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.name", "QA"], check=True)
+            old = root / "旧 名称.txt"
+            changed = root / "中文 空格.txt"
+            old.write_text("old\n", encoding="utf-8")
+            changed.write_text("one\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(root), "commit", "-qm", "baseline"], check=True)
+            baseline = subprocess.check_output(
+                ["git", "-C", str(root), "rev-parse", "HEAD"], text=True, encoding="utf-8",
+            ).strip()
+            renamed = root / "新 名称.txt"
+            old.rename(renamed)
+            changed.write_text("two\n", encoding="utf-8")
+            untracked = root / "新增 空格.txt"
+            untracked.write_text("new\n", encoding="utf-8")
+            dirty = checker.dirty_files(root)
+            self.assertIn("新 名称.txt", dirty)
+            self.assertIn("中文 空格.txt", dirty)
+            self.assertIn("新增 空格.txt", dirty)
+            subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(root), "commit", "-qm", "changed"], check=True)
+            current = subprocess.check_output(
+                ["git", "-C", str(root), "rev-parse", "HEAD"], text=True, encoding="utf-8",
+            ).strip()
+            diff = checker.changed_files(root, baseline, current)
+            self.assertIn("新 名称.txt", diff)
+            self.assertNotIn("旧 名称.txt", diff)
+            self.assertIn("中文 空格.txt", diff)
+
     def test_raw_bruno_assertion_failure_is_not_passed(self):
         coverage = load_script("check_api_coverage")
         raw = [
@@ -672,6 +861,41 @@ class RegressionTests(unittest.TestCase):
             self.assertIn(first[0].name, {path.name for path in drift})
             self.assertIn("/wrong", first[0].read_text(encoding="utf-8"))
 
+    def test_materializer_syncs_case_only_changes_and_blocks_concurrent_edits(self):
+        materializer = load_script("materialize_missing_bru")
+        manifests = load_script("manifest_io")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            module = root / "contracts" / "modules" / "用户"
+            module.mkdir(parents=True)
+            (module / "endpoints.yaml").write_text(json.dumps({"endpoints": [{
+                "id": "USER_GET", "method": "GET", "path": "/users",
+            }]}), encoding="utf-8")
+            cases_path = module / "cases.yaml"
+            cases_path.write_text(json.dumps({"cases": [{
+                "id": "USER_GET_OK", "title": "查询用户成功", "endpoint_id": "USER_GET",
+                "risk": "read-only", "expected": {"http_status": 200},
+                "assertions": [{"path": "$.data.id", "equals": "one"}],
+            }]}), encoding="utf-8")
+            config, _ = execution_fixture(root)
+            materializer.materialize(root / "contracts", root / "bruno", execution_config_path=config)
+            case = manifests.load_data(cases_path)
+            case["cases"][0]["assertions"][0]["equals"] = "two"
+            cases_path.write_text(json.dumps(case, ensure_ascii=False), encoding="utf-8")
+            materializer.materialize(root / "contracts", root / "bruno", execution_config_path=config)
+            bru = next(path for path in (root / "bruno" / "用户").glob("*.bru"))
+            self.assertIn('res.body.data.id: eq "two"', bru.read_text(encoding="utf-8"))
+
+            case = manifests.load_data(cases_path)
+            case["cases"][0]["assertions"][0]["equals"] = "three"
+            cases_path.write_text(json.dumps(case, ensure_ascii=False), encoding="utf-8")
+            bru.write_text(bru.read_text(encoding="utf-8").replace("/users", "/manual"), encoding="utf-8")
+            with self.assertRaises(SystemExit) as raised:
+                materializer.materialize(root / "contracts", root / "bruno", execution_config_path=config)
+            conflict = json.loads(str(raised.exception))
+            self.assertEqual(conflict["error"], "materialize_conflict")
+            self.assertTrue(conflict["diff"])
+
     def test_existing_filename_number_survives_manifest_reordering(self):
         materializer = load_script("materialize_missing_bru")
         coverage = load_script("check_api_coverage")
@@ -863,7 +1087,7 @@ class RegressionTests(unittest.TestCase):
             self.assertTrue(report["static_ready"])
             self.assertTrue(report["context_ready"])
             self.assertFalse(report["execution_ready"])
-            self.assertEqual(report["status"], "draft")
+            self.assertEqual(report["status"], "blocked")
 
     def test_coverage_detects_method_url_query_and_body_drift(self):
         coverage = load_script("check_api_coverage")
@@ -996,6 +1220,56 @@ class RegressionTests(unittest.TestCase):
             lock = load_script("manifest_io").load_data(contracts / "version-lock.yaml")
             self.assertEqual(lock["status"], "draft")
             self.assertEqual(lock["business"]["baseline_status"], "draft")
+            blocked = subprocess.run(
+                [
+                    sys.executable, str(ROOT / "scripts/check_version_compatibility.py"),
+                    str(repo), str(contracts), "--phase", "before-execute",
+                ],
+                check=False, capture_output=True, text=True, encoding="utf-8",
+            )
+            self.assertEqual(blocked.returncode, 3)
+            self.assertIn("expected current", blocked.stdout)
+
+            (repo / "main.go").write_text("package main\n// reviewed\n", encoding="utf-8")
+            completion = root / "completion.json"
+            completion.write_text(json.dumps({"completion_ok": True, "status": "verified"}), encoding="utf-8")
+            forged = subprocess.run(
+                [
+                    sys.executable, str(ROOT / "scripts/check_version_compatibility.py"),
+                    str(repo), str(contracts), "--write", "--tests-adapted",
+                    "--completion-report", str(completion),
+                ],
+                check=False, capture_output=True, text=True, encoding="utf-8",
+            )
+            self.assertEqual(forged.returncode, 3)
+            self.assertIn("full-matrix-strict", forged.stdout)
+            completion.write_text(json.dumps({
+                "report_version": 2,
+                "check_profile": "full-matrix-strict",
+                "scenario_matrix_checked": True,
+                "constraint_obligations_checked": True,
+                "exact_assertions_checked": True,
+                "variables_checked": True,
+                "source_mapping_checked": True,
+                "qa_lock_checked": True,
+                "business_version_checked": True,
+                "execution_scope": "all",
+                "completion_ok": True,
+                "status": "verified",
+                "errors": [],
+            }), encoding="utf-8")
+            updated = subprocess.run(
+                [
+                    sys.executable, str(ROOT / "scripts/check_version_compatibility.py"),
+                    str(repo), str(contracts), "--write", "--tests-adapted",
+                    "--completion-report", str(completion),
+                ],
+                check=False, capture_output=True, text=True, encoding="utf-8",
+            )
+            self.assertEqual(updated.returncode, 0, updated.stdout + updated.stderr)
+            lock = load_script("manifest_io").load_data(contracts / "version-lock.yaml")
+            self.assertEqual(lock["status"], "current")
+            self.assertEqual(lock["business"]["baseline_status"], "current")
 
     def test_module_materialization_does_not_touch_other_modules_or_index(self):
         materializer = load_script("materialize_missing_bru")
@@ -1166,6 +1440,23 @@ class RegressionTests(unittest.TestCase):
         self.assertNotIn(materializer.OMIT_MARKER, disabled)
         self.assertIn("console.log('业务前置')", disabled)
 
+    def test_top_level_openapi_path_example_is_materialized_as_a_concrete_value(self):
+        parser = load_script("parse_openapi")
+        endpoint = {
+            "id": "USER_GET",
+            "method": "GET",
+            "path": "/users/{id}",
+            "parameters": [{
+                "name": "id", "in": "path", "required": True,
+                "example": "user-42", "schema": {"type": "string"},
+            }],
+            "responses": {"200": {"content": {"application/json": {"example": {
+                "code": 0, "data": {"id": "user-42"},
+            }}}}},
+        }
+        success = parser.seed_contract_cases(endpoint)[0]
+        self.assertEqual(success["request"]["path_parameters"]["id"], "user-42")
+
     def test_materializer_supports_non_json_bodies_and_response_targets(self):
         materializer = load_script("materialize_missing_bru")
         case = {
@@ -1303,7 +1594,21 @@ class RegressionTests(unittest.TestCase):
             )
             source.write_text("package main\nfunc changed() {}\n", encoding="utf-8")
             report = root / "evidence.json"
-            report.write_text(json.dumps({"status": "verified", "completion_ok": True}), encoding="utf-8")
+            report.write_text(json.dumps({
+                "report_version": 2,
+                "check_profile": "full-matrix-strict",
+                "scenario_matrix_checked": True,
+                "constraint_obligations_checked": True,
+                "exact_assertions_checked": True,
+                "variables_checked": True,
+                "source_mapping_checked": True,
+                "qa_lock_checked": True,
+                "business_version_checked": True,
+                "execution_scope": "all",
+                "status": "verified",
+                "completion_ok": True,
+                "errors": [],
+            }), encoding="utf-8")
             result = subprocess.run(
                 [
                     sys.executable,
@@ -1653,6 +1958,16 @@ class RegressionTests(unittest.TestCase):
         qa_lock = load_script("qa_lock")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            (root / ".gitignore").write_text("contracts/\nbruno/\nexecution/\n*.json\n", encoding="utf-8")
+            (root / "business.txt").write_text("business\n", encoding="utf-8")
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.email", "qa@example.invalid"], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.name", "QA"], check=True)
+            subprocess.run(["git", "-C", str(root), "add", ".gitignore", "business.txt"], check=True)
+            subprocess.run(["git", "-C", str(root), "commit", "-qm", "baseline"], check=True)
+            business_sha = subprocess.check_output(
+                ["git", "-C", str(root), "rev-parse", "HEAD"], text=True, encoding="utf-8"
+            ).strip()
             contracts = root / "contracts" / "things"
             bru_root = root / "bruno"
             bru = bru_root / "things"
@@ -1707,6 +2022,11 @@ class RegressionTests(unittest.TestCase):
             openapi = contracts / "openapi.json"
             openapi.write_text(json.dumps({
                 "openapi": "3.0.0",
+                "provenance": {
+                    "status": "verified",
+                    "application_sha": business_sha,
+                    "application_pid": os.getpid(),
+                },
                 "paths": {"/things": {"get": {
                     "operationId": "THING_LIST",
                     "responses": {"200": {"description": "ok"}},
@@ -1721,9 +2041,26 @@ class RegressionTests(unittest.TestCase):
             evidence = root / "evidence.json"
             evidence.write_text(json.dumps({"executed": [case["id"]], "passed": [case["id"]]}), encoding="utf-8")
             preflight = root / "preflight.json"
-            preflight.write_text('{"status": "passed"}', encoding="utf-8")
+            preflight.write_text(json.dumps({
+                "version": 2,
+                "status": "runnable",
+                "check_profile": "full-matrix-strict",
+                "static_report_version": 2,
+                "static_ready": True,
+                "context_ready": True,
+                "execution_ready": True,
+                "openapi_sha256": hashlib.sha256(openapi.read_bytes()).hexdigest(),
+                "errors": [],
+            }), encoding="utf-8")
             version_lock = contracts / "version-lock.yaml"
-            version_lock.write_text("status: draft\n", encoding="utf-8")
+            checker = load_script("check_version_compatibility")
+            version_lock.write_text(json.dumps({
+                "status": "current",
+                "business": {
+                    "commit": business_sha,
+                    "source_digest": checker.source_digest(root),
+                },
+            }), encoding="utf-8")
             index = contracts / "index.yaml"
             index.write_text("generation_status: draft\n", encoding="utf-8")
             before = {path: path.read_bytes() for path in (generation_state, version_lock, index)}
@@ -1756,6 +2093,34 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(report["status"], "draft")
             self.assertFalse(report["completion_ok"])
             self.assertEqual(before, {path: path.read_bytes() for path in before})
+
+            openapi_document = json.loads(openapi.read_text(encoding="utf-8"))
+            openapi_document["provenance"]["status"] = "contract_provenance_unverified"
+            openapi.write_text(json.dumps(openapi_document), encoding="utf-8")
+            generation_state.write_text(
+                json.dumps({"openapi_sha256": hashlib.sha256(openapi.read_bytes()).hexdigest()}),
+                encoding="utf-8",
+            )
+            qa_lock.write(contracts)
+            warned = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts/check_api_coverage.py"),
+                    str(contracts),
+                    str(bru_root),
+                    "--module", "things",
+                    "--openapi", str(openapi),
+                    "--require-scenarios",
+                    "--require-auth",
+                    "--execution-config", str(config),
+                    "--json",
+                ],
+                check=False, capture_output=True, text=True, encoding="utf-8",
+            )
+            warned_report = json.loads(warned.stdout)
+            self.assertEqual(warned.returncode, 0, warned.stdout + warned.stderr)
+            self.assertTrue(warned_report["static_ok"])
+            self.assertTrue(any("provenance" in item for item in warned_report["warnings"]))
 
     def test_nested_json_body_is_compared_structurally(self):
         coverage = load_script("check_api_coverage")
@@ -1874,7 +2239,7 @@ class RegressionTests(unittest.TestCase):
             (qa_root / "scripts" / "run_bruno.py").write_text("outdated", encoding="utf-8")
             self.assertTrue(any("outdated" in error for error in manager.check_scripts(qa_root, ROOT / "scripts")))
 
-    def test_scope_risks_and_confirmations_are_enforced(self):
+    def test_scope_risks_are_reported_without_confirmation_flags(self):
         runner = load_script("run_bruno")
         with tempfile.TemporaryDirectory() as directory:
             contracts = Path(directory) / "contracts"
@@ -1891,16 +2256,56 @@ class RegressionTests(unittest.TestCase):
             }), encoding="utf-8")
             risks = runner.scope_risks(contracts, "APP")
             self.assertEqual(risks, {"read-only", "isolated-write"})
-            self.assertIn("--confirm-write", runner.confirmation_error(risks, False, False, False))
-            self.assertIsNone(runner.confirmation_error(risks, True, False, False))
-            self.assertIn(
-                "--confirm-destructive",
-                runner.confirmation_error({"destructive"}, True, False, False),
+            cases = runner.scope_cases(contracts, "APP")
+            self.assertEqual([case["id"] for case in cases], ["APP_GET_OK", "APP_POST_OK"])
+
+    def test_runner_logs_case_summary_and_remote_version_warnings(self):
+        runner = load_script("run_bruno")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            contracts = root / "contracts"
+            contracts.mkdir()
+            (contracts / "version-lock.yaml").write_text(
+                json.dumps({"business": {"commit": "abcdef1234567890"}}), encoding="utf-8",
             )
-            self.assertIn(
-                "--confirm-external",
-                runner.confirmation_error({"external-side-effect"}, False, False, False),
-            )
+            environment = {
+                "vars": {
+                    "baseUrl": "https://api.example.com",
+                    "versionPath": "/actuator/info",
+                    "versionJsonPath": "git.commit.id",
+                },
+                "headers": {},
+            }
+            response = mock.MagicMock()
+            response.status = 200
+            response.headers = {}
+            response.read.return_value = b'{"git":{"commit":{"id":"abcdef1"}}}'
+            context = mock.MagicMock()
+            context.__enter__.return_value = response
+            with mock.patch("urllib.request.urlopen", return_value=context):
+                self.assertEqual(runner.target_version_warnings(environment, contracts), [])
+
+            environment["vars"]["expectedVersion"] = "different"
+            with mock.patch("urllib.request.urlopen", return_value=context):
+                warnings = runner.target_version_warnings(environment, contracts)
+            self.assertTrue(any("mismatch" in warning for warning in warnings))
+
+            environment["vars"].pop("versionPath")
+            self.assertTrue(any("was not checked" in warning for warning in runner.target_version_warnings(environment, contracts)))
+
+            first_log = runner.log_path(root, None)
+            second_log = runner.log_path(root, "AC-信息")
+            self.assertIn("run-bruno-all.log", first_log.name)
+            self.assertIn("run-bruno-AC-信息.log", second_log.name)
+            output = io.StringIO()
+            with mock.patch("sys.stdout", output):
+                total, passed, failed = runner.render_case_summary(
+                    [{"id": "A", "title": "成功"}, {"id": "B", "title": "失败"}],
+                    {"executed": ["A", "B"], "passed": ["A"]},
+                )
+            self.assertEqual((total, passed, failed), (2, 1, ["B"]))
+            self.assertIn("[PASS] A", output.getvalue())
+            self.assertIn("[FAIL] B", output.getvalue())
 
     def test_materializer_removes_obsolete_plan_tags(self):
         materializer = load_script("materialize_missing_bru")
@@ -2033,6 +2438,133 @@ class RegressionTests(unittest.TestCase):
         self.assertTrue(any(item.get("required_header") == "operatorInfo" for item in required))
         self.assertTrue(any("143000" in item.get("expected_business_codes", []) for item in required))
 
+    def test_rcp_and_traffic_java_structures_resolve_real_delegator_entrypoints(self):
+        scanner = load_script("analyze_java_logic")
+
+        def write_sources(root: Path, sources: dict[str, str]) -> None:
+            root.mkdir()
+            for name, source in sources.items():
+                (root / name).write_text(source, encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rcp = root / "rcp"
+            write_sources(rcp, {
+                "RcpController.java": (
+                    '@RequestMapping("/v1/rcp")\nclass RcpController {\n'
+                    '  private final ApplicationDelegator delegator;\n'
+                    '  @PostMapping(\n    path = "/items"\n  )\n'
+                    '  public ResponseEntity<\n      Object> create() throws Exception {\n'
+                    '    return delegator.apply(new CreateRcpApplication());\n  }\n}\n'
+                ),
+                "CreateRcpApplication.java": (
+                    'class CreateRcpApplication {\n  private final RcpDomainService domainService;\n'
+                    '  public Object doServe() throws Exception { return domainService.create(); }\n}\n'
+                ),
+                "RcpDomainService.java": (
+                    'class RcpDomainService {\n  public Object create() { '
+                    'throw new MnoRcpApplicationException(MnoRcpErrorCode.INVALID_ITEM); }\n}\n'
+                ),
+                "MnoRcpApplicationException.java": (
+                    'class MnoRcpApplicationException extends RuntimeException {\n'
+                    '  public MnoRcpApplicationException(MnoRcpErrorCode code) {}\n}\n'
+                ),
+                "MnoRcpErrorCode.java": 'enum MnoRcpErrorCode { INVALID_ITEM(100009); }\n',
+                "RcpAdvice.java": (
+                    '@ControllerAdvice\nclass RcpAdvice {\n'
+                    '  @ExceptionHandler(MnoRcpApplicationException.class)\n'
+                    '  public Object handle(MnoRcpApplicationException error) { return error; }\n}\n'
+                ),
+            })
+            traffic = root / "traffic"
+            write_sources(traffic, {
+                "TrafficController.java": (
+                    '@RequestMapping("/v1/traffic")\nclass TrafficController {\n'
+                    '  private final ApplicationDelegator delegator;\n'
+                    '  private final DeleteTrafficApplication deleteApplication;\n'
+                    '  @DeleteMapping(path = "ac/{id}")\n'
+                    '  public Object delete() throws Exception { return delegator.apply(deleteApplication); }\n}\n'
+                ),
+                "DeleteTrafficApplication.java": (
+                    'class DeleteTrafficApplication {\n  private final TrafficDomainService domainService;\n'
+                    '  public Object doServe() { return domainService.delete(); }\n}\n'
+                ),
+                "TrafficDomainService.java": (
+                    'class TrafficDomainService {\n  private final TrafficIntegration integration;\n'
+                    '  public Object delete() { return integration.delete(); }\n}\n'
+                ),
+                "TrafficIntegration.java": (
+                    'class TrafficIntegration {\n  public Object delete() { '
+                    'throw new MnoTrafficApplicationException(MnoTrafficErrorCodeEnum.GROUP_IN_USE); }\n}\n'
+                ),
+                "MnoTrafficApplicationException.java": (
+                    'class MnoTrafficApplicationException extends RuntimeException {\n'
+                    '  public MnoTrafficApplicationException(MnoTrafficErrorCodeEnum code) {}\n}\n'
+                ),
+                "MnoTrafficErrorCodeEnum.java": 'enum MnoTrafficErrorCodeEnum { GROUP_IN_USE(143000); }\n',
+            })
+
+            rcp_result = scanner.scan([rcp])
+            traffic_result = scanner.scan([traffic])
+
+        self.assertEqual(rcp_result["errors"], [])
+        self.assertEqual(rcp_result["entrypoint_count"], 1)
+        self.assertEqual(rcp_result["exception_family"]["exception_type"], "MnoRcpApplicationException")
+        rcp_business = [item for item in rcp_result["candidates"] if item["kind"] == "business_exception"]
+        self.assertTrue(any("POST /v1/rcp/items" in item["endpoint_keys"] for item in rcp_business))
+        self.assertTrue(any("100009" in item.get("expected_business_codes", []) for item in rcp_business))
+
+        self.assertEqual(traffic_result["errors"], [])
+        self.assertEqual(traffic_result["entrypoint_count"], 1)
+        self.assertEqual(traffic_result["exception_family"]["exception_type"], "MnoTrafficApplicationException")
+        traffic_business = [item for item in traffic_result["candidates"] if item["kind"] == "business_exception"]
+        self.assertTrue(any("DELETE /v1/traffic/ac/{id}" in item["endpoint_keys"] for item in traffic_business))
+        self.assertTrue(any("143000" in item.get("expected_business_codes", []) for item in traffic_business))
+
+    def test_java_scanner_blocks_when_mappings_exist_but_no_entrypoint_is_parsed(self):
+        scanner = load_script("analyze_java_logic")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "BrokenController.java").write_text(
+                'class BrokenController {\n  @GetMapping("/broken")\n  Object broken() { return null; }\n}\n',
+                encoding="utf-8",
+            )
+            result = scanner.scan([root])
+        self.assertEqual(result["mapping_annotation_count"], 1)
+        self.assertEqual(result["entrypoint_count"], 0)
+        self.assertTrue(any("recognized 0 controller entrypoints" in error for error in result["errors"]))
+
+    def test_source_business_error_without_http_status_evidence_remains_unresolved(self):
+        scanner = load_script("analyze_source_logic")
+        with tempfile.TemporaryDirectory() as directory:
+            contracts = Path(directory) / "contracts"
+            module = contracts / "modules" / "AC"
+            module.mkdir(parents=True)
+            endpoint = {
+                "id": "AC_DELETE", "method": "DELETE", "path": "/ac",
+                "responses": {"200": {}}, "scenario_matrix": {}, "case_ids": [],
+            }
+            (module / "endpoints.yaml").write_text(
+                yaml.safe_dump({"module": "ac", "endpoints": [endpoint]}, sort_keys=False), encoding="utf-8",
+            )
+            (module / "cases.yaml").write_text(
+                yaml.safe_dump({"module": "ac", "cases": []}, sort_keys=False), encoding="utf-8",
+            )
+            (module / "logic.yaml").write_text(
+                yaml.safe_dump({"module": "ac", "logic": []}, sort_keys=False), encoding="utf-8",
+            )
+            result = {"version": 2, "candidates": [{
+                "id": "BUSINESS_NO_STATUS", "kind": "business_exception", "coverage_required": True,
+                "endpoint_keys": ["DELETE /ac"], "expected_business_codes": ["143000"],
+                "file": "TrafficDomainService.java", "line": 10, "evidence": "GROUP_IN_USE",
+            }]}
+            unresolved = scanner.apply_candidates(result, contracts)
+            cases = load_script("manifest_io").first_list(
+                load_script("manifest_io").load_data(module / "cases.yaml"), "cases",
+            )
+        self.assertEqual(unresolved, ["BUSINESS_NO_STATUS"])
+        self.assertEqual(cases, [])
+
     def test_source_enhancement_seeds_required_header_and_business_error_drafts(self):
         scanner = load_script("analyze_source_logic")
         parser = load_script("parse_openapi")
@@ -2155,7 +2687,9 @@ class RegressionTests(unittest.TestCase):
             self.assertFalse((qa_root / "qa.yaml").exists())
             self.assertFalse((qa_root / "scripts").exists())
             readme = (execution / "README.md").read_text(encoding="utf-8")
-            self.assertIn("--all", readme)
+            self.assertIn('run.bat --module "AC-信息"', readme)
+            self.assertNotIn("--all", readme)
+            self.assertNotIn("--confirm-", readme)
             self.assertNotIn("--plan", readme)
             self.assertNotIn("--risk", readme)
             environment = execution_config.load_bruno_environment_document(environments / "local.bru")
@@ -2193,9 +2727,9 @@ class RegressionTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.assertEqual(run_help.returncode, 0)
-        self.assertIn("--all", run_help.stdout)
         self.assertIn("--module", run_help.stdout)
-        self.assertIn("--confirm-destructive", run_help.stdout)
+        self.assertNotIn("--all", run_help.stdout)
+        self.assertNotIn("--confirm-", run_help.stdout)
         self.assertNotIn("--plan", run_help.stdout)
         self.assertNotIn("--risk", run_help.stdout)
 

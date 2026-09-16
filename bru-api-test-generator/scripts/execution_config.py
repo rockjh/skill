@@ -38,6 +38,10 @@ DEFAULT_ENVIRONMENT_TEMPLATE = """vars {
   SESSION_COOKIE: ""
   ACCESS_KEY: ""
   SECRET_KEY: ""
+  versionPath: ""
+  expectedVersion: ""
+  versionJsonPath: ""
+  versionHeader: ""
 }
 
 headers {
@@ -55,45 +59,55 @@ BRUNO_JSON_TEMPLATE = {
 
 RUN_BAT_TEMPLATE = r"""@echo off
 setlocal
+rem Usage: run.bat runs all modules; run.bat --module "AC-信息" runs one module.
 python "%~dp0..\scripts\mno_bruno_qa.py" run --qa-root "%~dp0.." %*
 exit /b %errorlevel%
 """
 
 RUN_SH_TEMPLATE = """#!/usr/bin/env sh
 set -eu
+# Usage: ./run.sh runs all modules; ./run.sh --module "AC-信息" runs one module.
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 exec python3 "$SCRIPT_DIR/../scripts/mno_bruno_qa.py" run --qa-root "$SCRIPT_DIR/.." "$@"
 """
 
 SHARED_RUN_BAT_TEMPLATE = r"""@echo off
 setlocal
+rem Usage: run.bat runs all modules; run.bat --module "AC-信息" runs one module.
 mno-bruno-qa run --qa-root "%~dp0.." %*
 exit /b %errorlevel%
 """
 
 SHARED_RUN_SH_TEMPLATE = """#!/usr/bin/env sh
 set -eu
+# Usage: ./run.sh runs all modules; ./run.sh --module "AC-信息" runs one module.
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 exec mno-bruno-qa run --qa-root "$SCRIPT_DIR/.." "$@"
 """
 
 EXECUTION_README_TEMPLATE = """# Bruno 执行入口
 
-`config.yaml` 只保存活动环境、工具模式、覆盖档位和签名提供方。公共 Header 在活动环境的
+`config.yaml` 保存活动环境、工具模式、覆盖档位和签名提供方。公共 Header 在活动环境的
 `headers {}` 中维护，由 `collection.bru` 统一注入，请求自身 Header 优先。
 
+不加参数时执行全部模块；只执行一个模块时使用 `--module`：
+
 ```bat
-qa\\execution\\run.bat --all --confirm-write --confirm-destructive --confirm-external
-qa\\execution\\run.bat --module ac
+qa\\execution\\run.bat
+qa\\execution\\run.bat --module "AC-信息"
 ```
 
 ```sh
-./qa/execution/run.sh --all --confirm-write --confirm-destructive --confirm-external
-./qa/execution/run.sh --module ac
+./qa/execution/run.sh
+./qa/execution/run.sh --module "AC-信息"
 ```
 
-所选 collection 或模块始终全量执行。`risk` 只用于执行前确认和报告。模块运行不更新
-`contracts/version-lock.yaml`、全局 generation-state 或全局完成状态。
+运行器会打印阶段进度、每个用例的状态及最终汇总。每次运行都会在 `qa/logs/` 新建按时间和
+执行范围命名的日志。版本不一致只会以红色告警显示，不会阻塞用例执行。
+
+远程环境可在活动环境的 `vars {}` 中配置 `versionPath`。默认用
+`version-lock.yaml` 的业务提交作为期望值，也可用 `expectedVersion` 覆盖；特殊响应可配置
+`versionJsonPath` 或 `versionHeader`。模块运行不会更新全局完成状态。
 """
 
 COLLECTION_TEMPLATE = f'''auth {{
@@ -509,7 +523,7 @@ def initialize_execution_layout(qa_root: Path, local_scripts: bool | None = None
             changed.append(path)
     readme_path = execution_root / "README.md"
     current_readme = readme_path.read_text(encoding="utf-8", errors="strict")
-    if "--plan" in current_readme or "--risk" in current_readme:
+    if any(token in current_readme for token in ("--plan", "--risk", "--all", "--confirm-")):
         readme_path.write_text(EXECUTION_README_TEMPLATE, encoding="utf-8")
         changed.append(readme_path)
     config = load_execution_config(config_path)
@@ -523,8 +537,18 @@ def initialize_execution_layout(qa_root: Path, local_scripts: bool | None = None
         changed.append(plans_path)
     changed.extend(migrate_legacy_base_url(config_path, new_environments))
     for path, desired, known in (
-        (execution_root / "run.bat", run_bat_template.replace("\n", "\r\n"), {RUN_BAT_TEMPLATE.replace("\n", "\r\n"), SHARED_RUN_BAT_TEMPLATE.replace("\n", "\r\n")}),
-        (execution_root / "run.sh", run_sh_template, {RUN_SH_TEMPLATE, SHARED_RUN_SH_TEMPLATE}),
+        (execution_root / "run.bat", run_bat_template.replace("\n", "\r\n"), {
+            RUN_BAT_TEMPLATE.replace("\n", "\r\n"),
+            SHARED_RUN_BAT_TEMPLATE.replace("\n", "\r\n"),
+            RUN_BAT_TEMPLATE.replace('rem Usage: run.bat runs all modules; run.bat --module "AC-信息" runs one module.\n', "").replace("\n", "\r\n"),
+            SHARED_RUN_BAT_TEMPLATE.replace('rem Usage: run.bat runs all modules; run.bat --module "AC-信息" runs one module.\n', "").replace("\n", "\r\n"),
+        }),
+        (execution_root / "run.sh", run_sh_template, {
+            RUN_SH_TEMPLATE,
+            SHARED_RUN_SH_TEMPLATE,
+            RUN_SH_TEMPLATE.replace('# Usage: ./run.sh runs all modules; ./run.sh --module "AC-信息" runs one module.\n', ""),
+            SHARED_RUN_SH_TEMPLATE.replace('# Usage: ./run.sh runs all modules; ./run.sh --module "AC-信息" runs one module.\n', ""),
+        }),
     ):
         current = path.read_text(encoding="utf-8", errors="strict")
         if current in known and current != desired:
