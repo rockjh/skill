@@ -39,6 +39,64 @@ DEFAULT_RULES: tuple[dict[str, Any], ...] = (
     {"id": "source-domain-rules", "stages": ["generation", "materialization", "pre-execution", "post-execution"], "required": True},
 )
 
+DATABASE_STEP_REASONS = {
+    "setup": "missing_prerequisite_api",
+    "assertion": "missing_response_state",
+}
+DATABASE_STEP_FIELDS = {
+    "phase", "reason", "engine", "script", "evidence", "expected",
+    "cleanup", "cleanup_not_required_reason",
+}
+
+
+def database_steps(case: dict[str, Any]) -> list[dict[str, Any]]:
+    value = case.get("database_steps", [])
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def database_access_errors(case: dict[str, Any]) -> list[str]:
+    case_id = str(case.get("id", "<unknown>"))
+    value = case.get("database_steps")
+    if value is None:
+        return []
+    if not isinstance(value, list) or not value:
+        return [f"case {case_id} database_steps must be a non-empty list"]
+    errors: list[str] = []
+    for index, step in enumerate(value):
+        label = f"case {case_id} database_steps[{index}]"
+        if not isinstance(step, dict):
+            errors.append(f"{label} must be an object")
+            continue
+        unknown = sorted(set(step) - DATABASE_STEP_FIELDS)
+        if unknown:
+            errors.append(f"{label} contains unsupported field(s): {', '.join(unknown)}")
+        phase = str(step.get("phase", ""))
+        if phase not in DATABASE_STEP_REASONS:
+            errors.append(f"{label}.phase must be setup or assertion")
+        elif step.get("reason") != DATABASE_STEP_REASONS[phase]:
+            errors.append(f"{label}.reason must be {DATABASE_STEP_REASONS[phase]} for phase {phase}")
+        if not str(step.get("engine", "")).strip():
+            errors.append(f"{label}.engine must name the database technology")
+        if not str(step.get("script", "")).strip():
+            errors.append(f"{label}.script must contain executable Bruno JavaScript")
+        evidence = step.get("evidence")
+        if not (
+            isinstance(evidence, str) and evidence.strip()
+            or isinstance(evidence, list) and any(str(item).strip() for item in evidence)
+        ):
+            errors.append(f"{label}.evidence must cite the source schema or repository logic")
+        if phase == "assertion" and not (
+            isinstance(step.get("expected"), dict) and step["expected"]
+        ):
+            errors.append(f"{label}.expected must declare the exact database result")
+        if phase == "assertion" and not re.search(r"\btest\s*\(", str(step.get("script", ""))):
+            errors.append(f"{label}.script must register a Bruno test(...) observation")
+        if phase == "setup" and not str(step.get("cleanup", "")).strip() and not str(
+            step.get("cleanup_not_required_reason", "")
+        ).strip():
+            errors.append(f"{label} must declare cleanup or cleanup_not_required_reason")
+    return errors
+
 
 def rules_path(qa_root: Path) -> Path:
     return qa_root / "constraints" / "rules.yaml"
@@ -780,6 +838,7 @@ def validate_stage(
         for case in first_list(case_doc, "cases"):
             if "request-parseable" in active:
                 errors.extend(_request_errors(case))
+                errors.extend(database_access_errors(case))
             if "review-reason-required" in active:
                 errors.extend(review_reason_errors(case))
     if "review-placeholder-authorized" in active:

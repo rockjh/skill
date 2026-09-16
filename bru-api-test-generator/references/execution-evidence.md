@@ -11,6 +11,8 @@ qa/evidence/modules/<module-id>/<timestamp>-evidence.json
 
 Pass status requires an executed request, successful request status, no runtime error, at least one assertion/test observation, and every observation passing. A top-level Bruno `pass` value alone is insufficient.
 
+Database assertion steps register Bruno `test` observations and fail the owning case on connection, query, expectation, or cleanup errors. Persist only the bounded assertion outcome in Bruno's normalized evidence; do not retain connection strings, credentials, or full database rows/documents.
+
 Normalized evidence contains `executed`, `passed`, and per-case actual HTTP status, redacted response body/shape, and assertion/request failure detail. Successful observations are also written to `observed-rules.yaml` and reused during later generation to improve request values and exact assertions.
 
 ## Result Report

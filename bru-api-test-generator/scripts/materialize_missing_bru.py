@@ -24,7 +24,7 @@ from execution_config import (
     load_execution_config,
 )
 from parse_openapi import display_directory, render_manifest, update_module_document
-from qa_constraints import write_module_lock
+from qa_constraints import database_access_errors, database_steps, write_module_lock
 from qa_lock import write as write_qa_lock
 
 
@@ -346,7 +346,40 @@ def post_response_script(case: dict[str, Any], assertions: list[dict[str, Any]])
                 f"    expect(Number.isInteger({expression})).to.equal(true);",
                 "  });",
             ])
+    for step in database_steps(case):
+        if step.get("phase") != "assertion":
+            continue
+        engine = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(step["engine"]).strip())
+        lines.append(f"  // bru-api-test-generator: database-assertion {engine}")
+        lines.extend(textwrap.indent(str(step["script"]).strip(), "  ").splitlines())
+    cleanup_lines: list[str] = []
+    for step in database_steps(case):
+        cleanup = str(step.get("cleanup", "")).strip()
+        if step.get("phase") != "setup" or not cleanup:
+            continue
+        engine = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(step["engine"]).strip())
+        cleanup_lines.append(f"    // bru-api-test-generator: database-cleanup {engine}")
+        cleanup_lines.extend(textwrap.indent(cleanup, "    ").splitlines())
+    if cleanup_lines:
+        lines = ["  try {", *[f"  {line}" for line in lines], "  } finally {", *cleanup_lines, "  }"]
     return "\n".join(["script:post-response {", *lines, "}"]) if lines else ""
+
+
+def pre_request_script(case: dict[str, Any]) -> str:
+    lines: list[str] = []
+    omitted_headers = request_omit_headers(case)
+    if omitted_headers:
+        lines.extend([
+            f"  // {OMIT_MARKER}",
+            f"  req.deleteHeaders({json.dumps(omitted_headers, ensure_ascii=False)});",
+            f"  // {OMIT_END_MARKER}",
+        ])
+    setup_steps = [step for step in database_steps(case) if step.get("phase") == "setup"]
+    for step in setup_steps:
+        engine = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(step["engine"]).strip())
+        lines.append(f"  // bru-api-test-generator: database-setup {engine}")
+        lines.extend(textwrap.indent(str(step["script"]).strip(), "  ").splitlines())
+    return "\n".join(["script:pre-request {", *lines, "}"]) if lines else ""
 
 
 def render_case(
@@ -354,6 +387,9 @@ def render_case(
     endpoint: dict[str, Any],
     sequence: int | None = None,
 ) -> str:
+    database_errors = database_access_errors(case)
+    if database_errors:
+        raise ValueError("; ".join(database_errors))
     request = case.get("request") if isinstance(case.get("request"), dict) else {}
     method = str(endpoint.get("method", "GET")).lower()
     base_env = "baseUrl"
@@ -384,9 +420,9 @@ def render_case(
         "  auth: none",
         "}",
     ]
-    omit_script = request_omit_script(case)
-    if omit_script:
-        lines.extend(["", omit_script])
+    request_script = pre_request_script(case)
+    if request_script:
+        lines.extend(["", request_script])
     headers = request.get("headers")
     headers = dict(headers) if isinstance(headers, dict) else {}
     content_type = request.get("content_type")

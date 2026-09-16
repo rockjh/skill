@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bruno-api-test-generator"
-version = "5.1.0"
+version = "5.2.0"
 description = "Reusable Bruno API QA generation and execution CLI"
 requires-python = ">=3.10"
 dependencies = ["PyYAML>=6"]

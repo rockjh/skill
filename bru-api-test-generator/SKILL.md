@@ -1,6 +1,6 @@
 ---
 name: bru-api-test-generator
-description: Generate, execute, and incrementally maintain auditable Bruno HTTP API tests from local OpenAPI, project source, prior QA constraints, and execution evidence. Use for module-owned API QA with exact assertions, machine-enforced lifecycle validation, independent module runs, and result-oriented failure reports; do not use for browser or database-heavy system E2E workflows.
+description: Generate, execute, and incrementally maintain auditable Bruno HTTP API tests from local OpenAPI, project source, prior QA constraints, and execution evidence. Use for module-owned API QA with exact assertions, narrow database setup or verification when an API cannot provide it, machine-enforced lifecycle validation, independent module runs, and result-oriented failure reports; do not use for browser or database-heavy system E2E workflows.
 ---
 
 # Bruno API Test Generator
@@ -75,9 +75,10 @@ Read [references/execution-config.md](references/execution-config.md) before ini
    ```
 
 5. Reuse `qa/constraints/source-rules.yaml`, global and module `observed-rules.yaml`, prior execution evidence, and named variables from the active local Bruno environment before inventing data. Environment values are referenced as `{{VARIABLE}}`; their literal values are never copied into contracts or requests. Source-derived values must populate cases when OpenAPI omits examples/defaults.
-6. Materialize and validate all registered requests. Generated `.bru` files have no `meta.tags` line.
-7. If OpenAPI provenance has a loopback `source_url`, generation must immediately invoke the default all-module run. A failed case must not stop later cases.
-8. Merge module results, run global reconciliation, and write the final result report. The report, not static inventory, is the primary handoff.
+6. If an unavailable prerequisite API or omitted response state requires direct database access, add case-owned `database_steps` under the rules below. Otherwise do not connect to a database from an API case.
+7. Materialize and validate all registered requests. Generated `.bru` files have no `meta.tags` line.
+8. If OpenAPI provenance has a loopback `source_url`, generation must immediately invoke the default all-module run. A failed case must not stop later cases.
+9. Merge module results, run global reconciliation, and write the final result report. The report, not static inventory, is the primary handoff.
 
 Read [references/offline-swagger.md](references/offline-swagger.md), [references/case-matrix.md](references/case-matrix.md), [references/coverage-manifest.md](references/coverage-manifest.md), and [references/incremental-generation.md](references/incremental-generation.md) for schemas and detailed behavior.
 
@@ -110,6 +111,7 @@ Every enabled rule in `qa/constraints/rules.yaml` is required. A violation fails
 - module workers do not update `index.yaml`, `generation-state.yaml`, or `qa-lock.yaml`;
 - business source files are never modified by QA commands;
 - QA contracts, requests, evidence, and reports contain no credentials;
+- database steps use one of the two allowed reasons, cite source evidence, and declare exact verification or cleanup;
 - successful case inputs satisfy active source/domain field rules.
 
 Static checks, execution preflight, and post-execution reconciliation call this same engine. Do not implement a second copy of a rule in prose or a stage-specific checker.
@@ -136,12 +138,25 @@ An unexplained placeholder fails generation and checking. An explained placehold
 Every non-review success case must assert:
 
 - exact HTTP status and business success code;
-- at least one exact key result or request/response relation;
+- at least one exact key result, request/response relation, or allowed database-state assertion when the response omits that state;
 - list item structure and length where applicable;
 - page number, page size, total, and records/content structure for pagination;
 - created/updated resource identifiers or captured IDs for write flows.
 
-Derive assertions from DTO/Output/CommonResponse schemas, fixed source values, OpenAPI examples, and redacted successful response evidence. A long-lived `status == 200`-only case is invalid. Execution retains redacted response values and shapes under `qa/evidence/` and writes observed rules for the next incremental generation.
+Derive assertions from DTO/Output/CommonResponse schemas, entities/repositories, fixed source values, OpenAPI examples, and redacted successful response evidence. A long-lived `status == 200`-only case is invalid. Execution retains redacted response values and shapes under `qa/evidence/` and writes observed rules for the next incremental generation.
+
+## Direct Database Access
+
+Direct MySQL, Elasticsearch, MongoDB, or other datastore statements are allowed only when:
+
+1. the module has no public or approved test interface for creating prerequisite data required by its API cases; or
+2. the response omits the state required to verify that an API operation succeeded.
+
+Declare those operations as `database_steps` in the owning case. A `setup` step uses reason `missing_prerequisite_api`; an `assertion` step uses `missing_response_state`. Keep the statement directly in the case-owned Bruno script, use source-backed exact keys and expectations, load every connection value from the active environment, and clean up setup writes. Do not build a shared adapter for a one-off statement.
+
+Database access is a fallback, not a replacement for an available API. It must not become the business action under test or weaken response assertions the API can support. Database connection, statement, assertion, and cleanup failures fail the case.
+
+Read [references/database-access.md](references/database-access.md) before adding or executing a database step. It defines the manifest shape, Bruno script placement, dependency handling, examples, and safety limits.
 
 ## Execution
 

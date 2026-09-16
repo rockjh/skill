@@ -32,6 +32,7 @@ from manifest_io import first_list, load_data
 from qa_lock import check as check_qa_lock
 from qa_constraints import (
     check_module_lock,
+    database_steps,
     needs_manual_confirmation,
     validate_stage,
     validate_worker_snapshot,
@@ -201,6 +202,10 @@ def scope_cases(contracts_root: Path, module: str | None) -> list[dict[str, Any]
                 case["_endpoint"] = endpoints.get(str(case.get("endpoint_id")), {})
                 cases.append(case)
     return cases
+
+
+def requires_developer_sandbox(cases: list[dict[str, Any]]) -> bool:
+    return any(database_steps(case) for case in cases)
 
 
 def is_remote_url(value: str) -> bool:
@@ -914,6 +919,8 @@ def execute(args: argparse.Namespace, qa_root: Path, execution_log: Path) -> int
             "--reporter-skip-all-headers",
             "-r",
         ])
+        if requires_developer_sandbox(cases):
+            bruno_command.extend(["--sandbox", "developer"])
         try:
             resolved_bruno_command = command_argv(args.bruno_cli, *bruno_command)
         except FileNotFoundError:

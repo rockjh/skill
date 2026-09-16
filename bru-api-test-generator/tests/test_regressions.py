@@ -1183,6 +1183,84 @@ class RegressionTests(unittest.TestCase):
         self.assertIn('bru.setVar("things", res.body.data)', rendered)
         self.assertIn("res.body.data.forEach", rendered)
 
+    def test_database_steps_render_setup_assertion_cleanup_and_enable_developer_sandbox(self):
+        materializer = load_script("materialize_missing_bru")
+        runner = load_script("run_bruno")
+        coverage = load_script("check_api_coverage")
+        case = {
+            "id": "THING_EXECUTE",
+            "title": "执行事物成功",
+            "endpoint_id": "THING_EXECUTE_ENDPOINT",
+            "bru": "01-执行事物成功.bru",
+            "expected": {"http_status": 200, "business_code": 0},
+            "assertions": [{"path": "$.code", "equals": 0}],
+            "database_steps": [
+                {
+                    "phase": "setup",
+                    "reason": "missing_prerequisite_api",
+                    "engine": "mysql",
+                    "evidence": ["ThingRepository.java:42"],
+                    "script": "await connection.execute('INSERT INTO thing(id) VALUES (?)', [thingId]);",
+                    "cleanup": "await connection.execute('DELETE FROM thing WHERE id = ?', [thingId]);",
+                },
+                {
+                    "phase": "assertion",
+                    "reason": "missing_response_state",
+                    "engine": "mongodb",
+                    "evidence": ["ThingDocument.java:18"],
+                    "expected": {"status": "DONE"},
+                    "script": "test('persisted state', () => expect(document.status).to.equal('DONE'));",
+                },
+            ],
+        }
+        endpoint = {"id": "THING_EXECUTE_ENDPOINT", "method": "POST", "path": "/things/execute"}
+        rendered = materializer.render_case(case, endpoint)
+        self.assertIn("database-setup mysql", rendered)
+        self.assertIn("database-assertion mongodb", rendered)
+        self.assertIn("database-cleanup mysql", rendered)
+        self.assertIn("try {", rendered)
+        self.assertIn("} finally {", rendered)
+        self.assertTrue(runner.requires_developer_sandbox([case]))
+        self.assertFalse(runner.requires_developer_sandbox([{"id": "HTTP_ONLY"}]))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / case["bru"]).write_text(rendered, encoding="utf-8")
+            _, _, _, errors = coverage.case_files([case], root, {endpoint["id"]: endpoint})
+            self.assertEqual(errors, [])
+
+    def test_database_steps_are_limited_to_the_two_supported_reasons(self):
+        constraints = load_script("qa_constraints")
+        coverage = load_script("check_api_coverage")
+        valid = {
+            "id": "THING_EXECUTE",
+            "scenario": "success",
+            "expected": {"business_code": 0},
+            "assertions": [{"path": "$.code", "equals": 0}],
+            "database_steps": [{
+                "phase": "assertion",
+                "reason": "missing_response_state",
+                "engine": "elasticsearch",
+                "evidence": "ThingIndexRepository.java:27",
+                "expected": {"status": "DONE"},
+                "script": "test('indexed state', () => expect(hit._source.status).to.equal('DONE'));",
+            }],
+        }
+        self.assertEqual(constraints.database_access_errors(valid), [])
+        self.assertEqual(coverage.case_completion_errors(valid), [])
+        self.assertEqual(coverage.success_assertion_errors(valid), [])
+
+        invalid = dict(valid)
+        invalid["database_steps"] = [{
+            "phase": "setup",
+            "reason": "missing_response_state",
+            "engine": "mysql",
+            "evidence": [],
+            "script": "UPDATE thing SET status = 'READY'",
+        }]
+        errors = constraints.database_access_errors(invalid)
+        self.assertTrue(any("reason must be missing_prerequisite_api" in error for error in errors))
+        self.assertTrue(any("cleanup" in error for error in errors))
+
     def test_coverage_requires_every_declared_assertion_constraint(self):
         coverage = load_script("check_api_coverage")
         with tempfile.TemporaryDirectory() as directory:

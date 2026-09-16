@@ -10,7 +10,7 @@ Do not edit copied project scripts except for an explicitly owned extension.
 | `source_constraints.py` | Extract source/response constraints and reuse local environment templates |
 | `analyze_source_logic.py` | Scan cross-language API logic evidence |
 | `analyze_java_logic.py` | Trace Java/Spring Controller-to-service call chains |
-| `materialize_missing_bru.py` | Generate or verify registered `.bru` requests |
+| `materialize_missing_bru.py` | Generate or verify registered `.bru` requests, including approved case-owned database steps |
 | `qa_constraints.py` | Enforce shared lifecycle rules and Git-backed worker boundaries |
 | `check_api_coverage.py` | Reconcile OpenAPI, cases, requests, assertions, source, and evidence |
 | `run_bruno.py` | Execute all modules or one module and retain result/evidence artifacts |

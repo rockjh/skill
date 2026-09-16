@@ -103,6 +103,8 @@ from qa_lock import check as check_qa_lock
 from materialize_missing_bru import request_url as materialized_request_url
 from qa_constraints import (
     check_module_lock,
+    database_access_errors,
+    database_steps,
     needs_manual_confirmation,
     qa_root_for_contracts,
     review_reason_errors,
@@ -257,6 +259,7 @@ def case_fingerprint(case: dict[str, Any]) -> str:
         "scenario": case.get("scenario", case.get("scenarios")),
         "request": case.get("request"),
         "assertions": case.get("assertions"),
+        "database_steps": case.get("database_steps"),
     }
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
@@ -271,10 +274,16 @@ def case_completion_errors(case: dict[str, Any]) -> list[str]:
         "equals", "eq", "contains", "matches", "type", "length", "minimum",
         "maximum", "nullable", "is_null", "equals_variable", "items", "item_type",
     }
-    if not isinstance(assertions, list) or not any(
+    has_database_assertion = any(
+        step.get("phase") == "assertion"
+        and isinstance(step.get("expected"), dict)
+        and bool(step["expected"])
+        for step in database_steps(case)
+    )
+    if not has_database_assertion and (not isinstance(assertions, list) or not any(
         isinstance(item, dict) and bool(precise_keys & set(item))
         for item in assertions
-    ):
+    )):
         errors.append(f"case {case_id} has no exact assertion eligible for verified completion")
     if isinstance(assertions, list) and any(
         isinstance(item, dict) and item.get("exists") is True and not _assertion_is_exact(item)
@@ -313,7 +322,16 @@ def success_assertion_errors(case: dict[str, Any]) -> list[str]:
     ):
         return [f"success case {case_id} has no exact business-success assertion"]
     business_paths = {str(item.get("path")) for item in business_assertions}
-    if not any(_assertion_is_exact(item) and str(item.get("path")) not in business_paths for item in assertions):
+    has_database_assertion = any(
+        step.get("phase") == "assertion"
+        and isinstance(step.get("expected"), dict)
+        and bool(step["expected"])
+        for step in database_steps(case)
+    )
+    if not has_database_assertion and not any(
+        _assertion_is_exact(item) and str(item.get("path")) not in business_paths
+        for item in assertions
+    ):
         return [f"success case {case_id} has no exact result-field or request/response assertion"]
     return []
 
@@ -1164,7 +1182,14 @@ def case_files(
             errors.append(f"case {case_id} Bruno file has no assert block: {matched}")
         covered.add(case_id)
         assertions = case.get("assertions")
-        if not needs_manual_confirmation(case) and (not isinstance(assertions, list) or not any(
+        case_database_steps = database_steps(case)
+        has_database_assertion = any(
+            step.get("phase") == "assertion"
+            and isinstance(step.get("expected"), dict)
+            and bool(step["expected"])
+            for step in case_database_steps
+        )
+        if not needs_manual_confirmation(case) and not has_database_assertion and (not isinstance(assertions, list) or not any(
             isinstance(item, dict)
             and (
                 any(key in item for key in ("equals", "eq", "contains", "matches", "type", "length", "minimum", "maximum", "nullable", "is_null", "equals_variable"))
@@ -1177,6 +1202,16 @@ def case_files(
             for item in assertions
         )):
             errors.append(f"case {case_id} has no precise response assertion beyond status/code/exists")
+        for step in case_database_steps:
+            phase = str(step.get("phase", ""))
+            engine = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(step.get("engine", "")).strip())
+            marker = f"bru-api-test-generator: database-{phase} {engine}"
+            if marker not in contents[matched]:
+                errors.append(f"case {case_id} database {phase} step is not represented in Bruno")
+            if phase == "setup" and str(step.get("cleanup", "")).strip():
+                cleanup_marker = f"bru-api-test-generator: database-cleanup {engine}"
+                if cleanup_marker not in contents[matched]:
+                    errors.append(f"case {case_id} database setup cleanup is not represented in Bruno")
         for assertion in assertions if isinstance(assertions, list) else []:
             if not isinstance(assertion, dict):
                 continue
@@ -1480,6 +1515,7 @@ def check_module(
         if module_tag and case.get("swagger_tag") and str(case.get("swagger_tag")).strip() != module_tag:
             errors.append(f"case {case.get('id')} Swagger tag does not match module {module_id}")
         errors.extend(review_reason_errors(case))
+        errors.extend(database_access_errors(case))
         if require_scenarios:
             if not needs_manual_confirmation(case):
                 errors.extend(case_completion_errors(case))

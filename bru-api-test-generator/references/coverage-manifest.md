@@ -123,6 +123,8 @@ structural constraints. Use assertion `capture_as` or case-level `captures`
 to publish a response value with `bru.setVar`, then `equals_variable` to compare
 it in a dependent request.
 
+When no API can create required prerequisite data or the response omits a state needed for verification, a case may declare `database_steps`. These are materialized as case-owned Bruno scripts and participate in the case fingerprint. Read [database-access.md](database-access.md) for the exact two reasons, schema, examples, and safety constraints.
+
 ## Module cases.yaml
 
 Cases link back to an endpoint and optionally to source logic. Assertions must include a concrete field or relation beyond status and business code:

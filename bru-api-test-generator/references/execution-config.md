@@ -54,6 +54,8 @@ request:
 
 The runner parses the custom Header block, resolves variables, passes Bruno a temporary native environment, and sends the resolved map to the collection pre-request script. Do not duplicate common Header logic in request files.
 
+Database connection variables also live in this environment. When selected cases contain `database_steps`, the runner enables Bruno's developer sandbox so their pinned Node clients can load. See [database-access.md](database-access.md).
+
 When `sign.provider` is `sha256`, `collection.bru` reads `ACCESS_KEY` and `SECRET_KEY` from the active environment. Version `v1` signs the request path, optional body, normalized query parameters, timestamp, and secret; it writes `sign`, `timestamp`, and `accesskey` Headers. A disabled provider adds no signing Headers.
 
 ## Execution Scope
