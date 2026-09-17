@@ -7,7 +7,7 @@ from copy import deepcopy
 from typing import Any
 
 
-API_TEST_SCHEMA_VERSION = "5.4"
+API_TEST_SCHEMA_VERSION = "5.6"
 E2E_GATE_SCHEMA_VERSION = "4"
 
 E2E_SCENARIO_STATUSES = ("ready", "pending_environment", "contract_blocked")
@@ -110,6 +110,18 @@ COMMAND_SCHEMAS: dict[str, dict[str, Any]] = {
             "--module": "string",
             "--bruno-cli": "path-or-command",
             "--cli-timeout": "number",
+            "--write-mock-data": "boolean",
+            "--clean-mock-data": "boolean",
+        }
+    },
+    "api-test.mock-data-generate": {
+        "options": {
+            "--qa-root": "path", "--module": "string[]", "--run-id": "string", "--allow-write": "boolean",
+        }
+    },
+    "api-test.mock-data-clean": {
+        "options": {
+            "--qa-root": "path", "--module": "string[]", "--run-id": "string", "--allow-cleanup": "boolean",
         }
     },
     "api-test.reconcile": {

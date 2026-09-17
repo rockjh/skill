@@ -93,8 +93,29 @@ DATABASE_STEP_REASONS = {
 }
 DATABASE_STEP_FIELDS = {
     "phase", "reason", "engine", "script", "evidence", "expected",
-    "cleanup", "cleanup_not_required_reason",
+    "cleanup", "cleanup_verification", "id",
+    "data_source", "depends_on", "estimated_records", "idempotent", "ownership",
+    "precheck", "setup_verification", "transport", "dependent_case_ids", "runtime_variables",
 }
+MOCK_DATA_NAMESPACE_ENV = "DEV_AI_DATA_NAMESPACE"
+DANGEROUS_DATABASE_RE = re.compile(
+    r"(?is)\b(?:TRUNCATE|(?:CREATE|DROP)\s+(?:TABLE|DATABASE|SCHEMA)|FLUSHALL|FLUSHDB)\b|"
+    r"\bDELETE\s+FROM\s+[`\"\[]?[A-Za-z0-9_.-]+[`\"\]]?\s*(?:;|$)|"
+    r"\.(?:deleteMany|updateMany|remove)\s*\(\s*\{\s*\}\s*[,)]|"
+    r"\bmatch_all\b"
+)
+ASSERTION_WRITE_RE = re.compile(
+    r"(?is)\b(?:INSERT|UPDATE|DELETE|MERGE)\b|\bREPLACE\s+INTO\b|"
+    r"\.(?:insertOne|insertMany|updateOne|updateMany|replaceOne|deleteOne|deleteMany|remove|"
+    r"set|del|hset|hmset|index|create|delete)\s*\("
+)
+RELATIONAL_ENGINES = {"mysql", "mariadb", "postgresql", "postgres", "oracle", "sqlserver", "mssql"}
+SQL_PARAMETER_RE = re.compile(r"\?|\$\d+|:[A-Za-z0-9_]+|@[A-Za-z_][A-Za-z0-9_]*")
+
+
+def mock_data_ready_env(case_id: str) -> str:
+    suffix = re.sub(r"[^A-Za-z0-9]+", "_", case_id).strip("_").upper()
+    return f"DEV_AI_MOCK_DATA_READY_{suffix or 'CASE'}"
 
 
 def database_steps(case: dict[str, Any]) -> list[dict[str, Any]]:
@@ -121,8 +142,10 @@ def database_access_errors(case: dict[str, Any]) -> list[str]:
         phase = str(step.get("phase", ""))
         if phase not in DATABASE_STEP_REASONS:
             errors.append(f"{label}.phase must be setup or assertion")
-        elif step.get("reason") != DATABASE_STEP_REASONS[phase]:
-            errors.append(f"{label}.reason must be {DATABASE_STEP_REASONS[phase]} for phase {phase}")
+        else:
+            expected_reason = "prerequisite_api" if phase == "setup" and step.get("transport") == "api" else DATABASE_STEP_REASONS[phase]
+            if step.get("reason") != expected_reason:
+                errors.append(f"{label}.reason must be {expected_reason} for phase {phase}")
         if not str(step.get("engine", "")).strip():
             errors.append(f"{label}.engine must name the database technology")
         if not str(step.get("script", "")).strip():
@@ -139,10 +162,77 @@ def database_access_errors(case: dict[str, Any]) -> list[str]:
             errors.append(f"{label}.expected must declare the exact database result")
         if phase == "assertion" and not re.search(r"\btest\s*\(", str(step.get("script", ""))):
             errors.append(f"{label}.script must register a Bruno test(...) observation")
-        if phase == "setup" and not str(step.get("cleanup", "")).strip() and not str(
-            step.get("cleanup_not_required_reason", "")
-        ).strip():
-            errors.append(f"{label} must declare cleanup or cleanup_not_required_reason")
+        if phase == "assertion" and ASSERTION_WRITE_RE.search(str(step.get("script", ""))):
+            errors.append(f"{label}.script must be read-only")
+        if phase == "setup" and not str(step.get("cleanup", "")).strip():
+            errors.append(f"{label} must declare cleanup")
+        if phase == "setup":
+            if step.get("idempotent") is not True:
+                errors.append(f"{label}.idempotent must be true")
+            estimated = step.get("estimated_records")
+            if isinstance(estimated, bool) or not isinstance(estimated, int) or estimated <= 0:
+                errors.append(f"{label}.estimated_records must be a positive integer")
+            ownership = step.get("ownership")
+            if not isinstance(ownership, dict):
+                errors.append(f"{label}.ownership must declare the run-owned resource and selector")
+            else:
+                unknown_ownership = sorted(set(ownership) - {"namespace_env", "resource", "selector"})
+                if unknown_ownership:
+                    errors.append(f"{label}.ownership contains unsupported field(s): {', '.join(unknown_ownership)}")
+                if ownership.get("namespace_env") != MOCK_DATA_NAMESPACE_ENV:
+                    errors.append(f"{label}.ownership.namespace_env must be {MOCK_DATA_NAMESPACE_ENV}")
+                if not str(ownership.get("resource", "")).strip():
+                    errors.append(f"{label}.ownership.resource must name the owned table, collection, index, or keyspace")
+                if not str(ownership.get("selector", "")).strip():
+                    errors.append(f"{label}.ownership.selector must describe the exact namespaced selector")
+            for field in ("precheck", "script", "setup_verification", "cleanup"):
+                content = str(step.get(field, ""))
+                if field in {"precheck", "setup_verification"} and not content.strip():
+                    errors.append(f"{label}.{field} must be an executable read-only ownership check")
+                    continue
+                if content and MOCK_DATA_NAMESPACE_ENV not in content:
+                    errors.append(f"{label}.{field} must use {MOCK_DATA_NAMESPACE_ENV}")
+                if DANGEROUS_DATABASE_RE.search(content):
+                    errors.append(f"{label}.{field} contains an unbounded or destructive database operation")
+                if field in {"precheck", "setup_verification"} and ASSERTION_WRITE_RE.search(content):
+                    errors.append(f"{label}.{field} must be read-only")
+                engine = str(step.get("engine", "")).casefold()
+                if engine in RELATIONAL_ENGINES and re.search(r"(?i)\b(?:INSERT|DELETE|SELECT|UPDATE|MERGE)\b", content):
+                    if not SQL_PARAMETER_RE.search(content):
+                        errors.append(f"{label}.{field} must use parameter binding")
+                    if field == "script" and re.search(r"(?i)\b(?:UPDATE|MERGE)\b", content):
+                        errors.append(f"{label}.script must not modify an existing row")
+                    if field == "script" and re.search(r"(?i)\bINSERT\b", content) and not re.search(
+                        r"(?is)\bINSERT\s+IGNORE\b|\bON\s+CONFLICT\b.*\bDO\s+NOTHING\b|\b(?:IF|WHERE)\s+NOT\s+EXISTS\b",
+                        content,
+                    ):
+                        errors.append(f"{label}.script insert must reuse conflicts without updating existing rows")
+            script = str(step.get("script", ""))
+            engine = str(step.get("engine", "")).casefold()
+            if engine in {"mongodb", "mongo"} and re.search(r"\$set\s*:", script) and "$setOnInsert" not in script:
+                errors.append(f"{label}.script must use $setOnInsert instead of modifying an existing document")
+            if engine in {"elasticsearch", "opensearch"} and re.search(r"\.index\s*\(", script):
+                errors.append(f"{label}.script must use create semantics instead of overwriting an existing document")
+            if engine == "redis" and re.search(r"\.set\s*\(", script) and not re.search(r"\bNX\b|\bnx\s*:\s*true", script):
+                errors.append(f"{label}.script must use Redis NX semantics")
+            verification = str(step.get("cleanup_verification", "")).strip()
+            if not verification:
+                errors.append(f"{label}.cleanup_verification must prove the owned data no longer exists")
+            elif MOCK_DATA_NAMESPACE_ENV not in verification:
+                errors.append(f"{label}.cleanup_verification must use {MOCK_DATA_NAMESPACE_ENV}")
+            elif DANGEROUS_DATABASE_RE.search(verification):
+                errors.append(f"{label}.cleanup_verification contains an unbounded or destructive database operation")
+            elif ASSERTION_WRITE_RE.search(verification):
+                errors.append(f"{label}.cleanup_verification must be read-only")
+            elif (
+                str(step.get("engine", "")).casefold() in RELATIONAL_ENGINES
+                and re.search(r"(?i)\bSELECT\b", verification)
+                and not SQL_PARAMETER_RE.search(verification)
+            ):
+                errors.append(f"{label}.cleanup_verification must use parameter binding")
+            dependencies = step.get("depends_on", [])
+            if not isinstance(dependencies, list) or any(not str(value).strip() for value in dependencies):
+                errors.append(f"{label}.depends_on must be a list of setup step ids")
     return errors
 
 

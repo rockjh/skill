@@ -63,3 +63,9 @@ and writes merged global evidence plus a result-first global report. A failed
 module remains visible without hiding successful modules.
 
 Before retaining any evidence or report, the shared post-execution constraints scan contracts, Bruno requests, evidence, and results for credentials.
+
+## Mock-data Ledger
+
+Each preparation attempt writes a redacted ledger below `qa/results/mock-data/`, including the environment, run namespace, selected modules, target data sources, estimate, one write-authorization decision, reused ranges, possible or verified creations, failures, cleanup authorization, cleanup results, and absence-verification results. Before every write, the ledger freezes that step's exact cleanup and verification scripts plus its non-secret runtime identifiers. Later cleanup uses only this frozen run-owned contract, so it remains available after source or case files change; it still refuses a changed environment or connection target.
+
+If preparation is denied or fails, cases with setup steps are reported as `not_executed` with an insufficient-data reason; unrelated cases remain runnable. A retained or interrupted run can be cleaned later by its run ID.

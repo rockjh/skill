@@ -104,6 +104,34 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 exec dev-ai api-test run --qa-root "$SCRIPT_DIR/.." "$@"
 """
 
+MOCK_DATA_GENERATE_BAT_TEMPLATE = r"""@echo off
+setlocal
+rem Usage: generate-mock-data.bat handles all modules; repeat --module to select modules.
+dev-ai api-test mock-data-generate --qa-root "%~dp0.." %*
+exit /b %errorlevel%
+"""
+
+MOCK_DATA_GENERATE_SH_TEMPLATE = """#!/usr/bin/env sh
+set -eu
+# Usage: ./generate-mock-data.sh handles all modules; repeat --module to select modules.
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec dev-ai api-test mock-data-generate --qa-root "$SCRIPT_DIR/.." "$@"
+"""
+
+MOCK_DATA_CLEAN_BAT_TEMPLATE = r"""@echo off
+setlocal
+rem Usage: clean-mock-data.bat cleans the latest run; use --run-id or repeat --module as needed.
+dev-ai api-test mock-data-clean --qa-root "%~dp0.." %*
+exit /b %errorlevel%
+"""
+
+MOCK_DATA_CLEAN_SH_TEMPLATE = """#!/usr/bin/env sh
+set -eu
+# Usage: ./clean-mock-data.sh cleans the latest run; use --run-id or repeat --module as needed.
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec dev-ai api-test mock-data-clean --qa-root "$SCRIPT_DIR/.." "$@"
+"""
+
 LEGACY_RUN_BAT_TEMPLATE = r"""@echo off
 setlocal
 rem Usage: run.bat runs all modules; run.bat --module "users" runs one module.
@@ -148,6 +176,11 @@ qa\\execution\\run.bat --cli-timeout 90
 
 `config.yaml` uses `cli_timeout: 60` by default; `--cli-timeout` overrides one run.
 Set `BRUNO_NODE_HOME` and/or `BRUNO_NPM_BIN` before launching only when PATH guidance is needed.
+
+Mock data uses one run-level write decision and one cleanup decision. Use
+`generate-mock-data.bat` / `generate-mock-data.sh` for standalone preparation and
+`clean-mock-data.bat` / `clean-mock-data.sh` for run-ledger cleanup. All modules are
+selected by default; repeat `--module` to select one or more modules.
 
 运行器会打印阶段进度、每个用例的状态及最终汇总。每次运行都会在 `qa/results/logs/` 新建按时间和
 执行范围命名的日志。版本不一致只会以红色告警显示，不会阻塞用例执行。
@@ -564,6 +597,10 @@ def initialize_execution_layout(qa_root: Path, local_scripts: bool | None = None
         (new_environments / "local.bru", DEFAULT_ENVIRONMENT_TEMPLATE, "\n"),
         (execution_root / "run.bat", run_bat_template, "\r\n"),
         (execution_root / "run.sh", run_sh_template, "\n"),
+        (execution_root / "generate-mock-data.bat", MOCK_DATA_GENERATE_BAT_TEMPLATE, "\r\n"),
+        (execution_root / "generate-mock-data.sh", MOCK_DATA_GENERATE_SH_TEMPLATE, "\n"),
+        (execution_root / "clean-mock-data.bat", MOCK_DATA_CLEAN_BAT_TEMPLATE, "\r\n"),
+        (execution_root / "clean-mock-data.sh", MOCK_DATA_CLEAN_SH_TEMPLATE, "\n"),
         (execution_root / "README.md", EXECUTION_README_TEMPLATE, "\n"),
         (bruno_root / "collection.bru", COLLECTION_TEMPLATE, "\n"),
         (bruno_root / "bruno.json", json.dumps(BRUNO_JSON_TEMPLATE, ensure_ascii=False, indent=2) + "\n", "\n"),
@@ -619,8 +656,12 @@ def initialize_execution_layout(qa_root: Path, local_scripts: bool | None = None
         if COLLECTION_MARKER in current_collection and current_collection != COLLECTION_TEMPLATE:
             collection_path.write_text(COLLECTION_TEMPLATE, encoding="utf-8")
             changed.append(collection_path)
-    run_sh = execution_root / "run.sh"
-    run_sh.chmod(run_sh.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    for run_sh in (
+        execution_root / "run.sh",
+        execution_root / "generate-mock-data.sh",
+        execution_root / "clean-mock-data.sh",
+    ):
+        run_sh.chmod(run_sh.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     config = load_execution_config(config_path)
     load_bruno_environment_document(environment_file(config_path, config))
 

@@ -1205,13 +1205,11 @@ def case_files(
         for step in case_database_steps:
             phase = str(step.get("phase", ""))
             engine = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(step.get("engine", "")).strip())
-            marker = f"dev-ai: database-{phase} {engine}"
+            marker = "dev-ai: mock-data-prerequisite" if phase == "setup" else f"dev-ai: database-{phase} {engine}"
             if marker not in contents[matched]:
                 errors.append(f"case {case_id} database {phase} step is not represented in Bruno")
-            if phase == "setup" and str(step.get("cleanup", "")).strip():
-                cleanup_marker = f"dev-ai: database-cleanup {engine}"
-                if cleanup_marker not in contents[matched]:
-                    errors.append(f"case {case_id} database setup cleanup is not represented in Bruno")
+        if case.get("mock_data_required") is True and "dev-ai: mock-data-prerequisite" not in contents[matched]:
+            errors.append(f"case {case_id} source-derived mock-data prerequisite is not represented in Bruno")
         for assertion in assertions if isinstance(assertions, list) else []:
             if not isinstance(assertion, dict):
                 continue

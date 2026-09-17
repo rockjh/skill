@@ -34,6 +34,7 @@ from .parse_openapi import display_directory, render_manifest, update_module_doc
 from .constraints import (
     database_access_errors,
     database_steps,
+    mock_data_ready_env,
     qa_root_for_contracts,
     validate_stage,
     write_module_lock,
@@ -365,16 +366,6 @@ def post_response_script(case: dict[str, Any], assertions: list[dict[str, Any]])
         engine = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(step["engine"]).strip())
         lines.append(f"  // dev-ai: database-assertion {engine}")
         lines.extend(textwrap.indent(str(step["script"]).strip(), "  ").splitlines())
-    cleanup_lines: list[str] = []
-    for step in database_steps(case):
-        cleanup = str(step.get("cleanup", "")).strip()
-        if step.get("phase") != "setup" or not cleanup:
-            continue
-        engine = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(step["engine"]).strip())
-        cleanup_lines.append(f"    // dev-ai: database-cleanup {engine}")
-        cleanup_lines.extend(textwrap.indent(cleanup, "    ").splitlines())
-    if cleanup_lines:
-        lines = ["  try {", *[f"  {line}" for line in lines], "  } finally {", *cleanup_lines, "  }"]
     return "\n".join(["script:post-response {", *lines, "}"]) if lines else ""
 
 
@@ -388,10 +379,14 @@ def pre_request_script(case: dict[str, Any]) -> str:
             f"  // {OMIT_END_MARKER}",
         ])
     setup_steps = [step for step in database_steps(case) if step.get("phase") == "setup"]
-    for step in setup_steps:
-        engine = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(step["engine"]).strip())
-        lines.append(f"  // dev-ai: database-setup {engine}")
-        lines.extend(textwrap.indent(str(step["script"]).strip(), "  ").splitlines())
+    if setup_steps or case.get("mock_data_required") is True:
+        ready_env = mock_data_ready_env(str(case.get("id", "")))
+        lines.extend([
+            "  // dev-ai: mock-data-prerequisite",
+            f'  if (!bru.getEnvVar("{ready_env}")) {{',
+            '    throw new Error("mock data prerequisite was not authorized or could not be prepared");',
+            "  }",
+        ])
     return "\n".join(["script:pre-request {", *lines, "}"]) if lines else ""
 
 

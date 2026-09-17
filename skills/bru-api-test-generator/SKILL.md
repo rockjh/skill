@@ -11,12 +11,12 @@ Use the installed `dev-ai api-test` commands for every operation. `dev_ai.domain
 
 1. Inspect current workspace instructions, build files, source, configuration, migrations, tests, and QA assets.
 2. Use a local OpenAPI file or checked-in contract. Fetch only from an already-running loopback service when no local contract exists.
-3. Run `dev-ai api-test init --qa-root qa`, then generate with the relevant source roots and reviewed module ownership.
-4. Resolve gate failures in source evidence, contracts, cases, fixtures, variables, or assertions. Do not delete mandatory rules.
-5. Materialize, check, preflight, and execute only through `dev-ai api-test`.
-6. Treat `qa/results/` reports as authoritative; console output is a redacted summary and pointer.
+3. Run `dev-ai api-test init --qa-root qa`, then generate with the relevant source roots and reviewed module ownership. Generation records detected data sources, DDL/entities, explicit relationships, required fields, and safe environment references without persisting credentials.
+4. Resolve gate failures in source evidence, contracts, cases, fixtures, variables, assertions, or mock-data ownership. Do not invent relationships or delete mandatory rules.
+5. Materialize, check, preflight, and execute only through `dev-ai api-test`. A run analyzes all selected mock-data steps, asks once before the first write, prepares them in dependency order, then runs independent and data-dependent cases as authorized.
+6. After a run creates data, answer the single cleanup decision or retain the run ledger for `dev-ai api-test mock-data-clean`. Treat `qa/results/` reports and mock-data ledgers as authoritative; console output is a redacted summary and pointer.
 
-Database preparation or verification is allowed only when a public API cannot establish or observe the required state. It must be narrowly scoped to owned test data, parameterized, reversible, blocked in production or protected environments, and covered by cleanup and recovery verification.
+Database preparation or verification is allowed only when a public API cannot establish or observe the required state. It must use the current run namespace, narrowly scoped owned data, parameterized and idempotent operations, reverse-order cleanup, and absence verification. Production and protected environments are hard-blocked; flags cannot override them. Non-interactive writes and cleanup require their explicit command flags.
 
 For parallel module work, run `worker-start` before delegation. Each worker owns exactly one module contract, Bruno directory, and module result area; it must not edit shared configuration or another module. The main agent owns shared assets, aggregation, and final reconciliation.
 

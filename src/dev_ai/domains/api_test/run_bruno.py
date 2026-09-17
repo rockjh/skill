@@ -52,6 +52,12 @@ from .constraints import (
 )
 from .command_execution import command_argv
 from .materialize_missing_bru import request_url
+from .mock_data import (
+    MockDataError,
+    apply_runtime_variables as apply_mock_data_runtime_variables,
+    cleanup as cleanup_mock_data,
+    prepare as prepare_mock_data,
+)
 
 
 ANSI_RED = "\033[31m"
@@ -221,6 +227,39 @@ def requires_developer_sandbox(cases: list[dict[str, Any]]) -> bool:
     return any(database_steps(case) for case in cases)
 
 
+def finish_mock_data_run(
+    args: argparse.Namespace,
+    qa_root: Path,
+    run_id: str,
+) -> int:
+    """Offer bounded cleanup after any execution outcome when this run created data."""
+
+    ledger_path = qa_root / "results" / "mock-data" / f"{run_id}.json"
+    if not ledger_path.is_file():
+        return 0
+    try:
+        ledger = load_data(ledger_path)
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"ERROR: cannot read mock-data ledger for cleanup: {exc}", file=sys.stderr)
+        return 10
+    if not isinstance(ledger, dict) or not ledger.get("created") or ledger.get("status") == "cleaned":
+        return 0
+    try:
+        result = cleanup_mock_data(
+            qa_root,
+            modules=[args.module] if args.module else None,
+            run_id=run_id,
+            allow_cleanup=args.clean_mock_data,
+        )
+    except (MockDataError, OSError, TypeError, ValueError) as exc:
+        print(f"ERROR: mock-data cleanup failed: {exc}", file=sys.stderr)
+        print(f"Retry: dev-ai api-test mock-data-clean --qa-root {qa_root} --run-id {run_id}", file=sys.stderr)
+        return 10
+    if result.get("status") == "retained":
+        print(f"Mock data retained. Cleanup: dev-ai api-test mock-data-clean --qa-root {qa_root} --run-id {run_id}")
+    return 0
+
+
 def is_remote_url(value: str) -> bool:
     hostname = (urllib.parse.urlsplit(value).hostname or "").casefold()
     return hostname not in {"localhost", "127.0.0.1", "::1"}
@@ -354,6 +393,11 @@ def result_report(
     executed = set(evidence.get("executed", [])) if evidence else set()
     passed = set(evidence.get("passed", [])) if evidence else set()
     observations = evidence.get("cases", {}) if evidence and isinstance(evidence.get("cases"), dict) else {}
+    unavailable_reasons = (
+        evidence.get("not_executed_reasons", {})
+        if evidence and isinstance(evidence.get("not_executed_reasons"), dict)
+        else {}
+    )
     rows: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     not_executed: list[dict[str, Any]] = []
@@ -368,14 +412,15 @@ def result_report(
         elif case_id not in executed:
             status = "not_executed"
             reason = (
-                str(case.get("review_reason") or "; ".join(str(value) for value in case.get("review_reasons", {}).values()))
-                if confirmation
-                else default_reason
+                str(unavailable_reasons.get(case_id))
+                if unavailable_reasons.get(case_id)
+                else str(case.get("review_reason") or "; ".join(str(value) for value in case.get("review_reasons", {}).values()))
+                if confirmation else default_reason
             )
             category = (
                 "insufficient_source_evidence"
                 if confirmation and ("源码" in reason or "source" in reason.lower())
-                else "insufficient_data" if confirmation else default_category
+                else "insufficient_data" if confirmation or unavailable_reasons.get(case_id) else default_category
             )
         else:
             status = "failed"
@@ -990,6 +1035,34 @@ def execute(args: argparse.Namespace, qa_root: Path, execution_log: Path) -> int
             print(f"  result_report={report_path}")
             return preflight_result.returncode
 
+        mock_run_id = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        mock_ready = False
+        mock_result: dict[str, Any] = {}
+        mock_blocked_case_ids: set[str] = set()
+        try:
+            mock_result = prepare_mock_data(
+                qa_root,
+                modules=[args.module] if args.module else None,
+                allow_write=args.write_mock_data,
+                run_id=mock_run_id,
+            )
+            dependent = {str(value) for value in mock_result.get("dependent_case_ids", [])}
+            ready = {str(value) for value in mock_result.get("ready_case_ids", [])}
+            mock_blocked_case_ids = dependent - ready
+            mock_ready = bool(mock_result.get("authorized")) and not mock_blocked_case_ids
+        except (MockDataError, OSError, TypeError, ValueError) as exc:
+            print(f"ERROR: mock-data preparation failed: {exc}", file=sys.stderr)
+            print("Cases that require mock data will not send their requests; independent cases will continue.", file=sys.stderr)
+            ledger_path = qa_root / "results" / "mock-data" / f"{mock_run_id}.json"
+            if ledger_path.is_file():
+                value = load_data(ledger_path)
+                if isinstance(value, dict):
+                    mock_result = value
+                    mock_blocked_case_ids = {str(item) for item in value.get("dependent_case_ids", [])}
+        runtime_variables = mock_result.get("runtime_variables", {})
+        if isinstance(runtime_variables, dict) and runtime_variables:
+            environment = apply_mock_data_runtime_variables(qa_root, environment, runtime_variables)
+
         runtime_env_path = temporary / "runtime-environment.bru"
         runtime_env_path.write_text(render_runtime_environment(environment), encoding="utf-8")
         bruno_command = ["run", selected_directory or "."]
@@ -1007,10 +1080,11 @@ def execute(args: argparse.Namespace, qa_root: Path, execution_log: Path) -> int
         except FileNotFoundError:
             reason = f"Bruno CLI executable was not found: {args.bruno_cli}"
             print(f"ERROR: {reason}", file=sys.stderr)
-            return finish_failed_attempt(
+            result_code = finish_failed_attempt(
                 qa_root, cases, args.module, "environment_unavailable", reason,
                 version_warnings, execution_log, 2,
             )
+            return finish_mock_data_run(args, qa_root, mock_run_id) or result_code
         print(f"[5/6] Running {len(cases)} Bruno case(s)")
         bruno_result = subprocess.run(
             resolved_bruno_command, cwd=bruno_root, check=False, capture_output=True,
@@ -1033,7 +1107,7 @@ def execute(args: argparse.Namespace, qa_root: Path, execution_log: Path) -> int
                 version_warnings, execution_log,
             )
             print(f"  result_report={report_path}")
-            return bruno_result.returncode or 1
+            return finish_mock_data_run(args, qa_root, mock_run_id) or bruno_result.returncode or 1
 
         normalize_result = subprocess.run(
             [
@@ -1061,9 +1135,22 @@ def execute(args: argparse.Namespace, qa_root: Path, execution_log: Path) -> int
                 version_warnings, execution_log,
             )
             print(f"  result_report={report_path}")
-            return normalize_result.returncode
+            return finish_mock_data_run(args, qa_root, mock_run_id) or normalize_result.returncode
 
         evidence = load_data(evidence_path)
+        if mock_blocked_case_ids:
+            evidence["executed"] = [value for value in evidence.get("executed", []) if value not in mock_blocked_case_ids]
+            evidence["passed"] = [value for value in evidence.get("passed", []) if value not in mock_blocked_case_ids]
+            evidence["not_executed_reasons"] = {
+                case_id: str(mock_result.get("blocked_case_ids", {}).get(case_id))
+                if isinstance(mock_result.get("blocked_case_ids"), dict) and mock_result["blocked_case_ids"].get(case_id)
+                else "mock data was not authorized or preparation failed"
+                for case_id in sorted(mock_blocked_case_ids)
+            }
+            for case_id in mock_blocked_case_ids:
+                if isinstance(evidence.get("cases"), dict):
+                    evidence["cases"].pop(case_id, None)
+            evidence_path.write_text(json.dumps(evidence, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
         print("Case results:")
         total_cases, executed_cases, passed_cases, failed_cases, not_executed = render_case_summary(cases, evidence)
 
@@ -1131,6 +1218,15 @@ def execute(args: argparse.Namespace, qa_root: Path, execution_log: Path) -> int
         report_path, evidence_output, report = persist_execution_artifacts(
             qa_root, cases, evidence, args.module,
         )
+        report["mock_data"] = {
+            "run_id": mock_run_id,
+            "ready": mock_ready,
+            "status": mock_result.get("status", "failed"),
+            "ready_case_ids": mock_result.get("ready_case_ids", []),
+            "blocked_case_ids": sorted(mock_blocked_case_ids),
+            "ledger": (Path("results") / "mock-data" / f"{mock_run_id}.json").as_posix(),
+        }
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         constraint_errors = validate_stage(
             qa_root,
             "post-execution",
@@ -1153,7 +1249,8 @@ def execute(args: argparse.Namespace, qa_root: Path, execution_log: Path) -> int
         print(f"  result_report={report_path}")
         if evidence_output:
             print(f"  execution_evidence={evidence_output}")
-    return result_code
+        cleanup_code = finish_mock_data_run(args, qa_root, mock_run_id)
+    return cleanup_code or result_code
 
 
 def positive_cli_timeout(value: str) -> float:
@@ -1176,6 +1273,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--cli-timeout", type=positive_cli_timeout,
         help="seconds allowed for the Bruno CLI version probe (overrides execution config; default: 60)",
+    )
+    parser.add_argument(
+        "--write-mock-data", action="store_true",
+        help="explicitly allow this non-interactive run to create source-backed mock data",
+    )
+    parser.add_argument(
+        "--clean-mock-data", action="store_true",
+        help="explicitly allow this non-interactive run to clean data created by this run",
     )
     args = parser.parse_args(argv)
     scripts_root = Path(__file__).resolve().parent

@@ -95,7 +95,635 @@ def execution_fixture(
     return config, env_file
 
 
+def mock_data_fixture(root: Path, modules: tuple[str, ...] = ("orders", "users")) -> Path:
+    qa_root = root / "qa"
+    load_script("execution_config").initialize_execution_layout(qa_root)
+    module_documents = []
+    for module in modules:
+        module_root = qa_root / "contracts" / "modules" / module
+        module_root.mkdir(parents=True, exist_ok=True)
+        (module_root / "endpoints.yaml").write_text(yaml.safe_dump({
+            "module": module,
+            "name": module.title(),
+            "swagger_tag": f"{module}-tag",
+            "endpoints": [],
+        }), encoding="utf-8")
+        step_id = f"{module}-fixture"
+        step = {
+            "id": step_id,
+            "phase": "setup",
+            "reason": "missing_prerequisite_api",
+            "engine": "mysql",
+            "data_source": "primary",
+            "evidence": [f"db/migration/{module}.sql:1"],
+            "estimated_records": 1,
+            "idempotent": True,
+            "depends_on": [],
+            "ownership": {
+                "namespace_env": "DEV_AI_DATA_NAMESPACE",
+                "resource": module,
+                "selector": "test_namespace = DEV_AI_DATA_NAMESPACE",
+            },
+            "precheck": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); bru.setVar('DEV_AI_STEP_EXISTS', await exists(ns) ? 'true' : 'false');",
+            "script": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); await create(ns);",
+            "setup_verification": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); if (!await exists(ns)) throw new Error('missing');",
+            "cleanup": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); await remove(ns);",
+            "cleanup_verification": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); if (await exists(ns)) throw new Error('still exists');",
+        }
+        (module_root / "cases.yaml").write_text(yaml.safe_dump({
+            "module": module,
+            "cases": [{"id": f"{module.upper()}_CASE", "database_steps": [step]}],
+        }), encoding="utf-8")
+        module_documents.append({
+            "id": module, "name": module.title(), "directory": module,
+            "swagger_tag": f"{module}-tag",
+        })
+    (qa_root / "contracts" / "index.yaml").write_text(
+        yaml.safe_dump({"modules": module_documents}), encoding="utf-8",
+    )
+    (qa_root / "contracts" / "module-map.yaml").write_text(yaml.safe_dump({
+        "modules": [
+            {"id": item["id"], "name": item["name"], "swagger_tags": [item["swagger_tag"]]}
+            for item in module_documents
+        ],
+    }), encoding="utf-8")
+    inventory = qa_root / "constraints" / "mock-data.yaml"
+    inventory.parent.mkdir(parents=True, exist_ok=True)
+    inventory.write_text(yaml.safe_dump({
+        "version": 1,
+        "data_sources": [{
+            "id": "primary",
+            "engine": "mysql",
+            "environment": {
+                "host": {"env": "PRIMARY_MYSQL_HOST", "default": "127.0.0.1"},
+                "port": {"env": "PRIMARY_MYSQL_PORT", "default": 3306},
+                "database": {"env": "PRIMARY_MYSQL_DATABASE", "default": "qa"},
+                "password": {"env": "PRIMARY_MYSQL_PASSWORD"},
+            },
+            "evidence": [{"file": "application.yaml", "line": 1}],
+        }],
+        "entities": [],
+        "creation_order": [],
+    }), encoding="utf-8")
+    return qa_root
+
+
+def successful_mock_script(_root, _script, _variables, label):
+    return {"DEV_AI_STEP_EXISTS": "false"} if "precheck" in label else {}
+
+
 class RegressionTests(unittest.TestCase):
+    def test_mock_data_discovery_redacts_credentials_and_extracts_ddl(self):
+        mock_data = load_script("mock_data")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            (source / "application.yaml").write_text(
+                "spring:\n"
+                "  datasource:\n"
+                "    primary:\n"
+                "      url: jdbc:mysql://127.0.0.1:3307/orders?ssl=true\n"
+                "      username: app_user\n"
+                "      password: super-secret\n"
+                "  data:\n"
+                "    mongodb:\n"
+                "      uri: mongodb://mongo.local:27018/audit\n",
+                encoding="utf-8",
+            )
+            (source / "V1__orders.sql").write_text(
+                "CREATE TABLE account (id BIGINT PRIMARY KEY);\n"
+                "CREATE TABLE orders (\n"
+                "  id BIGINT PRIMARY KEY,\n"
+                "  account_id BIGINT NOT NULL REFERENCES account(id),\n"
+                "  external_id VARCHAR(64) UNIQUE,\n"
+                "  deleted_at TIMESTAMP NULL\n"
+                ");\n",
+                encoding="utf-8",
+            )
+            qa_root = root / "qa"
+            load_script("execution_config").initialize_execution_layout(qa_root)
+            path = mock_data.write_discovery(qa_root, [source])
+            rendered = path.read_text(encoding="utf-8")
+            inventory = yaml.safe_load(rendered)
+            self.assertNotIn("super-secret", rendered)
+            self.assertEqual({item["engine"] for item in inventory["data_sources"]}, {"mysql", "mongodb"})
+            mysql = next(item for item in inventory["data_sources"] if item["engine"] == "mysql")
+            self.assertEqual(mysql["environment"]["host"]["default"], "127.0.0.1")
+            self.assertEqual(mysql["environment"]["port"]["default"], 3307)
+            self.assertNotIn("default", mysql["environment"]["password"])
+            orders = next(item for item in inventory["entities"] if item["name"] == "orders")
+            self.assertEqual(orders["references"][0]["entity"], "account")
+            self.assertEqual(orders["logical_delete_field"], "deleted_at")
+            self.assertLess(inventory["creation_order"].index("account"), inventory["creation_order"].index("orders"))
+
+    def test_mock_data_write_confirmation_is_once_and_covers_all_modules(self):
+        mock_data = load_script("mock_data")
+
+        class TtyInput(io.StringIO):
+            def isatty(self):
+                return True
+
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = mock_data_fixture(Path(directory))
+            user_input = TtyInput("y\nno-unused-answer\n")
+            calls: list[str] = []
+            with mock.patch.object(
+                mock_data, "_execute_script",
+                side_effect=lambda root, script, variables, label: (
+                    calls.append(label), successful_mock_script(root, script, variables, label)
+                )[1],
+            ):
+                result = mock_data.prepare(
+                    qa_root, input_stream=user_input, output=io.StringIO(), run_id="run-all",
+                )
+            self.assertEqual(result["status"], "created")
+            self.assertEqual([item["module"] for item in result["created"]], ["orders", "users"])
+            self.assertEqual(len(calls), 6)
+            self.assertEqual(user_input.readline().strip(), "no-unused-answer")
+            authorizations = [event for event in result["events"] if event["action"] == "write_authorization"]
+            self.assertEqual(len(authorizations), 1)
+
+    def test_mock_data_denial_writes_nothing_and_production_cannot_be_overridden(self):
+        mock_data = load_script("mock_data")
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = mock_data_fixture(Path(directory), ("orders",))
+            with mock.patch.object(mock_data, "_execute_script") as execute:
+                denied = mock_data.prepare(
+                    qa_root, input_stream=io.StringIO("yes\n"), output=io.StringIO(), run_id="denied",
+                )
+            self.assertEqual(denied["status"], "write_denied")
+            execute.assert_not_called()
+
+            config = qa_root / "execution" / "config.yaml"
+            config.write_text(config.read_text(encoding="utf-8").replace("active_environment: local", "active_environment: production"), encoding="utf-8")
+            with mock.patch.object(mock_data, "_execute_script") as execute:
+                with self.assertRaisesRegex(mock_data.MockDataError, "forbidden"):
+                    mock_data.prepare(
+                        qa_root, allow_write=True, output=io.StringIO(), run_id="production",
+                    )
+            execute.assert_not_called()
+
+    def test_mock_data_cleanup_is_reverse_order_verified_and_module_scoped(self):
+        mock_data = load_script("mock_data")
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = mock_data_fixture(Path(directory))
+            with mock.patch.object(mock_data, "_execute_script", side_effect=successful_mock_script):
+                mock_data.prepare(qa_root, allow_write=True, output=io.StringIO(), run_id="cleanup-run")
+            calls: list[str] = []
+            with mock.patch.object(
+                mock_data, "_execute_script",
+                side_effect=lambda _root, _script, _variables, label: calls.append(label),
+            ):
+                result = mock_data.cleanup(
+                    qa_root, allow_cleanup=True, output=io.StringIO(), run_id="cleanup-run",
+                )
+            self.assertEqual(result["status"], "cleaned")
+            self.assertEqual(calls, [
+                "mock-data cleanup users-fixture",
+                "mock-data cleanup verification users-fixture",
+                "mock-data cleanup orders-fixture",
+                "mock-data cleanup verification orders-fixture",
+            ])
+
+    def test_mock_data_module_cleanup_keeps_the_run_recoverable(self):
+        mock_data = load_script("mock_data")
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = mock_data_fixture(Path(directory))
+            with mock.patch.object(mock_data, "_execute_script", side_effect=successful_mock_script):
+                mock_data.prepare(qa_root, allow_write=True, output=io.StringIO(), run_id="partial-cleanup")
+                partial = mock_data.cleanup(
+                    qa_root, modules=["Orders"], allow_cleanup=True,
+                    output=io.StringIO(), run_id="partial-cleanup",
+                )
+                completed = mock_data.cleanup(
+                    qa_root, allow_cleanup=True, output=io.StringIO(), run_id="partial-cleanup",
+                )
+            self.assertEqual(partial["status"], "partially_cleaned")
+            self.assertEqual(partial["cleaned_step_ids"], ["orders-fixture"])
+            self.assertEqual(completed["status"], "cleaned")
+            self.assertEqual(completed["cleaned_step_ids"], ["orders-fixture", "users-fixture"])
+
+    def test_mock_data_cleanup_rejects_environment_target_drift(self):
+        mock_data = load_script("mock_data")
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = mock_data_fixture(Path(directory), ("orders",))
+            with mock.patch.object(mock_data, "_execute_script", side_effect=successful_mock_script):
+                mock_data.prepare(qa_root, allow_write=True, output=io.StringIO(), run_id="target-drift")
+            inventory_path = qa_root / "constraints" / "mock-data.yaml"
+            inventory = yaml.safe_load(inventory_path.read_text(encoding="utf-8"))
+            inventory["data_sources"][0]["environment"]["host"]["default"] = "127.0.0.2"
+            inventory_path.write_text(yaml.safe_dump(inventory), encoding="utf-8")
+            with mock.patch.object(mock_data, "_execute_script") as execute:
+                with self.assertRaisesRegex(mock_data.MockDataError, "target configuration changed"):
+                    mock_data.cleanup(
+                        qa_root, allow_cleanup=True, output=io.StringIO(), run_id="target-drift",
+                    )
+            execute.assert_not_called()
+            ledger = json.loads(
+                (qa_root / "results" / "mock-data" / "target-drift.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(ledger["status"], "cleanup_blocked")
+
+    def test_mock_data_cleanup_retains_parents_when_a_dependent_cleanup_fails(self):
+        mock_data = load_script("mock_data")
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = mock_data_fixture(Path(directory))
+            users_path = qa_root / "contracts" / "modules" / "users" / "cases.yaml"
+            users = yaml.safe_load(users_path.read_text(encoding="utf-8"))
+            users["cases"][0]["database_steps"][0]["depends_on"] = ["orders-fixture"]
+            users_path.write_text(yaml.safe_dump(users), encoding="utf-8")
+            with mock.patch.object(mock_data, "_execute_script", side_effect=successful_mock_script):
+                mock_data.prepare(qa_root, allow_write=True, output=io.StringIO(), run_id="cleanup-dependency")
+            calls: list[str] = []
+
+            def fail_child(_root, _script, _variables, label):
+                calls.append(label)
+                if label == "mock-data cleanup users-fixture":
+                    raise mock_data.MockDataError("child delete failed")
+                return {}
+
+            with mock.patch.object(mock_data, "_execute_script", side_effect=fail_child):
+                with self.assertRaisesRegex(mock_data.MockDataError, "child delete failed"):
+                    mock_data.cleanup(
+                        qa_root, allow_cleanup=True, output=io.StringIO(), run_id="cleanup-dependency",
+                    )
+            self.assertEqual(calls, ["mock-data cleanup users-fixture"])
+            ledger = json.loads(
+                (qa_root / "results" / "mock-data" / "cleanup-dependency.json").read_text(encoding="utf-8")
+            )
+            blocked = next(event for event in ledger["events"] if event.get("status") == "blocked")
+            self.assertEqual(blocked["step_id"], "orders-fixture")
+            self.assertEqual(ledger["status"], "cleanup_failed")
+
+    def test_mock_data_unknown_environment_is_not_implicitly_safe(self):
+        mock_data = load_script("mock_data")
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = mock_data_fixture(Path(directory), ("orders",))
+            config = qa_root / "execution" / "config.yaml"
+            config.write_text(
+                config.read_text(encoding="utf-8").replace("active_environment: local", "active_environment: customer-a"),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(mock_data.MockDataError, "unapproved environment"):
+                mock_data.prepare(qa_root, allow_write=True, output=io.StringIO(), run_id="unknown-environment")
+
+    def test_mock_data_protected_target_cannot_hide_behind_a_safe_environment_name(self):
+        mock_data = load_script("mock_data")
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = mock_data_fixture(Path(directory), ("orders",))
+            inventory_path = qa_root / "constraints" / "mock-data.yaml"
+            inventory = yaml.safe_load(inventory_path.read_text(encoding="utf-8"))
+            inventory["data_sources"][0]["environment"]["host"]["default"] = "orders-prod.internal"
+            inventory_path.write_text(yaml.safe_dump(inventory), encoding="utf-8")
+            with mock.patch.object(mock_data, "_execute_script") as execute:
+                with self.assertRaisesRegex(mock_data.MockDataError, "protected environment"):
+                    mock_data.prepare(
+                        qa_root, allow_write=True, output=io.StringIO(), run_id="protected-target",
+                    )
+            execute.assert_not_called()
+
+    def test_mock_data_run_id_cannot_escape_the_result_directory(self):
+        mock_data = load_script("mock_data")
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = mock_data_fixture(Path(directory), ("orders",))
+            with self.assertRaisesRegex(mock_data.MockDataError, "safe file name"):
+                mock_data.prepare(qa_root, allow_write=True, output=io.StringIO(), run_id="../../outside")
+            self.assertFalse((Path(directory) / "outside.json").exists())
+
+    def test_mock_data_discovery_resolves_placeholder_url_and_table_foreign_key(self):
+        mock_data = load_script("mock_data")
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source"
+            source.mkdir()
+            (source / "pom.xml").write_text(
+                "<dependency><groupId>com.mysql</groupId><artifactId>mysql-connector-j</artifactId></dependency>",
+                encoding="utf-8",
+            )
+            (source / "application.yaml").write_text(
+                "spring:\n  datasource:\n    url: ${DB_URL}\n    username: ${DB_USER}\n    password: ${DB_PASSWORD}\n",
+                encoding="utf-8",
+            )
+            (source / "V1__schema.sql").write_text(
+                "CREATE TABLE account (id VARCHAR(64) PRIMARY KEY);\n"
+                "CREATE TABLE orders (id VARCHAR(64) PRIMARY KEY, account_id VARCHAR(64) NOT NULL, "
+                "CONSTRAINT fk_orders_account FOREIGN KEY (account_id) REFERENCES account(id));\n",
+                encoding="utf-8",
+            )
+            sources = mock_data.discover_data_sources([source])
+            entities = mock_data.discover_entities([source])
+            self.assertEqual(sources[0]["environment"]["connection_url"]["env"], "DB_URL")
+            orders = next(item for item in entities if item["name"] == "orders")
+            self.assertEqual(orders["references"], [{"field": "account_id", "entity": "account", "target_field": "id"}])
+            self.assertLess(
+                mock_data.entity_creation_order(entities).index("account"),
+                mock_data.entity_creation_order(entities).index("orders"),
+            )
+
+    def test_mock_data_discovery_covers_supported_engines_and_keeps_sources_isolated(self):
+        mock_data = load_script("mock_data")
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source"
+            source.mkdir()
+            (source / "application.yaml").write_text(yaml.safe_dump({
+                "datastores": {
+                    "mysql": {"url": "jdbc:mysql://mysql.local:3306/app"},
+                    "mariadb": {"url": "jdbc:mariadb://maria.local:3306/app"},
+                    "postgresql": {"url": "jdbc:postgresql://pg.local:5432/app"},
+                    "oracle": {"url": "jdbc:oracle:thin:@oracle.local:1521/APP"},
+                    "sqlserver": {"url": "jdbc:sqlserver://sql.local:1433;databaseName=app"},
+                    "mongodb": {"uri": "mongodb+srv://user:secret@mongo.local/app"},
+                    "elasticsearch": {"url": "https://elastic.local:9243"},
+                    "opensearch": {"url": "https://search.local:9200"},
+                    "redis": {"url": "rediss://user:secret@redis.local:6380/2"},
+                },
+            }), encoding="utf-8")
+            sources = mock_data.discover_data_sources([source])
+            expected = {
+                "mysql", "mariadb", "postgresql", "oracle", "sqlserver", "mongodb",
+                "elasticsearch", "opensearch", "redis",
+            }
+            self.assertEqual({item["engine"] for item in sources}, expected)
+            self.assertEqual(len({item["id"] for item in sources}), len(sources))
+            rendered = yaml.safe_dump(sources)
+            self.assertNotIn("secret", rendered)
+            oracle = next(item for item in sources if item["engine"] == "oracle")
+            self.assertEqual(oracle["environment"]["host"]["default"], "oracle.local")
+            mongo = next(item for item in sources if item["engine"] == "mongodb")
+            self.assertEqual(mongo["environment"]["scheme"]["default"], "mongodb+srv")
+            self.assertNotIn("default", mongo["environment"]["password"])
+            redis = next(item for item in sources if item["engine"] == "redis")
+            self.assertEqual(redis["environment"]["scheme"]["default"], "rediss")
+
+    def test_source_derived_mock_data_prefers_api_and_falls_back_to_database(self):
+        mock_data = load_script("mock_data")
+        execution_config = load_script("execution_config")
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = Path(directory) / "qa"
+            execution_config.initialize_execution_layout(qa_root)
+            module = qa_root / "contracts" / "modules" / "orders"
+            module.mkdir(parents=True)
+            endpoints = [
+                {"id": "ORDER_CREATE", "method": "POST", "path": "/orders", "operation_id": "createOrder", "responses": {"201": {}}},
+                {"id": "ORDER_GET", "method": "GET", "path": "/orders/{id}", "operation_id": "getOrder", "parameters": [{"name": "id", "in": "path", "required": True}], "responses": {"200": {}, "404": {}}},
+                {"id": "ORDER_DELETE", "method": "DELETE", "path": "/orders/{id}", "operation_id": "deleteOrder", "parameters": [{"name": "id", "in": "path", "required": True}], "responses": {"204": {}}},
+            ]
+            (module / "endpoints.yaml").write_text(yaml.safe_dump({"module": "orders", "endpoints": endpoints}), encoding="utf-8")
+            cases = [
+                {"id": "ORDER_CREATE_SUCCESS", "endpoint_id": "ORDER_CREATE", "scenario": "success", "request": {"content_type": "application/json", "body": {"id": "review-id", "status": "READY"}}},
+                {"id": "ORDER_GET_SUCCESS", "endpoint_id": "ORDER_GET", "scenario": "success", "request": {"path_parameters": {"id": "review-id"}}, "database_steps": [{
+                    "id": "authored-db-fallback", "phase": "setup", "reason": "missing_prerequisite_api",
+                    "engine": "mysql", "data_source": "primary", "evidence": ["V1__orders.sql:1"],
+                    "estimated_records": 1, "idempotent": True, "depends_on": [],
+                    "ownership": {"namespace_env": "DEV_AI_DATA_NAMESPACE", "resource": "orders", "selector": "id = DEV_AI_DATA_NAMESPACE"},
+                    "precheck": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); bru.setVar('DEV_AI_STEP_EXISTS', await exists(ns) ? 'true' : 'false');",
+                    "script": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); await insertIfMissing(ns);",
+                    "setup_verification": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); if (!await exists(ns)) throw new Error('missing');",
+                    "cleanup": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); await remove(ns);",
+                    "cleanup_verification": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); if (await exists(ns)) throw new Error('still exists');",
+                }]},
+            ]
+            (module / "cases.yaml").write_text(yaml.safe_dump({"module": "orders", "cases": cases}), encoding="utf-8")
+            inventory = qa_root / "constraints" / "mock-data.yaml"
+            inventory.parent.mkdir(parents=True, exist_ok=True)
+            inventory.write_text(yaml.safe_dump({
+                "version": 1,
+                "data_sources": [{
+                    "id": "primary", "engine": "mysql",
+                    "environment": {
+                        "host": {"env": "MYSQL_HOST", "default": "127.0.0.1"},
+                        "port": {"env": "MYSQL_PORT", "default": 3306},
+                        "database": {"env": "MYSQL_DATABASE", "default": "qa"},
+                        "password": {"env": "MYSQL_PASSWORD"},
+                    },
+                }],
+                "entities": [{
+                    "name": "orders", "source_type": "ddl",
+                    "fields": [{"name": "id", "type": "VARCHAR(64)", "required": True}, {"name": "status", "type": "VARCHAR(16)", "required": True, "enum": ["READY"]}],
+                    "primary_key": ["id"], "unique_keys": [], "references": [],
+                    "evidence": [{"file": "V1__orders.sql", "line": 1}],
+                }],
+            }), encoding="utf-8")
+
+            mock_data.derive_mock_data_contracts(qa_root)
+            plan = mock_data.build_plan(qa_root)
+            self.assertEqual(plan["steps"][0]["transport"], "api")
+            self.assertEqual(plan["steps"][0]["data_source"], "public-api")
+            self.assertEqual(len(plan["steps"]), 1)
+            self.assertNotEqual(plan["steps"][0]["id"], "authored-db-fallback")
+            rendered_cases = yaml.safe_load((module / "cases.yaml").read_text(encoding="utf-8"))["cases"]
+            get_case = next(item for item in rendered_cases if item["id"] == "ORDER_GET_SUCCESS")
+            self.assertEqual(get_case["request"]["path_parameters"]["id"], "{{DEV_AI_DATA_ORDERS_ID}}")
+
+            # Removing the source-backed create API forces the deterministic database fallback.
+            endpoints[0]["path"] = "/unrelated"
+            (module / "endpoints.yaml").write_text(yaml.safe_dump({"module": "orders", "endpoints": endpoints}), encoding="utf-8")
+            cases[1].pop("database_steps")
+            (module / "cases.yaml").write_text(yaml.safe_dump({"module": "orders", "cases": cases}), encoding="utf-8")
+            mock_data.derive_mock_data_contracts(qa_root)
+            plan = mock_data.build_plan(qa_root)
+            self.assertEqual(plan["steps"][0]["transport"], "database")
+            self.assertIn("INSERT IGNORE", plan["steps"][0]["script"])
+            self.assertTrue((qa_root / "bruno" / "package.json").is_file())
+
+            # A later contract change restores the original path value and removes generated prerequisite state.
+            endpoints[1]["path"] = "/orders"
+            endpoints[1]["parameters"] = []
+            (module / "endpoints.yaml").write_text(
+                yaml.safe_dump({"module": "orders", "endpoints": endpoints}), encoding="utf-8",
+            )
+            mock_data.derive_mock_data_contracts(qa_root)
+            refreshed = yaml.safe_load((module / "cases.yaml").read_text(encoding="utf-8"))["cases"]
+            refreshed_get = next(item for item in refreshed if item["id"] == "ORDER_GET_SUCCESS")
+            self.assertEqual(refreshed_get["request"]["path_parameters"]["id"], "review-id")
+            self.assertNotIn("mock_data_required", refreshed_get)
+            self.assertNotIn("mock_data_path_binding", refreshed_get)
+
+    def test_failed_creation_is_frozen_for_cleanup_and_run_ids_cannot_be_overwritten(self):
+        mock_data = load_script("mock_data")
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = mock_data_fixture(Path(directory), ("orders",))
+
+            def partially_failing(_root, _script, _variables, label):
+                if "precheck" in label:
+                    return {"DEV_AI_STEP_EXISTS": "false"}
+                if label == "mock-data setup orders-fixture":
+                    raise mock_data.MockDataError("second statement failed after insert")
+                return {}
+
+            with mock.patch.object(mock_data, "_execute_script", side_effect=partially_failing):
+                with self.assertRaisesRegex(mock_data.MockDataError, "after insert"):
+                    mock_data.prepare(qa_root, allow_write=True, output=io.StringIO(), run_id="partial-write")
+            ledger = json.loads((qa_root / "results" / "mock-data" / "partial-write.json").read_text(encoding="utf-8"))
+            self.assertEqual(ledger["created"][0]["creation_status"], "possible")
+            self.assertIn("cleanup_b64", ledger["created"][0])
+
+            (qa_root / "contracts" / "modules" / "orders" / "cases.yaml").unlink()
+            cleanup_calls = []
+            with mock.patch.object(
+                mock_data, "_execute_script",
+                side_effect=lambda _root, _script, _variables, label: cleanup_calls.append(label) or {},
+            ):
+                cleaned = mock_data.cleanup(
+                    qa_root, allow_cleanup=True, output=io.StringIO(), run_id="partial-write",
+                )
+            self.assertEqual(cleaned["status"], "cleaned")
+            self.assertEqual(len(cleanup_calls), 2)
+            with self.assertRaisesRegex(mock_data.MockDataError, "already exists"):
+                mock_data.prepare(qa_root, allow_write=True, output=io.StringIO(), run_id="partial-write")
+
+    def test_mock_data_reuses_existing_data_without_writing_or_scheduling_cleanup(self):
+        mock_data = load_script("mock_data")
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = mock_data_fixture(Path(directory), ("orders",))
+            calls: list[str] = []
+
+            def existing(_root, _script, _variables, label):
+                calls.append(label)
+                return {"DEV_AI_STEP_EXISTS": "true"} if "precheck" in label else {}
+
+            with mock.patch.object(mock_data, "_execute_script", side_effect=existing):
+                result = mock_data.prepare(
+                    qa_root, allow_write=True, output=io.StringIO(), run_id="reuse-existing",
+                )
+                cleaned = mock_data.cleanup(
+                    qa_root, allow_cleanup=True, output=io.StringIO(), run_id="reuse-existing",
+                )
+            self.assertEqual(result["status"], "reused")
+            self.assertEqual(result["created"], [])
+            self.assertEqual([item["id"] for item in result["reused"]], ["orders-fixture"])
+            self.assertEqual(calls, [
+                "mock-data precheck orders-fixture",
+                "mock-data setup verification orders-fixture",
+            ])
+            self.assertEqual(cleaned["status"], "cleaned")
+
+    def test_mock_data_script_runner_returns_only_bounded_runtime_metadata(self):
+        mock_data = load_script("mock_data")
+        try:
+            subprocess.run(["node", "--version"], check=True, capture_output=True, text=True)
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            self.skipTest("Node.js is unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            variables: dict[str, str] = {}
+            result = mock_data._execute_script(
+                Path(directory),
+                "console.log('untrusted-noise'); "
+                "bru.setVar('DEV_AI_STEP_EXISTS', 'false'); "
+                "bru.setVar('UNSCOPED_SECRET', 'must-not-return');",
+                variables,
+                "metadata probe",
+            )
+            self.assertEqual(result, {"DEV_AI_STEP_EXISTS": "false"})
+            self.assertEqual(variables, result)
+
+    def test_source_derived_database_templates_cover_supported_engines(self):
+        mock_data = load_script("mock_data")
+        constraints = load_script("constraints")
+        relational_entity = {
+            "name": "orders", "fields": [{"name": "id", "type": "VARCHAR(64)", "required": True}],
+            "primary_key": ["id"], "references": [], "evidence": ["schema.sql:1"],
+        }
+        document_entity = {**relational_entity, "source_type": "annotated_entity"}
+        variable_by_entity = {"orders": "DEV_AI_DATA_ORDERS_ID"}
+        markers = {
+            "oracle": "FROM dual WHERE NOT EXISTS",
+            "sqlserver": "WHERE NOT EXISTS",
+            "mongodb": "$setOnInsert",
+            "elasticsearch": "client.create",
+            "opensearch": "client.create",
+            "redis": "{NX: true}",
+        }
+        try:
+            node_available = subprocess.run(
+                ["node", "--version"], check=False, capture_output=True, text=True,
+            ).returncode == 0
+        except FileNotFoundError:
+            node_available = False
+        for engine, marker in markers.items():
+            with self.subTest(engine=engine):
+                environment = {
+                    "host": {"env": f"{engine.upper()}_HOST"},
+                    "port": {"env": f"{engine.upper()}_PORT"},
+                    "database": {"env": f"{engine.upper()}_DATABASE"},
+                    "password": {"env": f"{engine.upper()}_PASSWORD"},
+                }
+                if engine in {"elasticsearch", "opensearch"}:
+                    environment["index"] = {"env": f"{engine.upper()}_INDEX"}
+                    environment["scheme"] = {"env": f"{engine.upper()}_SCHEME"}
+                source = {"id": engine, "engine": engine, "environment": environment}
+                if engine in {"oracle", "sqlserver"}:
+                    step = mock_data._sql_step(
+                        "orders", relational_entity, source, ["ORDER_GET_SUCCESS"], variable_by_entity,
+                    )
+                else:
+                    step = mock_data._non_relational_step(
+                        "orders", document_entity, source, ["ORDER_GET_SUCCESS"], variable_by_entity,
+                    )
+                self.assertIn(marker, step["script"])
+                self.assertEqual(
+                    constraints.database_access_errors({"id": "ORDER_GET_SUCCESS", "database_steps": [step]}),
+                    [],
+                )
+                if node_available:
+                    for field in ("precheck", "script", "setup_verification", "cleanup", "cleanup_verification"):
+                        checked = subprocess.run(
+                            ["node", "--check", "-"], input=f"(async () => {{\n{step[field]}\n}})();",
+                            capture_output=True, text=True,
+                        )
+                        self.assertEqual(checked.returncode, 0, f"{engine} {field}: {checked.stderr}")
+
+    def test_unresolved_source_fixture_blocks_only_dependent_cases_without_prompting(self):
+        mock_data = load_script("mock_data")
+        execution_config = load_script("execution_config")
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = Path(directory) / "qa"
+            execution_config.initialize_execution_layout(qa_root)
+            module = qa_root / "contracts" / "modules" / "orders"
+            module.mkdir(parents=True)
+            (module / "endpoints.yaml").write_text(yaml.safe_dump({
+                "module": "orders",
+                "endpoints": [{
+                    "id": "ORDER_GET", "method": "GET", "path": "/orders/{id}",
+                    "parameters": [{"name": "id", "in": "path"}], "responses": {"200": {}},
+                }, {
+                    "id": "ORDER_LIST", "method": "GET", "path": "/orders", "responses": {"200": {}},
+                }],
+            }), encoding="utf-8")
+            (module / "cases.yaml").write_text(yaml.safe_dump({
+                "module": "orders", "cases": [
+                    {"id": "ORDER_GET_SUCCESS", "endpoint_id": "ORDER_GET", "scenario": "success"},
+                    {"id": "ORDER_LIST_SUCCESS", "endpoint_id": "ORDER_LIST", "scenario": "success"},
+                ],
+            }), encoding="utf-8")
+            inventory = qa_root / "constraints" / "mock-data.yaml"
+            inventory.parent.mkdir(parents=True, exist_ok=True)
+            inventory.write_text(yaml.safe_dump({
+                "version": 1, "data_sources": [{
+                    "id": "primary", "engine": "mysql", "environment": {
+                        "host": {"env": "MYSQL_HOST", "default": "127.0.0.1"},
+                        "port": {"env": "MYSQL_PORT", "default": 3306},
+                        "database": {"env": "MYSQL_DATABASE", "default": "qa"},
+                    },
+                }],
+                "entities": [{
+                    "name": "orders", "source_type": "ddl",
+                    "fields": [{"name": "tenant_id", "type": "VARCHAR(64)", "required": True},
+                               {"name": "id", "type": "VARCHAR(64)", "required": True}],
+                    "primary_key": ["tenant_id", "id"], "references": [],
+                    "evidence": [{"file": "schema.sql", "line": 1}],
+                }],
+            }), encoding="utf-8")
+            mock_data.derive_mock_data_contracts(qa_root)
+            output = io.StringIO()
+            result = mock_data.prepare(
+                qa_root, input_stream=io.StringIO("yes\n"), output=output, run_id="blocked-plan",
+            )
+            self.assertEqual(result["status"], "planning_blocked")
+            self.assertEqual(set(result["blocked_case_ids"]), {"ORDER_GET_SUCCESS"})
+            self.assertNotIn("ORDER_LIST_SUCCESS", result["dependent_case_ids"])
+            self.assertNotIn("Allow this run", output.getvalue())
+
     def test_process_liveness_probe_does_not_terminate_current_windows_process(self):
         preflight = load_script("runtime_preflight")
         self.assertTrue(preflight.process_is_running(os.getpid()))
@@ -1274,7 +1902,7 @@ class RegressionTests(unittest.TestCase):
         self.assertIn('bru.setVar("things", res.body.data)', rendered)
         self.assertIn("res.body.data.forEach", rendered)
 
-    def test_database_steps_render_setup_assertion_cleanup_and_enable_developer_sandbox(self):
+    def test_database_steps_render_run_level_prerequisite_and_runtime_assertion(self):
         materializer = load_script("materialize_missing_bru")
         runner = load_script("run_bruno")
         coverage = load_script("check_api_coverage")
@@ -1287,12 +1915,24 @@ class RegressionTests(unittest.TestCase):
             "assertions": [{"path": "$.code", "equals": 0}],
             "database_steps": [
                 {
+                    "id": "thing-ready",
                     "phase": "setup",
                     "reason": "missing_prerequisite_api",
                     "engine": "mysql",
+                    "data_source": "primary",
                     "evidence": ["ThingRepository.java:42"],
-                    "script": "await connection.execute('INSERT INTO thing(id) VALUES (?)', [thingId]);",
-                    "cleanup": "await connection.execute('DELETE FROM thing WHERE id = ?', [thingId]);",
+                    "estimated_records": 1,
+                    "idempotent": True,
+                    "ownership": {
+                        "namespace_env": "DEV_AI_DATA_NAMESPACE",
+                        "resource": "thing",
+                        "selector": "test_namespace = DEV_AI_DATA_NAMESPACE",
+                    },
+                    "precheck": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); const [rows] = await connection.execute('SELECT id FROM thing WHERE id = ?', [ns]); bru.setVar('DEV_AI_STEP_EXISTS', rows.length ? 'true' : 'false');",
+                    "script": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); await connection.execute('INSERT IGNORE INTO thing(id) VALUES (?)', [ns]);",
+                    "setup_verification": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); const [rows] = await connection.execute('SELECT id FROM thing WHERE id = ?', [ns]); if (!rows.length) throw new Error('missing');",
+                    "cleanup": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); await connection.execute('DELETE FROM thing WHERE id = ?', [ns]);",
+                    "cleanup_verification": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); const [rows] = await connection.execute('SELECT id FROM thing WHERE id = ?', [ns]); if (rows.length) throw new Error('cleanup failed');",
                 },
                 {
                     "phase": "assertion",
@@ -1306,11 +1946,10 @@ class RegressionTests(unittest.TestCase):
         }
         endpoint = {"id": "THING_EXECUTE_ENDPOINT", "method": "POST", "path": "/things/execute"}
         rendered = materializer.render_case(case, endpoint)
-        self.assertIn("database-setup mysql", rendered)
+        self.assertIn("mock-data-prerequisite", rendered)
         self.assertIn("database-assertion mongodb", rendered)
-        self.assertIn("database-cleanup mysql", rendered)
-        self.assertIn("try {", rendered)
-        self.assertIn("} finally {", rendered)
+        self.assertNotIn("database-cleanup mysql", rendered)
+        self.assertNotIn("INSERT IGNORE", rendered)
         self.assertTrue(runner.requires_developer_sandbox([case]))
         self.assertFalse(runner.requires_developer_sandbox([{"id": "HTTP_ONLY"}]))
         with tempfile.TemporaryDirectory() as directory:

@@ -1,3 +1,3 @@
 """Shared runtime for the dev-ai development skills."""
 
-__version__ = "6.0.0"
+__version__ = "6.2.0"

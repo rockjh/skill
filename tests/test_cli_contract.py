@@ -25,6 +25,39 @@ class CliContractTests(unittest.TestCase):
         self.assertIn("--openapi", result["data"]["options"])
         self.assertNotIn("domains", result["data"])
 
+    def test_mock_data_commands_have_scoped_multi_module_contracts(self) -> None:
+        code, generate = self.invoke("schema", "api-test.mock-data-generate")
+        self.assertEqual(0, code)
+        self.assertEqual("string[]", generate["data"]["options"]["--module"])
+        self.assertIn("--allow-write", generate["data"]["options"])
+        code, clean = self.invoke("schema", "api-test.mock-data-clean")
+        self.assertEqual(0, code)
+        self.assertIn("--run-id", clean["data"]["options"])
+        self.assertIn("--allow-cleanup", clean["data"]["options"])
+
+    def test_mock_data_commands_return_public_envelopes_and_semantic_exit_codes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            qa_root = Path(temporary) / "qa"
+            code, initialized = self.invoke("api-test", "init", "--qa-root", str(qa_root))
+            self.assertEqual(0, code, initialized)
+            code, generated = self.invoke("api-test", "mock-data-generate", "--qa-root", str(qa_root))
+            self.assertEqual(0, code, generated)
+            self.assertTrue(generated["ok"])
+            self.assertIn("results\\mock-data", generated["artifact_path"])
+            code, missing = self.invoke("api-test", "mock-data-clean", "--qa-root", str(qa_root))
+            self.assertEqual(4, code, missing)
+            self.assertEqual("TARGET_NOT_FOUND", missing["error"]["code"])
+
+    def test_mock_data_subcommand_help_is_registered(self) -> None:
+        from dev_ai.domains.api_test.cli import main as api_test_main
+
+        stream = io.StringIO()
+        with redirect_stdout(stream), self.assertRaises(SystemExit) as exit_context:
+            api_test_main(["mock-data-generate", "--help"])
+        self.assertEqual(0, exit_context.exception.code)
+        self.assertIn("--module", stream.getvalue())
+        self.assertIn("--allow-write", stream.getvalue())
+
     def test_e2e_contract_schemas_are_scoped_and_complete(self) -> None:
         code, scenario = self.invoke("schema", "e2e.scenario")
         self.assertEqual(0, code)
@@ -67,6 +100,11 @@ class CliContractTests(unittest.TestCase):
             self.assertTrue((root / ".dev-ai.lock.json").is_file())
             self.assertTrue((root / "contracts" / "version-lock.yaml").is_file())
             self.assertFalse((root / "scripts").exists())
+            for name in (
+                "generate-mock-data.bat", "generate-mock-data.sh",
+                "clean-mock-data.bat", "clean-mock-data.sh",
+            ):
+                self.assertTrue((root / "execution" / name).is_file())
 
     def test_api_version_lock_can_complete_through_the_public_cli(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

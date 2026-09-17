@@ -76,6 +76,9 @@ def _artifact_path(domain: str, command: str, arguments: list[str], stdout: str)
         path = _option_path(arguments, "--project", ".") / "artifacts" / "e2e-run.json"
         return str(path) if path.is_file() else ""
     for line in reversed(stdout.splitlines()):
+        if " ledger=" in line:
+            return line.rsplit(" ledger=", 1)[1].strip()
+    for line in reversed(stdout.splitlines()):
         if line.startswith(("result_report=", "E2E report: ", "E2E 报告: ")):
             return line.split("=", 1)[-1].split(": ", 1)[-1].strip()
     return ""

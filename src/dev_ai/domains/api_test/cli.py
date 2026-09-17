@@ -19,6 +19,8 @@ from ...core.redaction import redact
 from .execution_config import initialize_execution_layout
 from .analyze_source_logic import apply_candidates, scan as scan_source_logic
 from .materialize_missing_bru import materialize
+from .mock_data import command as mock_data_operation
+from .mock_data import derive_mock_data_contracts, write_discovery
 from .parse_openapi import (
     extract,
     constraint_obligations,
@@ -138,6 +140,10 @@ def init_command(argv: list[str]) -> int:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(render_manifest(document, path), encoding="utf-8")
             changed.append(path)
+    inventory_path = qa_root / CONSTRAINTS / "mock-data.yaml"
+    if not inventory_path.is_file():
+        write_discovery(qa_root, [])
+        changed.append(inventory_path)
     version_lock = qa_root / CONTRACTS / "version-lock.yaml"
     if not version_lock.is_file():
         code = version_gate(qa_root, "--init")
@@ -212,6 +218,7 @@ def generate_command(argv: list[str]) -> int:
         if missing:
             parser.error("source root(s) do not exist: " + ", ".join(missing))
         source_constraints = write_source_constraints(qa_root, args.source_root, manifest)
+        write_discovery(qa_root, args.source_root)
         apply_constraints_to_manifest(manifest, source_constraints)
     elif source_constraints_path.is_file():
         source_constraints = scope_source_constraints(load_document(source_constraints_path), manifest)
@@ -297,6 +304,9 @@ def generate_command(argv: list[str]) -> int:
             render_manifest({"version": 1, "handlers": []}, exception_profile),
             encoding="utf-8",
         )
+    derive_mock_data_contracts(qa_root)
+    if (contracts / "generation-state.yaml").is_file():
+        refresh_generation_state_cases(contracts)
     write_value_resolutions(qa_root, source_constraints)
     materialize(contracts, qa_root / BRUNO, execution_config_path=qa_root / EXECUTION / "config.yaml")
     write_value_resolutions(qa_root, source_constraints)
@@ -629,12 +639,36 @@ def scripts_command(argv: list[str]) -> int:
     )
 
 
+def mock_data_command(argv: list[str], *, clean: bool) -> int:
+    action = "clean" if clean else "generate"
+    parser = argparse.ArgumentParser(prog=f"dev-ai api-test mock-data-{action}")
+    qa_root_argument(parser)
+    parser.add_argument(
+        "--module", action="append", default=[],
+        help="module id, display name, directory, or OpenAPI Tag; repeat for multiple modules",
+    )
+    parser.add_argument("--run-id", help="run ledger id (cleanup target, or optional generation id)")
+    parser.add_argument(
+        "--allow-cleanup" if clean else "--allow-write",
+        action="store_true",
+        help="explicit authorization required in non-interactive environments",
+    )
+    args = parser.parse_args(argv)
+    return mock_data_operation(
+        args.qa_root,
+        action=action,
+        modules=args.module or None,
+        run_id=args.run_id,
+        allowed=args.allow_cleanup if clean else args.allow_write,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(prog="dev-ai api-test")
     commands = (
         "init", "generate", "materialize", "check", "run", "preflight", "reconcile",
-        "aggregate", "worker-start", "worker-check", "scripts",
+        "aggregate", "worker-start", "worker-check", "mock-data-generate", "mock-data-clean", "scripts",
     )
     parser.add_argument("command", nargs="?", choices=commands)
     if not argv or argv[0] in {"-h", "--help"}:
@@ -651,6 +685,8 @@ def main(argv: list[str] | None = None) -> int:
         return materialize_command(remainder)
     if command == "aggregate":
         return aggregate_command(remainder)
+    if command in {"mock-data-generate", "mock-data-clean"}:
+        return mock_data_command(remainder, clean=command == "mock-data-clean")
     if command in {"worker-start", "worker-check"}:
         return worker_command(remainder, command == "worker-start")
     if command in {"check", "reconcile"}:

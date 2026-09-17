@@ -11,6 +11,8 @@ dev-ai api-test preflight
 dev-ai api-test run
 dev-ai api-test reconcile
 dev-ai api-test aggregate
+dev-ai api-test mock-data-generate
+dev-ai api-test mock-data-clean
 dev-ai api-test worker-start
 dev-ai api-test worker-check
 dev-ai api-test scripts
@@ -25,3 +27,5 @@ by default and exposes `version-init`, `version-check`, and `version-complete`
 for the business source lock; see `dev-ai schema api-test.scripts`.
 
 Generated QA projects contain only contracts, constraints, Bruno collections, execution configuration, and results. They never contain a Python copy of dev-ai.
+
+`mock-data-generate` and `mock-data-clean` default to every module and accept repeated module selectors. The generated `execution/generate-mock-data.bat`, `generate-mock-data.sh`, `clean-mock-data.bat`, and `clean-mock-data.sh` files are thin launchers for those commands. Use the scoped schema for authorization and run-ledger options.
