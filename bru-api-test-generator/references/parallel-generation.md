@@ -1,8 +1,8 @@
 # Parallel Module Generation And Execution
 
-Use workers only after the coordinator freezes the OpenAPI inventory, module map, shared execution configuration, and `qa/constraints/rules.yaml`.
+Use workers only after the coordinator freezes the OpenAPI inventory, module map, shared execution configuration, and `qa/data/constraints/rules.yaml`.
 
-Before dispatching each assignment, record its Git-backed boundary:
+Before dispatching each assignment, record its current-workspace boundary:
 
 ```bash
 bruno-api-test-generator worker-start --module <module>
@@ -13,7 +13,7 @@ bruno-api-test-generator worker-start --module <module>
 | Owner | Writable scope |
 | --- | --- |
 | Coordinator | Global contracts, locks, constraint merges, execution configuration, collection files, cross-module flows, and final reports |
-| Module worker | Its `contracts/modules/<directory>/`, `bruno/<directory>/`, `results/modules/<id>/`, `evidence/modules/<id>/`, and `logs/modules/<id>/` only |
+| Module worker | Its `data/contracts/modules/<directory>/`, `data/bruno/<directory>/`, `results/modules/<id>/`, `results/modules/evidence/<id>/`, and `results/logs/modules/<id>/` only |
 
 Workers may read shared contracts, configuration, prior evidence, and business source. They must not write business code, another module, `index.yaml`, `generation-state.yaml`, `qa-lock.yaml`, `version-lock.yaml`, `collection.bru`, shared environments, or cross-module flows.
 

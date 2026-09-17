@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 import stat
@@ -13,7 +14,10 @@ from typing import Any
 
 sys.dont_write_bytecode = True
 
+from qa_paths import BRUNO, CONTRACTS, EXECUTION, GLOBAL_EVIDENCE, LOGS, MODULE_EVIDENCE, migrate_legacy_layout
+
 RUNTIME_CONFIG_ENV = "__QA_EXECUTION_CONFIG"
+DEFAULT_CLI_TIMEOUT = 60.0
 COLLECTION_MARKER = "bru-api-test-generator: runtime-config"
 COLLECTION_END_MARKER = "bru-api-test-generator: runtime-config-end"
 TOOLING_MODES = {"project-scripts", "shared-cli"}
@@ -28,6 +32,7 @@ VARIABLE_RE = re.compile(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}")
 DEFAULT_CONFIG_TEMPLATE = """active_environment: local
 tooling: project-scripts
 coverage_profile: full-matrix
+cli_timeout: 60
 sign:
   provider: disabled
 """
@@ -59,31 +64,68 @@ BRUNO_JSON_TEMPLATE = {
 
 RUN_BAT_TEMPLATE = r"""@echo off
 setlocal
-rem Usage: run.bat runs all modules; run.bat --module "users" runs one module.
+rem Optional PATH hints: set BRUNO_NODE_HOME and/or BRUNO_NPM_BIN before running.
+if defined BRUNO_NODE_HOME set "PATH=%BRUNO_NODE_HOME%;%PATH%"
+if defined BRUNO_NPM_BIN set "PATH=%BRUNO_NPM_BIN%;%PATH%"
+rem Usage: run.bat runs all modules; add --module "users" or --cli-timeout 90 as needed.
 python "%~dp0..\scripts\bruno_api_test_generator.py" run --qa-root "%~dp0.." %*
 exit /b %errorlevel%
 """
 
 RUN_SH_TEMPLATE = """#!/usr/bin/env sh
 set -eu
-# Usage: ./run.sh runs all modules; ./run.sh --module "users" runs one module.
+# Optional PATH hints: export BRUNO_NODE_HOME and/or BRUNO_NPM_BIN before running.
+if [ -n "${BRUNO_NODE_HOME:-}" ]; then PATH="$BRUNO_NODE_HOME:$PATH"; fi
+if [ -n "${BRUNO_NPM_BIN:-}" ]; then PATH="$BRUNO_NPM_BIN:$PATH"; fi
+export PATH
+# Usage: ./run.sh runs all modules; add --module "users" or --cli-timeout 90 as needed.
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 exec python3 "$SCRIPT_DIR/../scripts/bruno_api_test_generator.py" run --qa-root "$SCRIPT_DIR/.." "$@"
 """
 
 SHARED_RUN_BAT_TEMPLATE = r"""@echo off
 setlocal
-rem Usage: run.bat runs all modules; run.bat --module "users" runs one module.
+rem Optional PATH hints: set BRUNO_NODE_HOME and/or BRUNO_NPM_BIN before running.
+if defined BRUNO_NODE_HOME set "PATH=%BRUNO_NODE_HOME%;%PATH%"
+if defined BRUNO_NPM_BIN set "PATH=%BRUNO_NPM_BIN%;%PATH%"
+rem Usage: run.bat runs all modules; add --module "users" or --cli-timeout 90 as needed.
 bruno-api-test-generator run --qa-root "%~dp0.." %*
 exit /b %errorlevel%
 """
 
 SHARED_RUN_SH_TEMPLATE = """#!/usr/bin/env sh
 set -eu
-# Usage: ./run.sh runs all modules; ./run.sh --module "users" runs one module.
+# Optional PATH hints: export BRUNO_NODE_HOME and/or BRUNO_NPM_BIN before running.
+if [ -n "${BRUNO_NODE_HOME:-}" ]; then PATH="$BRUNO_NODE_HOME:$PATH"; fi
+if [ -n "${BRUNO_NPM_BIN:-}" ]; then PATH="$BRUNO_NPM_BIN:$PATH"; fi
+export PATH
+# Usage: ./run.sh runs all modules; add --module "users" or --cli-timeout 90 as needed.
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 exec bruno-api-test-generator run --qa-root "$SCRIPT_DIR/.." "$@"
 """
+
+LEGACY_RUN_BAT_TEMPLATE = r"""@echo off
+setlocal
+rem Usage: run.bat runs all modules; run.bat --module "users" runs one module.
+python "%~dp0..\scripts\bruno_api_test_generator.py" run --qa-root "%~dp0.." %*
+exit /b %errorlevel%
+"""
+
+LEGACY_RUN_SH_TEMPLATE = """#!/usr/bin/env sh
+set -eu
+# Usage: ./run.sh runs all modules; ./run.sh --module "users" runs one module.
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec python3 "$SCRIPT_DIR/../scripts/bruno_api_test_generator.py" run --qa-root "$SCRIPT_DIR/.." "$@"
+"""
+
+LEGACY_SHARED_RUN_BAT_TEMPLATE = LEGACY_RUN_BAT_TEMPLATE.replace(
+    'python "%~dp0..\\scripts\\bruno_api_test_generator.py"',
+    "bruno-api-test-generator",
+)
+LEGACY_SHARED_RUN_SH_TEMPLATE = LEGACY_RUN_SH_TEMPLATE.replace(
+    'python3 "$SCRIPT_DIR/../scripts/bruno_api_test_generator.py"',
+    "bruno-api-test-generator",
+)
 
 EXECUTION_README_TEMPLATE = """# Bruno 执行入口
 
@@ -95,14 +137,19 @@ EXECUTION_README_TEMPLATE = """# Bruno 执行入口
 ```bat
 qa\\execution\\run.bat
 qa\\execution\\run.bat --module "users"
+qa\\execution\\run.bat --cli-timeout 90
 ```
 
 ```sh
 ./qa/execution/run.sh
 ./qa/execution/run.sh --module "users"
+./qa/execution/run.sh --cli-timeout 90
 ```
 
-运行器会打印阶段进度、每个用例的状态及最终汇总。每次运行都会在 `qa/logs/` 新建按时间和
+`config.yaml` uses `cli_timeout: 60` by default; `--cli-timeout` overrides one run.
+Set `BRUNO_NODE_HOME` and/or `BRUNO_NPM_BIN` before launching only when PATH guidance is needed.
+
+运行器会打印阶段进度、每个用例的状态及最终汇总。每次运行都会在 `qa/results/logs/` 新建按时间和
 执行范围命名的日志。版本不一致只会以红色告警显示，不会阻塞用例执行。
 
 远程环境可在活动环境的 `vars {}` 中配置 `versionPath`。默认用
@@ -188,7 +235,7 @@ def validate_execution_config(document: Any) -> dict[str, Any]:
         raise ValueError("execution config must contain an object")
     _reject_unknown(
         document,
-        {"active_environment", "tooling", "coverage_profile", "sign"},
+        {"active_environment", "tooling", "coverage_profile", "cli_timeout", "sign"},
         "execution config",
     )
     active = document.get("active_environment")
@@ -203,6 +250,14 @@ def validate_execution_config(document: Any) -> dict[str, Any]:
     coverage_profile = document.get("coverage_profile")
     if coverage_profile not in COVERAGE_PROFILES:
         raise ValueError("coverage_profile must be one of: contract-draft, full-matrix")
+    cli_timeout = document.get("cli_timeout", DEFAULT_CLI_TIMEOUT)
+    if (
+        isinstance(cli_timeout, bool)
+        or not isinstance(cli_timeout, (int, float))
+        or not math.isfinite(cli_timeout)
+        or cli_timeout <= 0
+    ):
+        raise ValueError("cli_timeout must be a positive number of seconds")
     sign = document.get("sign")
     if not isinstance(sign, dict):
         raise ValueError("sign must be an object containing provider")
@@ -219,6 +274,7 @@ def validate_execution_config(document: Any) -> dict[str, Any]:
         "active_environment": active,
         "tooling": str(tooling),
         "coverage_profile": str(coverage_profile),
+        "cli_timeout": float(cli_timeout),
         "sign": {"provider": str(provider), **({"version": version} if version else {})},
     }
 
@@ -342,6 +398,7 @@ def render_execution_config(config: dict[str, Any]) -> str:
         f"active_environment: {config['active_environment']}",
         f"tooling: {config['tooling']}",
         f"coverage_profile: {config['coverage_profile']}",
+        f"cli_timeout: {float(config.get('cli_timeout', DEFAULT_CLI_TIMEOUT)):g}",
         "sign:",
         f"  provider: {sign['provider']}",
     ]
@@ -413,6 +470,7 @@ def migrate_legacy_execution_config(
         "active_environment": active,
         "tooling": legacy.get("tooling", tooling),
         "coverage_profile": legacy.get("coverage_profile", "full-matrix"),
+        "cli_timeout": legacy.get("cli_timeout", DEFAULT_CLI_TIMEOUT),
         "sign": sign,
     }
     rendered = render_execution_config(normalized)
@@ -475,9 +533,10 @@ def initialize_execution_layout(qa_root: Path, local_scripts: bool | None = None
     """Create reusable execution assets and synchronize the project scripts."""
 
     qa_root = qa_root.resolve()
-    contracts_root = qa_root / "contracts"
-    bruno_root = qa_root / "bruno"
-    execution_root = qa_root / "execution"
+    changed = migrate_legacy_layout(qa_root)
+    contracts_root = qa_root / CONTRACTS
+    bruno_root = qa_root / BRUNO
+    execution_root = qa_root / EXECUTION
     old_environments = bruno_root / "environments"
     new_environments = execution_root / "environments"
     config_path = execution_root / "config.yaml"
@@ -488,7 +547,6 @@ def initialize_execution_layout(qa_root: Path, local_scripts: bool | None = None
         local_scripts,
     )
     tooling = "project-scripts" if local_scripts else "shared-cli"
-    changed: list[Path] = []
     if old_environments.exists():
         if new_environments.exists():
             raise ValueError(
@@ -499,6 +557,8 @@ def initialize_execution_layout(qa_root: Path, local_scripts: bool | None = None
         changed.append(new_environments)
     else:
         new_environments.mkdir(parents=True, exist_ok=True)
+    for path in (qa_root / GLOBAL_EVIDENCE, qa_root / MODULE_EVIDENCE, qa_root / LOGS):
+        path.mkdir(parents=True, exist_ok=True)
 
     if config_path.is_file():
         changed.extend(migrate_legacy_execution_config(config_path, new_environments, tooling))
@@ -540,18 +600,27 @@ def initialize_execution_layout(qa_root: Path, local_scripts: bool | None = None
         (execution_root / "run.bat", run_bat_template.replace("\n", "\r\n"), {
             RUN_BAT_TEMPLATE.replace("\n", "\r\n"),
             SHARED_RUN_BAT_TEMPLATE.replace("\n", "\r\n"),
+            LEGACY_RUN_BAT_TEMPLATE.replace("\n", "\r\n"),
+            LEGACY_SHARED_RUN_BAT_TEMPLATE.replace("\n", "\r\n"),
             RUN_BAT_TEMPLATE.replace('rem Usage: run.bat runs all modules; run.bat --module "users" runs one module.\n', "").replace("\n", "\r\n"),
             SHARED_RUN_BAT_TEMPLATE.replace('rem Usage: run.bat runs all modules; run.bat --module "users" runs one module.\n', "").replace("\n", "\r\n"),
+            LEGACY_RUN_BAT_TEMPLATE.replace('rem Usage: run.bat runs all modules; run.bat --module "users" runs one module.\n', "").replace("\n", "\r\n"),
+            LEGACY_SHARED_RUN_BAT_TEMPLATE.replace('rem Usage: run.bat runs all modules; run.bat --module "users" runs one module.\n', "").replace("\n", "\r\n"),
         }),
         (execution_root / "run.sh", run_sh_template, {
             RUN_SH_TEMPLATE,
             SHARED_RUN_SH_TEMPLATE,
+            LEGACY_RUN_SH_TEMPLATE,
+            LEGACY_SHARED_RUN_SH_TEMPLATE,
             RUN_SH_TEMPLATE.replace('# Usage: ./run.sh runs all modules; ./run.sh --module "users" runs one module.\n', ""),
             SHARED_RUN_SH_TEMPLATE.replace('# Usage: ./run.sh runs all modules; ./run.sh --module "users" runs one module.\n', ""),
+            LEGACY_RUN_SH_TEMPLATE.replace('# Usage: ./run.sh runs all modules; ./run.sh --module "users" runs one module.\n', ""),
+            LEGACY_SHARED_RUN_SH_TEMPLATE.replace('# Usage: ./run.sh runs all modules; ./run.sh --module "users" runs one module.\n', ""),
         }),
     ):
         current = path.read_text(encoding="utf-8", errors="strict")
-        if current in known and current != desired:
+        normalized_known = {value.replace("\r\n", "\n") for value in known}
+        if current in normalized_known and current != desired.replace("\r\n", "\n"):
             path.write_text(desired, encoding="utf-8", newline="")
             changed.append(path)
     collection_path = bruno_root / "collection.bru"

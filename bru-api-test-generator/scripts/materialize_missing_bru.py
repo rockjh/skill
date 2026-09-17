@@ -6,11 +6,14 @@ from __future__ import annotations
 import argparse
 import difflib
 import hashlib
+import html
+import io
 import json
 import re
 import sys
 import textwrap
 import urllib.parse
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -21,10 +24,20 @@ from execution_config import (
     COLLECTION_MARKER,
     COLLECTION_TEMPLATE,
     HEADER_NAME_RE,
+    environment_file,
+    load_bruno_environment_document,
     load_execution_config,
+    render_headers_block,
+    render_runtime_environment,
 )
 from parse_openapi import display_directory, render_manifest, update_module_document
-from qa_constraints import database_access_errors, database_steps, write_module_lock
+from qa_constraints import (
+    database_access_errors,
+    database_steps,
+    qa_root_for_contracts,
+    validate_stage,
+    write_module_lock,
+)
 from qa_lock import write as write_qa_lock
 
 
@@ -606,6 +619,230 @@ def sync_index_counts(contracts_root: Path) -> None:
     index_path.write_text(render_manifest(index, index_path), encoding="utf-8")
 
 
+def _binary_schema(endpoint: dict[str, Any]) -> dict[str, Any] | None:
+    body = endpoint.get("request_body", {}) if isinstance(endpoint.get("request_body"), dict) else {}
+    pending: list[Any] = [body]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            if value.get("format") == "binary":
+                return value
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+    return None
+
+
+def _fixture_variable(endpoint_id: str, fixture_type: str) -> str:
+    prefix = re.sub(r"[^A-Za-z0-9]+", "_", endpoint_id).strip("_").upper() or "ENDPOINT"
+    return f"{prefix}_FILE_{fixture_type.replace('-', '_').upper()}"
+
+
+def _fixture_type(case: dict[str, Any]) -> str:
+    explicit = str(case.get("fixture_type", ""))
+    if explicit:
+        return explicit
+    case_id = str(case.get("id", "")).upper()
+    for token, fixture_type in (
+        ("HEADER_ONLY", "header-only"),
+        ("MISSING_COLUMN", "missing-column"),
+        ("INVALID_CONTENT", "invalid-content"),
+        ("INVALID_EXTENSION", "invalid-extension"),
+        ("INVALID_MIME", "invalid-mime"),
+        ("OVERSIZED", "oversized"),
+        ("EMPTY", "empty"),
+    ):
+        if token in case_id:
+            return fixture_type
+    return "legal" if str(case.get("scenario")) == "success" else ""
+
+
+def _replace_fixture_variable(value: Any, variable: str) -> Any:
+    if isinstance(value, str) and re.fullmatch(
+        r"\{\{(?:UPLOAD_FILE|EMPTY_UPLOAD_FILE|INVALID_EXTENSION_FILE|INVALID_MIME_FILE|OVERSIZED_UPLOAD_FILE|[A-Z0-9_]+_FILE_[A-Z0-9_]+)\}\}",
+        value,
+    ):
+        return "{{" + variable + "}}"
+    if isinstance(value, dict):
+        return {key: _replace_fixture_variable(child, variable) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_replace_fixture_variable(child, variable) for child in value]
+    return value
+
+
+def _xlsx_bytes(columns: list[str], rows: list[list[str]]) -> bytes:
+    strings = [*columns, *(cell for row in rows for cell in row)]
+    unique = list(dict.fromkeys(strings))
+    indexes = {value: index for index, value in enumerate(unique)}
+    cells: list[str] = []
+    for row_index, row in enumerate([columns, *rows], 1):
+        rendered = "".join(
+            f'<c r="{chr(65 + column_index)}{row_index}" t="s"><v>{indexes[cell]}</v></c>'
+            for column_index, cell in enumerate(row)
+        )
+        cells.append(f'<row r="{row_index}">{rendered}</row>')
+    parts = {
+        "[Content_Types].xml": (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+            '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            '<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>'
+            '</Types>'
+        ),
+        "_rels/.rels": (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+            '</Relationships>'
+        ),
+        "xl/workbook.xml": (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>'
+        ),
+        "xl/_rels/workbook.xml.rels": (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+            '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>'
+            '</Relationships>'
+        ),
+        "xl/worksheets/sheet1.xml": (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            f'<sheetData>{"".join(cells)}</sheetData></worksheet>'
+        ),
+        "xl/sharedStrings.xml": (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            f'<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="{len(strings)}" uniqueCount="{len(unique)}">'
+            + "".join(f"<si><t>{html.escape(value)}</t></si>" for value in unique)
+            + "</sst>"
+        ),
+    }
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, content in parts.items():
+            info = zipfile.ZipInfo(name, (2020, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(info, content.encode("utf-8"))
+    return output.getvalue()
+
+
+def _fixture_bytes(fixture_type: str, excel: bool, columns: list[str]) -> bytes:
+    if fixture_type == "empty":
+        return b""
+    if not excel:
+        return b"invalid\n" if fixture_type in {"invalid-content", "invalid-mime"} else b"valid\n"
+    if fixture_type == "header-only":
+        return _xlsx_bytes(columns, [])
+    if fixture_type == "missing-column":
+        return _xlsx_bytes(columns[:-1] or ["missing"], [["1"] * max(1, len(columns) - 1)])
+    if fixture_type == "invalid-content":
+        return _xlsx_bytes(columns, [["__INVALID__"] * len(columns)])
+    return _xlsx_bytes(columns, [[str(index + 1) for index in range(len(columns))]])
+
+
+def generate_fixtures(
+    contracts_root: Path,
+    bruno_root: Path,
+    config_path: Path,
+) -> list[Path]:
+    """Create endpoint-owned fixtures, variables, and a checksum manifest."""
+
+    qa_root = qa_root_for_contracts(contracts_root)
+    generated_root = qa_root / "fixtures" / "generated"
+    generated_root.mkdir(parents=True, exist_ok=True)
+    manifest_items: list[dict[str, Any]] = []
+    changed: list[Path] = []
+    config = load_execution_config(config_path)
+    env_path = environment_file(config_path, config)
+    environment = load_bruno_environment_document(env_path)
+    modules_root = contracts_root / "modules"
+    for module_dir in sorted(path for path in modules_root.iterdir() if path.is_dir()):
+        endpoint_doc = load_data(module_dir / "endpoints.yaml")
+        cases_path = module_dir / "cases.yaml"
+        case_doc = load_data(cases_path) if cases_path.is_file() else {}
+        endpoints = {str(item.get("id")): item for item in first_list(endpoint_doc, "endpoints") if item.get("id")}
+        cases = first_list(case_doc, "cases")
+        cases_changed = False
+        for endpoint_id, endpoint in endpoints.items():
+            schema = _binary_schema(endpoint)
+            if schema is None:
+                continue
+            extensions = [str(value).casefold().lstrip(".") for value in schema.get("x-allowed-extensions", [])]
+            excel = bool(set(extensions) & {"xls", "xlsx"}) or schema.get("x-excel-template") is not None
+            extension = "xlsx" if excel else (extensions[0] if extensions else "bin")
+            columns = [str(value) for value in schema.get("x-template-columns", ["id", "name"])] or ["id"]
+            endpoint_cases = [case for case in cases if str(case.get("endpoint_id")) == endpoint_id]
+            types = {_fixture_type(case) for case in endpoint_cases} - {""}
+            if excel:
+                types.update({"legal", "empty", "header-only", "missing-column", "invalid-content", "oversized"})
+            for fixture_type in sorted(types):
+                variable = _fixture_variable(endpoint_id, fixture_type)
+                for case in endpoint_cases:
+                    if _fixture_type(case) == fixture_type:
+                        replaced = _replace_fixture_variable(case.get("request", {}), variable)
+                        if replaced != case.get("request", {}):
+                            case["request"] = replaced
+                            case["fixture_type"] = fixture_type
+                            cases_changed = True
+                file_extension = "txt" if fixture_type == "invalid-extension" else extension
+                safe_endpoint = re.sub(r"[^A-Za-z0-9._-]+", "-", endpoint_id).strip("-") or "endpoint"
+                fixture_path = generated_root / safe_endpoint / f"{fixture_type}.{file_extension}"
+                fixture_path.parent.mkdir(parents=True, exist_ok=True)
+                payload = _fixture_bytes(fixture_type, excel, columns)
+                if not fixture_path.is_file() or fixture_path.read_bytes() != payload:
+                    fixture_path.write_bytes(payload)
+                    changed.append(fixture_path)
+                if fixture_type == "oversized":
+                    maximum = int(schema.get("x-max-size", schema.get("maxLength", 4096)))
+                    if fixture_path.stat().st_size <= maximum:
+                        with fixture_path.open("r+b") as handle:
+                            handle.seek(maximum)
+                            handle.write(b"\0")
+                        changed.append(fixture_path)
+                relative = fixture_path.relative_to(qa_root).as_posix()
+                environment["vars"][variable] = (Path("..") / ".." / Path(relative)).as_posix()
+                manifest_items.append({
+                    "id": f"{endpoint_id}:{fixture_type}",
+                    "type": fixture_type,
+                    "source": "generated",
+                    "endpoint_scope": [endpoint_id],
+                    "variable": variable,
+                    "path": relative,
+                    "sha256": hashlib.sha256(fixture_path.read_bytes()).hexdigest(),
+                    "validation": {"exists": True, "size": fixture_path.stat().st_size, "extension": file_extension},
+                    "evidence": {
+                        "source_kind": "openapi",
+                        "file": str(module_dir / "endpoints.yaml"),
+                        "symbol": endpoint_id,
+                        "line": 1,
+                        "endpoint_scope": [endpoint_id],
+                        "confidence": "high",
+                    },
+                })
+        if cases_changed:
+            updated = dict(case_doc) if isinstance(case_doc, dict) else {}
+            updated["cases"] = cases
+            cases_path.write_text(render_manifest(updated, cases_path), encoding="utf-8")
+            changed.append(cases_path)
+    manifest_path = generated_root / "manifest.yaml"
+    rendered_manifest = render_manifest({"version": 1, "fixtures": manifest_items}, manifest_path)
+    if not manifest_path.is_file() or manifest_path.read_text(encoding="utf-8", errors="strict") != rendered_manifest:
+        manifest_path.write_text(rendered_manifest, encoding="utf-8")
+        changed.append(manifest_path)
+    if manifest_items:
+        rendered_environment = render_runtime_environment(environment) + render_headers_block(environment)
+        if env_path.read_text(encoding="utf-8", errors="strict") != rendered_environment:
+            env_path.write_text(rendered_environment, encoding="utf-8")
+            changed.append(env_path)
+    return changed
+
+
 def materialize(
     contracts_root: Path,
     bruno_root: Path,
@@ -619,7 +856,8 @@ def materialize(
     modules_root = contracts_root / "modules"
     if not modules_root.is_dir():
         raise SystemExit(f"modules directory does not exist: {modules_root}")
-    config_path = execution_config_path or (contracts_root.parent / "execution" / "config.yaml")
+    qa_root = qa_root_for_contracts(contracts_root)
+    config_path = execution_config_path or (qa_root / "execution" / "config.yaml")
     try:
         load_execution_config(config_path)
     except ValueError as exc:
@@ -636,6 +874,8 @@ def materialize(
         created = []
         if COLLECTION_MARKER not in collection_path.read_text(encoding="utf-8", errors="strict"):
             raise SystemExit(f"collection runtime script is missing from {collection_path}")
+    if not dry_run and not module_filter:
+        created.extend(generate_fixtures(contracts_root, bruno_root, config_path))
     module_map_path = contracts_root / "module-map.yaml"
     module_map = load_data(module_map_path) if module_map_path.is_file() else {}
     module_metadata = {
@@ -913,7 +1153,7 @@ def materialize(
         if drift:
             raise SystemExit("materialize consistency check failed: " + ", ".join(str(path) for path in drift))
     if not dry_run and module_filter:
-        write_module_lock(contracts_root.parent, module_filter)
+        write_module_lock(qa_root, module_filter)
     return list(dict.fromkeys(created))
 
 
@@ -935,6 +1175,12 @@ def main() -> int:
         return 0
     if args.bruno_root is None:
         parser.error("bruno_root is required unless --sync-index is used")
+    qa_root = qa_root_for_contracts(args.contracts_root)
+    generation_errors = validate_stage(qa_root, "generation", module=args.module)
+    if generation_errors:
+        for error in generation_errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+        return 1
     created = materialize(
         args.contracts_root,
         args.bruno_root,
@@ -948,7 +1194,12 @@ def main() -> int:
     print(f"{action} {len(created)} Bruno/documentation artifact(s)")
     for path in created:
         print(path)
-    return 1 if args.check and created else 0
+    if args.check and created:
+        return 1
+    errors = validate_stage(qa_root, "materialization", module=args.module)
+    for error in errors:
+        print(f"ERROR: {error}", file=sys.stderr)
+    return 1 if errors else 0
 
 
 if __name__ == "__main__":

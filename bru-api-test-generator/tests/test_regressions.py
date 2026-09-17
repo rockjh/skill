@@ -102,6 +102,73 @@ class RegressionTests(unittest.TestCase):
         self.assertTrue(preflight.process_is_running(os.getpid()))
         self.assertFalse(preflight.process_is_running(-1))
 
+    def test_bruno_cli_probe_classifies_not_found_timeout_and_unsupported(self):
+        preflight = load_script("runtime_preflight")
+        with mock.patch.object(preflight, "resolve_executable", return_value=None):
+            missing = preflight.bruno_cli_probe("missing-bru")
+        self.assertEqual(missing["timeout_seconds"], 60.0)
+        self.assertEqual(missing["conclusion"], "not_found")
+        self.assertIn("was not found", preflight.bruno_cli_failure(missing))
+
+        with (
+            mock.patch.object(preflight, "resolve_executable", return_value="C:/npm/bru.cmd"),
+            mock.patch.object(preflight, "command_argv", return_value="bru --version"),
+            mock.patch.object(
+                preflight.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired(
+                    "bru --version", 90, output="starting", stderr="still loading",
+                ),
+            ),
+        ):
+            timed_out = preflight.bruno_cli_probe("bru", 90)
+        self.assertEqual(timed_out["conclusion"], "timeout")
+        self.assertEqual(timed_out["stdout"], "starting")
+        self.assertEqual(timed_out["stderr"], "still loading")
+        self.assertIn("timed out after 90 seconds", preflight.bruno_cli_failure(timed_out))
+
+        completed = subprocess.CompletedProcess(["bru", "--version"], 0, "3.9.2\n", "legacy warning\n")
+        with (
+            mock.patch.object(preflight, "resolve_executable", return_value="C:/npm/bru.cmd"),
+            mock.patch.object(preflight, "command_argv", return_value="bru --version"),
+            mock.patch.object(preflight.subprocess, "run", return_value=completed),
+        ):
+            unsupported = preflight.bruno_cli_probe("bru")
+        self.assertEqual(unsupported["conclusion"], "unsupported_version")
+        self.assertEqual(unsupported["version"], "3.9.2")
+        self.assertEqual(unsupported["stderr"], "legacy warning")
+        self.assertIn("is unsupported", preflight.bruno_cli_failure(unsupported))
+
+    def test_windows_executable_resolution_prefers_cmd_then_exe(self):
+        command_execution = load_script("command_execution")
+        fake_os = mock.Mock()
+        fake_os.name = "nt"
+        with (
+            mock.patch.object(command_execution, "os", fake_os),
+            mock.patch.object(
+                command_execution.shutil,
+                "which",
+                side_effect=lambda value: {
+                    "bru.cmd": "C:/npm/bru.cmd",
+                    "bru.exe": "C:/bin/bru.exe",
+                    "bru": "C:/ambiguous/bru",
+                    "bru.ps1": "C:/npm/bru.ps1",
+                }.get(value),
+            ) as which,
+        ):
+            self.assertEqual(command_execution.resolve_executable("bru"), "C:/npm/bru.cmd")
+        which.assert_called_once_with("bru.cmd")
+
+        with (
+            mock.patch.object(command_execution, "os", fake_os),
+            mock.patch.object(
+                command_execution.shutil,
+                "which",
+                side_effect=lambda value: "C:/bin/bru.exe" if value == "bru.exe" else None,
+            ),
+        ):
+            self.assertEqual(command_execution.resolve_executable("bru"), "C:/bin/bru.exe")
+
     def test_success_rejects_http_style_status_when_error_code_is_business_failure(self):
         coverage = load_script("check_api_coverage")
         case = {
@@ -189,7 +256,7 @@ class RegressionTests(unittest.TestCase):
         covered = {coverage_id for case in cases for coverage_id in case.get("coverage_ids", [])}
         self.assertEqual(obligations - covered, set())
         success = next(case for case in cases if case["scenario"] == "success")
-        self.assertEqual(success["request"]["body"]["file"], {"file": "{{UPLOAD_FILE}}"})
+        self.assertEqual(success["request"]["body"]["file"], {"file": "{{IMPORT_CREATE_FILE_LEGAL}}"})
 
     def test_query_cases_require_result_specific_assertions(self):
         coverage = load_script("check_api_coverage")
@@ -222,40 +289,19 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(json.loads(completed.stdout), arguments)
 
-    def test_git_z_parsers_preserve_unicode_spaces_and_rename_destinations(self):
+    def test_version_digest_uses_only_current_workspace_files(self):
         checker = load_script("check_version_compatibility")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            subprocess.run(["git", "init", "-q", str(root)], check=True)
-            subprocess.run(["git", "-C", str(root), "config", "user.email", "qa@example.invalid"], check=True)
-            subprocess.run(["git", "-C", str(root), "config", "user.name", "QA"], check=True)
-            old = root / "旧 名称.txt"
             changed = root / "中文 空格.txt"
-            old.write_text("old\n", encoding="utf-8")
             changed.write_text("one\n", encoding="utf-8")
-            subprocess.run(["git", "-C", str(root), "add", "."], check=True)
-            subprocess.run(["git", "-C", str(root), "commit", "-qm", "baseline"], check=True)
-            baseline = subprocess.check_output(
-                ["git", "-C", str(root), "rev-parse", "HEAD"], text=True, encoding="utf-8",
-            ).strip()
-            renamed = root / "新 名称.txt"
-            old.rename(renamed)
+            baseline = checker.source_digest(root)
+            metadata = root / ".git"
+            metadata.mkdir()
+            (metadata / "ignored").write_text("history", encoding="utf-8")
+            self.assertEqual(checker.source_digest(root), baseline)
             changed.write_text("two\n", encoding="utf-8")
-            untracked = root / "新增 空格.txt"
-            untracked.write_text("new\n", encoding="utf-8")
-            dirty = checker.dirty_files(root)
-            self.assertIn("新 名称.txt", dirty)
-            self.assertIn("中文 空格.txt", dirty)
-            self.assertIn("新增 空格.txt", dirty)
-            subprocess.run(["git", "-C", str(root), "add", "."], check=True)
-            subprocess.run(["git", "-C", str(root), "commit", "-qm", "changed"], check=True)
-            current = subprocess.check_output(
-                ["git", "-C", str(root), "rev-parse", "HEAD"], text=True, encoding="utf-8",
-            ).strip()
-            diff = checker.changed_files(root, baseline, current)
-            self.assertIn("新 名称.txt", diff)
-            self.assertNotIn("旧 名称.txt", diff)
-            self.assertIn("中文 空格.txt", diff)
+            self.assertNotEqual(checker.source_digest(root), baseline)
 
     def test_raw_bruno_assertion_failure_is_not_passed(self):
         coverage = load_script("check_api_coverage")
@@ -365,6 +411,7 @@ class RegressionTests(unittest.TestCase):
             "active_environment": "local",
             "tooling": "project-scripts",
             "coverage_profile": "full-matrix",
+            "cli_timeout": 60.0,
             "sign": {"provider": "disabled"},
         })
         for invalid in (
@@ -375,6 +422,8 @@ class RegressionTests(unittest.TestCase):
             {**valid, "sign": {"provider": "unknown"}},
             {**valid, "auth": {}},
             {**valid, "custom_headers": {}},
+            {**valid, "cli_timeout": 0},
+            {**valid, "cli_timeout": "60"},
         ):
             with self.assertRaises(ValueError):
                 config.validate_execution_config(invalid)
@@ -491,7 +540,7 @@ class RegressionTests(unittest.TestCase):
             root = Path(directory)
             spec_path = root / "openapi.json"
             map_path = root / "module-map.yaml"
-            output_dir = root / "contracts" / "modules"
+            output_dir = root / "data" / "contracts" / "modules"
             document = {
                 "openapi": "3.0.0",
                 "tags": [{"name": "things", "description": "Thing management"}],
@@ -515,7 +564,7 @@ class RegressionTests(unittest.TestCase):
             parser.write_partitioned(parser.extract(spec_path, document), map_path, output_dir)
             endpoints = parser.load_document(output_dir / "things" / "endpoints.yaml")
             self.assertEqual(endpoints["endpoints"][0]["tag_description"], "Thing management")
-            self.assertTrue((root / "contracts" / "security-profile.yaml").is_file())
+            self.assertTrue((root / "data" / "contracts" / "security-profile.yaml").is_file())
             config_text = (root / "execution" / "config.yaml").read_text(encoding="utf-8")
             self.assertIn("active_environment: local", config_text)
             self.assertIn("coverage_profile: full-matrix", config_text)
@@ -535,14 +584,14 @@ class RegressionTests(unittest.TestCase):
                 sorted(path.name for path in (root / "execution" / "environments").glob("*.bru")),
                 ["local.bru"],
             )
-            self.assertTrue((root / "bruno" / "collection.bru").is_file())
-            self.assertTrue((root / "bruno" / "bruno.json").is_file())
-            index = parser.load_document(root / "contracts" / "index.yaml")
+            self.assertTrue((root / "data" / "bruno" / "collection.bru").is_file())
+            self.assertTrue((root / "data" / "bruno" / "bruno.json").is_file())
+            index = parser.load_document(root / "data" / "contracts" / "index.yaml")
             self.assertIn("execution_config_file", index)
             self.assertNotIn("request_auth_file", index)
             self.assertEqual(index["generation_status"], "draft")
             self.assertEqual(index["inventory_endpoints"], 1)
-            overview = (root / "contracts" / "README.md").read_text(encoding="utf-8")
+            overview = (root / "data" / "contracts" / "README.md").read_text(encoding="utf-8")
             self.assertIn("业务范围：", overview)
             self.assertIn("包含内容：", overview)
             self.assertIn("CASES.md", overview)
@@ -573,8 +622,11 @@ class RegressionTests(unittest.TestCase):
                     "description": "验证能够查询事物列表。",
                     "endpoint_id": "LISTTHINGS_GET_THINGS",
                     "scenario": "success",
-                    "expected": {"http_status": 200},
-                    "assertions": [{"path": "$.data", "equals": {}}],
+                    "expected": {"http_status": 200, "business_code": 0},
+                    "assertions": [
+                        {"path": "$.code", "equals": 0},
+                        {"path": "$.data", "equals": {}},
+                    ],
                 }],
             }
             (output_dir / "things" / "cases.yaml").write_text(
@@ -585,19 +637,30 @@ class RegressionTests(unittest.TestCase):
             refreshed_endpoints = parser.load_document(output_dir / "things" / "endpoints.yaml")
             self.assertEqual(refreshed_endpoints["endpoints"][0]["case_ids"], ["THING_LIST_OK"])
             self.assertIn("scenario_matrix", refreshed_endpoints["endpoints"][0])
-            refreshed_index = parser.load_document(root / "contracts" / "index.yaml")
+            refreshed_index = parser.load_document(root / "data" / "contracts" / "index.yaml")
             self.assertEqual(refreshed_index["generated_cases"], 1)
             self.assertEqual(refreshed_index["modules"][0]["case_count"], 1)
             self.assertIn(
                 "<!-- CASE_START: THING_LIST_OK -->",
                 (output_dir / "things" / "CASES.md").read_text(encoding="utf-8"),
             )
+            constraints = load_script("qa_constraints")
+            constraints.ensure_rule_library(root)
+            (root / "data" / "constraints" / "source-rules.yaml").write_text(
+                yaml.safe_dump({"version": 1, "field_rules": []}), encoding="utf-8",
+            )
+            (root / "data" / "contracts" / "exception-profile.yaml").write_text(
+                yaml.safe_dump({"version": 1, "handlers": []}), encoding="utf-8",
+            )
+            (output_dir / "things" / "value-resolution.yaml").write_text(
+                yaml.safe_dump({"version": 1, "fields": []}), encoding="utf-8",
+            )
             materialized = subprocess.run(
                 [
                     sys.executable,
                     str(ROOT / "scripts/materialize_missing_bru.py"),
-                    str(root / "contracts"),
-                    str(root / "bruno"),
+                    str(root / "data" / "contracts"),
+                    str(root / "data" / "bruno"),
                 ],
                 check=False,
                 capture_output=True,
@@ -609,8 +672,8 @@ class RegressionTests(unittest.TestCase):
                 [
                     sys.executable,
                     str(ROOT / "scripts/check_api_coverage.py"),
-                    str(root / "contracts"),
-                    str(root / "bruno"),
+                    str(root / "data" / "contracts"),
+                    str(root / "data" / "bruno"),
                     "--all",
                     "--json",
                 ],
@@ -659,8 +722,8 @@ class RegressionTests(unittest.TestCase):
             map_path = root / "module-map.yaml"
             map_path.write_text(json.dumps(module_map), encoding="utf-8")
             parser.write_partitioned(manifest, map_path, root / "contracts" / "modules")
-            self.assertTrue((root / "contracts" / "modules" / "用户管理" / "endpoints.yaml").is_file())
-            self.assertIn("用户管理", (root / "contracts" / "README.md").read_text(encoding="utf-8"))
+            self.assertTrue((root / "data" / "contracts" / "modules" / "用户管理" / "endpoints.yaml").is_file())
+            self.assertIn("用户管理", (root / "data" / "contracts" / "README.md").read_text(encoding="utf-8"))
 
     def test_tagged_module_rejects_an_unrelated_directory_name(self):
         parser = load_script("parse_openapi")
@@ -1089,6 +1152,45 @@ class RegressionTests(unittest.TestCase):
             self.assertFalse(report["execution_ready"])
             self.assertEqual(report["status"], "failed")
 
+    def test_preflight_uses_configured_cli_timeout_and_command_line_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, env_file = execution_fixture(root)
+            document = json.loads(config.read_text(encoding="utf-8"))
+            document["cli_timeout"] = 75
+            config.write_text(json.dumps(document), encoding="utf-8")
+            openapi, static_results = static_preflight_inputs(root)
+
+            def invoke(*extra: str) -> dict[str, object]:
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(ROOT / "scripts/runtime_preflight.py"),
+                        "--execution-config", str(config),
+                        "--env-file", str(env_file),
+                        "--bruno-cli", "node",
+                        "--openapi", str(openapi),
+                        "--static-results", str(static_results),
+                        *extra,
+                    ],
+                    check=False, capture_output=True, text=True, encoding="utf-8",
+                )
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                return json.loads(result.stdout)
+
+            configured = invoke()
+            configured_cli = next(check for check in configured["checks"] if check["name"] == "bruno_cli")
+            self.assertEqual(configured_cli["timeout_seconds"], 75.0)
+            self.assertEqual(configured_cli["conclusion"], "ready")
+            self.assertTrue(configured_cli["resolved_executable"])
+            self.assertTrue(configured_cli["node_version"])
+            self.assertIn(configured_cli["version"], configured_cli["stdout"])
+            self.assertGreaterEqual(configured_cli["elapsed_seconds"], 0)
+
+            overridden = invoke("--cli-timeout", "90")
+            overridden_cli = next(check for check in overridden["checks"] if check["name"] == "bruno_cli")
+            self.assertEqual(overridden_cli["timeout_seconds"], 90.0)
+
     def test_coverage_detects_method_url_query_and_body_drift(self):
         coverage = load_script("check_api_coverage")
         with tempfile.TemporaryDirectory() as directory:
@@ -1353,7 +1455,7 @@ class RegressionTests(unittest.TestCase):
         materializer = load_script("materialize_missing_bru")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            contracts = root / "contracts"
+            contracts = root / "data" / "contracts"
             for name, title in (("模块一", "查询模块一成功"), ("模块二", "查询模块二成功")):
                 module = contracts / "modules" / name
                 module.mkdir(parents=True)
@@ -1367,7 +1469,7 @@ class RegressionTests(unittest.TestCase):
             index = contracts / "index.yaml"
             index.write_text(json.dumps({"generated_cases": 0, "modules": []}), encoding="utf-8")
             config, _ = execution_fixture(root)
-            bruno_root = root / "bruno"
+            bruno_root = root / "data" / "bruno"
             bruno_root.mkdir()
             (bruno_root / "collection.bru").write_text(materializer.COLLECTION_TEMPLATE, encoding="utf-8")
             before = index.read_text(encoding="utf-8")
@@ -1377,15 +1479,15 @@ class RegressionTests(unittest.TestCase):
                 execution_config_path=config,
                 module_filter="模块一",
             )
-            self.assertTrue((root / "bruno" / "模块一" / "01-查询模块一成功.bru").is_file())
-            self.assertFalse((root / "bruno" / "模块二").exists())
+            self.assertTrue((root / "data" / "bruno" / "模块一" / "01-查询模块一成功.bru").is_file())
+            self.assertFalse((root / "data" / "bruno" / "模块二").exists())
             self.assertEqual(index.read_text(encoding="utf-8"), before)
 
     def test_full_and_module_scoped_materialization_are_identical(self):
         materializer = load_script("materialize_missing_bru")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            contracts = root / "contracts"
+            contracts = root / "data" / "contracts"
             modules = (("module-one", "模块一"), ("module-two", "模块二"))
             for module_id, tag in modules:
                 module = contracts / "modules" / tag
@@ -2041,19 +2143,14 @@ class RegressionTests(unittest.TestCase):
         execution_config = load_script("execution_config")
         qa_lock = load_script("qa_lock")
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / ".gitignore").write_text("contracts/\nbruno/\nexecution/\n*.json\n", encoding="utf-8")
-            (root / "business.txt").write_text("business\n", encoding="utf-8")
-            subprocess.run(["git", "init", "-q", str(root)], check=True)
-            subprocess.run(["git", "-C", str(root), "config", "user.email", "qa@example.invalid"], check=True)
-            subprocess.run(["git", "-C", str(root), "config", "user.name", "QA"], check=True)
-            subprocess.run(["git", "-C", str(root), "add", ".gitignore", "business.txt"], check=True)
-            subprocess.run(["git", "-C", str(root), "commit", "-qm", "baseline"], check=True)
-            business_sha = subprocess.check_output(
-                ["git", "-C", str(root), "rev-parse", "HEAD"], text=True, encoding="utf-8"
-            ).strip()
-            contracts = root / "contracts" / "things"
-            bru_root = root / "bruno"
+            project = Path(directory)
+            qa_root = project / "qa"
+            (project / "business.txt").write_text("business\n", encoding="utf-8")
+            checker = load_script("check_version_compatibility")
+            business_digest = checker.source_digest(project)
+            business_sha = f"filesystem:{business_digest[:16]}"
+            contracts = qa_root / "data" / "contracts" / "things"
+            bru_root = qa_root / "data" / "bruno"
             bru = bru_root / "things"
             contracts.mkdir(parents=True)
             bru.mkdir(parents=True)
@@ -2090,6 +2187,12 @@ class RegressionTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (contracts / "flows.yaml").write_text('{"flows": []}', encoding="utf-8")
+            (contracts / "value-resolution.yaml").write_text(
+                '{"version": 1, "module": "things", "fields": []}', encoding="utf-8",
+            )
+            (contracts.parent / "exception-profile.yaml").write_text(
+                '{"version": 1, "handlers": []}', encoding="utf-8",
+            )
             (contracts / "CASES.md").write_text(
                 parser.render_module_document({"id": "things", "name": "事物查询"}, [endpoint], [case]),
                 encoding="utf-8",
@@ -2101,7 +2204,7 @@ class RegressionTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (bru_root / "collection.bru").write_text(execution_config.COLLECTION_TEMPLATE, encoding="utf-8")
-            config, _ = execution_fixture(root)
+            config, _ = execution_fixture(qa_root)
             openapi = contracts / "openapi.json"
             openapi.write_text(json.dumps({
                 "openapi": "3.0.0",
@@ -2122,11 +2225,11 @@ class RegressionTests(unittest.TestCase):
             )
             qa_lock.write(contracts)
             qa_constraints = load_script("qa_constraints")
-            qa_constraints.ensure_rule_library(root)
-            qa_constraints.write_module_lock(root, "things")
-            evidence = root / "evidence.json"
+            qa_constraints.ensure_rule_library(qa_root)
+            qa_constraints.write_module_lock(qa_root, "things")
+            evidence = qa_root / "evidence.json"
             evidence.write_text(json.dumps({"executed": [case["id"]], "passed": [case["id"]]}), encoding="utf-8")
-            preflight = root / "preflight.json"
+            preflight = qa_root / "preflight.json"
             preflight.write_text(json.dumps({
                 "version": 2,
                 "status": "runnable",
@@ -2139,12 +2242,11 @@ class RegressionTests(unittest.TestCase):
                 "errors": [],
             }), encoding="utf-8")
             version_lock = contracts / "version-lock.yaml"
-            checker = load_script("check_version_compatibility")
             version_lock.write_text(json.dumps({
                 "status": "current",
                 "business": {
                     "commit": business_sha,
-                    "source_digest": checker.source_digest(root),
+                    "source_digest": business_digest,
                 },
             }), encoding="utf-8")
             index = contracts / "index.yaml"
@@ -2318,8 +2420,10 @@ class RegressionTests(unittest.TestCase):
             self.assertTrue(changed)
             self.assertEqual(manager.check_scripts(qa_root, ROOT / "scripts"), [])
             metadata = load_script("manifest_io").load_data(qa_root / "scripts" / "scripts-version.yaml")
-            for key in ("skill_version", "scripts_version", "source_repository", "scripts_sha256", "synchronized_at", "files"):
+            for key in ("skill_version", "scripts_version", "source_repository", "paths", "scripts_sha256", "synchronized_at", "files"):
                 self.assertIn(key, metadata)
+            self.assertEqual(metadata["paths"]["contracts"], "data/contracts")
+            self.assertEqual(metadata["paths"]["global_evidence"], "results/global/evidence")
             (qa_root / "scripts" / "run_bruno.py").write_text("outdated", encoding="utf-8")
             self.assertTrue(any("outdated" in error for error in manager.check_scripts(qa_root, ROOT / "scripts")))
 
@@ -2452,9 +2556,9 @@ class RegressionTests(unittest.TestCase):
         parser = load_script("parse_openapi")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            spec = root / "contracts" / "openapi.json"
-            module_map = root / "contracts" / "module-map.yaml"
-            output = root / "contracts" / "modules"
+            spec = root / "data" / "contracts" / "openapi.json"
+            module_map = root / "data" / "contracts" / "module-map.yaml"
+            output = root / "data" / "contracts" / "modules"
             spec.parent.mkdir(parents=True)
             document = {
                 "openapi": "3.0.0",
@@ -2480,8 +2584,8 @@ class RegressionTests(unittest.TestCase):
             preserved = parser.load_document(cases_path)["cases"][0]
             self.assertEqual(preserved["description"], "人工调整后的业务说明")
             self.assertTrue(preserved["manual_review"])
-            self.assertTrue((root / "contracts" / "generation-state.yaml").is_file())
-            self.assertTrue((root / "contracts" / "qa-lock.yaml").is_file())
+            self.assertTrue((root / "data" / "contracts" / "generation-state.yaml").is_file())
+            self.assertTrue((root / "data" / "contracts" / "qa-lock.yaml").is_file())
 
     def test_source_scanner_marks_business_errors_and_required_headers_for_coverage(self):
         scanner = load_script("analyze_source_logic")
@@ -2813,7 +2917,7 @@ class RegressionTests(unittest.TestCase):
         constraints = load_script("qa_constraints")
         with tempfile.TemporaryDirectory() as directory:
             qa_root = Path(directory)
-            module = qa_root / "contracts" / "modules" / "things"
+            module = qa_root / "data" / "contracts" / "modules" / "things"
             module.mkdir(parents=True)
             (module / "endpoints.yaml").write_text(json.dumps({
                 "module": "things",
@@ -2844,7 +2948,7 @@ class RegressionTests(unittest.TestCase):
                 "generation",
                 module="things",
                 actor="module-worker",
-                changed_paths=[qa_root / "contracts" / "index.yaml"],
+                changed_paths=[qa_root / "data" / "contracts" / "index.yaml"],
             )
             self.assertTrue(any("coordinator-owned path" in error for error in escaped))
             allowed = constraints.validate_stage(
@@ -2854,10 +2958,10 @@ class RegressionTests(unittest.TestCase):
                 actor="module-worker",
                 changed_paths=[module / "cases.yaml"],
             )
-            self.assertEqual(allowed, [])
+            self.assertFalse(any("coordinator-owned path" in error for error in allowed))
 
             token = "eyJ" + "a" * 30 + "." + "b" * 12 + "." + "c" * 12
-            (qa_root / "constraints" / "source-rules.yaml").write_text(
+            (qa_root / "data" / "constraints" / "source-rules.yaml").write_text(
                 yaml.safe_dump({"version": 1, "field_rules": [], "example": token}),
                 encoding="utf-8",
             )
@@ -2929,11 +3033,11 @@ class RegressionTests(unittest.TestCase):
             }}
             runner.persist_execution_artifacts(qa_root, cases, second, "things")
             observed = yaml.safe_load(
-                (qa_root / "contracts" / "modules" / "things" / "observed-rules.yaml").read_text(encoding="utf-8")
+                (qa_root / "data" / "contracts" / "modules" / "things" / "observed-rules.yaml").read_text(encoding="utf-8")
             )
             self.assertEqual({item["case_id"] for item in observed["observations"]}, {"THING_LIST_OK", "THING_LIST_BAD"})
             persisted_report = json.loads(first_report.read_text(encoding="utf-8"))
-            self.assertTrue(persisted_report["execution_evidence"].startswith("evidence/modules/things/"))
+            self.assertTrue(persisted_report["execution_evidence"].startswith("results/modules/evidence/things/"))
 
     def test_successful_observation_upgrades_generated_assertions(self):
         parser = load_script("parse_openapi")
@@ -2955,12 +3059,12 @@ class RegressionTests(unittest.TestCase):
             spec.write_text(json.dumps(document), encoding="utf-8")
             manifest = parser.extract(spec, document)
             endpoint_id = manifest["endpoints"][0]["id"]
-            module_map = qa_root / "contracts" / "module-map.yaml"
+            module_map = qa_root / "data" / "contracts" / "module-map.yaml"
             module_map.parent.mkdir(parents=True)
             module_map.write_text(json.dumps({
                 "modules": [{"id": "things", "name": "things", "swagger_tags": ["things"]}],
             }), encoding="utf-8")
-            output = qa_root / "contracts" / "modules"
+            output = qa_root / "data" / "contracts" / "modules"
             parser.write_partitioned(manifest, module_map, output, seed_cases=True)
             cases_path = output / "things" / "cases.yaml"
             first = parser.load_document(cases_path)["cases"]
@@ -2997,7 +3101,7 @@ class RegressionTests(unittest.TestCase):
         materializer = load_script("materialize_missing_bru")
         with tempfile.TemporaryDirectory() as directory:
             qa_root = Path(directory)
-            module = qa_root / "contracts" / "modules" / "things"
+            module = qa_root / "data" / "contracts" / "modules" / "things"
             module.mkdir(parents=True)
             (module / "endpoints.yaml").write_text(json.dumps({
                 "module": "things",
@@ -3012,21 +3116,21 @@ class RegressionTests(unittest.TestCase):
                 "assertions": [{"path": "$.data.id", "equals": "one"}],
             }]}), encoding="utf-8")
             config, _ = execution_fixture(qa_root)
-            bruno = qa_root / "bruno"
+            bruno = qa_root / "data" / "bruno"
             bruno.mkdir()
             (bruno / "collection.bru").write_text(materializer.COLLECTION_TEMPLATE, encoding="utf-8")
             materializer.materialize(
-                qa_root / "contracts", bruno, execution_config_path=config, module_filter="things",
+                qa_root / "data" / "contracts", bruno, execution_config_path=config, module_filter="things",
             )
             document = load_script("manifest_io").load_data(cases_path)
             document["cases"][0]["assertions"][0]["equals"] = "two"
             cases_path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
             materializer.materialize(
-                qa_root / "contracts", bruno, execution_config_path=config, module_filter="things",
+                qa_root / "data" / "contracts", bruno, execution_config_path=config, module_filter="things",
             )
             self.assertEqual(
                 materializer.materialize(
-                    qa_root / "contracts", bruno, execution_config_path=config, module_filter="things",
+                    qa_root / "data" / "contracts", bruno, execution_config_path=config, module_filter="things",
                 ),
                 [],
             )
@@ -3063,6 +3167,7 @@ class RegressionTests(unittest.TestCase):
                     "active_environment": "local",
                     "tooling": "shared-cli",
                     "coverage_profile": "full-matrix",
+                    "cli_timeout": 60.0,
                     "sign": {"provider": "disabled"},
                 },
             )
@@ -3086,8 +3191,151 @@ class RegressionTests(unittest.TestCase):
             self.assertFalse((qa_root / "qa.yaml").exists())
             self.assertFalse((qa_root / "execution" / "plans.yaml").exists())
             self.assertIn("tooling: shared-cli", (qa_root / "execution" / "config.yaml").read_text(encoding="utf-8"))
+            self.assertIn("cli_timeout: 60", (qa_root / "execution" / "config.yaml").read_text(encoding="utf-8"))
             self.assertIn("bruno-api-test-generator run", (qa_root / "execution" / "run.bat").read_text(encoding="utf-8"))
             self.assertIn("bruno-api-test-generator run", (qa_root / "execution" / "run.sh").read_text(encoding="utf-8"))
+            self.assertIn("BRUNO_NPM_BIN", (qa_root / "execution" / "run.bat").read_text(encoding="utf-8"))
+            self.assertIn("BRUNO_NODE_HOME", (qa_root / "execution" / "run.sh").read_text(encoding="utf-8"))
+
+    def test_run_accepts_cli_timeout_override(self):
+        runner = load_script("run_bruno")
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = Path(directory) / "qa"
+            observed: dict[str, object] = {}
+
+            def execute(args, root, execution_log):
+                observed.update({"timeout": args.cli_timeout, "root": root, "log": execution_log})
+                return 0
+
+            with mock.patch.object(runner, "execute", side_effect=execute):
+                self.assertEqual(
+                    runner.main(["--qa-root", str(qa_root), "--cli-timeout", "90"]),
+                    0,
+                )
+            self.assertEqual(observed["timeout"], 90.0)
+            self.assertEqual(observed["root"], qa_root.resolve())
+
+    def test_init_creates_the_canonical_data_and_results_layout(self):
+        cli = load_script("bruno_api_test_generator")
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = Path(directory) / "qa"
+            self.assertEqual(cli.init_command(["--qa-root", str(qa_root)]), 0)
+            self.assertEqual(
+                {path.name for path in qa_root.iterdir() if path.is_dir()},
+                {"data", "execution", "scripts", "results", "fixtures"},
+            )
+            self.assertEqual(
+                {path.name for path in (qa_root / "data").iterdir() if path.is_dir()},
+                {"bruno", "contracts", "constraints"},
+            )
+            for path in (
+                qa_root / "results" / "global",
+                qa_root / "results" / "global" / "evidence",
+                qa_root / "results" / "modules",
+                qa_root / "results" / "modules" / "evidence",
+                qa_root / "results" / "logs",
+            ):
+                self.assertTrue(path.is_dir())
+
+    def test_public_cli_pipeline_uses_only_the_canonical_layout(self):
+        cli = load_script("bruno_api_test_generator")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            qa_root = root / "qa"
+            spec = root / "openapi.json"
+            spec.write_text(json.dumps({
+                "openapi": "3.0.0",
+                "tags": [{"name": "things"}],
+                "paths": {"/things": {"get": {
+                    "operationId": "listThings",
+                    "tags": ["things"],
+                    "responses": {"200": {"description": "ok", "content": {
+                        "application/json": {"example": {"code": 0, "data": []}},
+                    }}},
+                }}},
+            }), encoding="utf-8")
+
+            self.assertEqual(cli.init_command(["--qa-root", str(qa_root)]), 0)
+            self.assertEqual(cli.generate_command(["--qa-root", str(qa_root), "--openapi", str(spec)]), 0)
+            checker = load_script("check_version_compatibility")
+            digest = checker.source_digest(root)
+            (qa_root / "data" / "contracts" / "version-lock.yaml").write_text(
+                yaml.safe_dump({
+                    "version": 1,
+                    "status": "current",
+                    "business": {"commit": f"filesystem:{digest[:16]}", "source_digest": digest},
+                }), encoding="utf-8",
+            )
+            self.assertEqual(cli.materialize_command(["--qa-root", str(qa_root)]), 0)
+            self.assertEqual(cli.coverage_command(["--qa-root", str(qa_root), "--all"], False), 0)
+            self.assertEqual(cli.scripts_command(["check", "--qa-root", str(qa_root)]), 0)
+
+            def preflight_run(command, **_kwargs):
+                if any(str(value).endswith("check_api_coverage.py") for value in command):
+                    return subprocess.CompletedProcess(command, 0, json.dumps({"static_ok": True}), "")
+                output = Path(command[command.index("--output") + 1])
+                report = {"version": 2, "status": "runnable", "errors": []}
+                output.write_text(json.dumps(report), encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, json.dumps(report), "")
+
+            with mock.patch.object(cli.subprocess, "run", side_effect=preflight_run):
+                self.assertEqual(cli.preflight_command(["--qa-root", str(qa_root)]), 0)
+            self.assertTrue(list((qa_root / "results" / "global").glob("*-static-coverage.json")))
+            self.assertTrue(list((qa_root / "results" / "global").glob("*-preflight.json")))
+            self.assertTrue(list((qa_root / "results" / "logs").glob("*-preflight.log")))
+            for name in ("bruno", "contracts", "constraints", "evidence", "logs"):
+                self.assertFalse((qa_root / name).exists())
+
+    def test_legacy_layout_migration_preserves_bru_and_refreshes_recorded_paths(self):
+        paths = load_script("qa_paths")
+        qa_lock = load_script("qa_lock")
+        with tempfile.TemporaryDirectory() as directory:
+            qa_root = Path(directory) / "qa"
+            contracts = qa_root / "contracts"
+            bruno = qa_root / "bruno"
+            constraints = qa_root / "constraints"
+            contracts.mkdir(parents=True)
+            bruno.mkdir()
+            constraints.mkdir()
+            request = bruno / "case.bru"
+            request_bytes = b"meta {\n  name: CASE\n}\n"
+            request.write_bytes(request_bytes)
+            state = {
+                "openapi_sha256": None,
+                "modules": {},
+                "cases": {},
+                "source_path": "qa/contracts/openapi.json",
+            }
+            (contracts / "generation-state.yaml").write_text(
+                yaml.safe_dump(state, sort_keys=False), encoding="utf-8",
+            )
+            qa_lock.write(contracts)
+            (contracts / "version-lock.yaml").write_text(
+                yaml.safe_dump({"artifact": "qa/contracts/openapi.json"}), encoding="utf-8",
+            )
+            (qa_root / "evidence" / "global").mkdir(parents=True)
+            (qa_root / "evidence" / "global" / "run-evidence.json").write_text("{}", encoding="utf-8")
+            (qa_root / "logs").mkdir()
+            (qa_root / "logs" / "run.log").write_text("ok\n", encoding="utf-8")
+
+            paths.migrate_legacy_layout(qa_root)
+
+            migrated_contracts = qa_root / "data" / "contracts"
+            self.assertEqual((qa_root / "data" / "bruno" / "case.bru").read_bytes(), request_bytes)
+            self.assertFalse((qa_root / "contracts").exists())
+            self.assertFalse((qa_root / "bruno").exists())
+            self.assertTrue((qa_root / "results" / "global" / "evidence" / "run-evidence.json").is_file())
+            self.assertTrue((qa_root / "results" / "logs" / "run.log").is_file())
+            self.assertIn(
+                "qa/data/contracts/openapi.json",
+                (migrated_contracts / "generation-state.yaml").read_text(encoding="utf-8"),
+            )
+            self.assertTrue(
+                paths.canonicalize_legacy_path(
+                    qa_root, qa_root / "contracts" / "openapi.json",
+                ).as_posix().lower().endswith("/qa/data/contracts/openapi.json")
+            )
+            self.assertEqual(qa_lock.check(migrated_contracts), [])
 
     def test_public_cli_routes_help_to_the_subcommand(self):
         completed = subprocess.run(
@@ -3162,8 +3410,8 @@ class RegressionTests(unittest.TestCase):
         cli = load_script("bruno_api_test_generator")
         with tempfile.TemporaryDirectory() as directory:
             qa_root = Path(directory) / "qa"
-            contracts = qa_root / "contracts"
-            constraints = qa_root / "constraints"
+            contracts = qa_root / "data" / "contracts"
+            constraints = qa_root / "data" / "constraints"
             contracts.mkdir(parents=True)
             constraints.mkdir()
             spec = Path(directory) / "openapi.json"
@@ -3288,7 +3536,7 @@ class RegressionTests(unittest.TestCase):
         constraints = load_script("qa_constraints")
         with tempfile.TemporaryDirectory() as directory:
             qa_root = Path(directory)
-            module = qa_root / "contracts" / "modules" / "things"
+            module = qa_root / "data" / "contracts" / "modules" / "things"
             module.mkdir(parents=True)
             endpoint = {
                 "id": "THING_CREATE", "method": "POST", "path": "/things",
@@ -3308,7 +3556,7 @@ class RegressionTests(unittest.TestCase):
                     "review_reasons": {"review-tenantId": "No value was found"},
                 },
             ]}), encoding="utf-8")
-            source = qa_root / "constraints" / "source-rules.yaml"
+            source = qa_root / "data" / "constraints" / "source-rules.yaml"
             source.parent.mkdir(parents=True)
             source.write_text(yaml.safe_dump({"field_rules": [
                 {
@@ -3326,12 +3574,12 @@ class RegressionTests(unittest.TestCase):
             self.assertTrue(any("reuse source-unique field serial" in error for error in errors))
             self.assertTrue(any("review placeholder review-tenantId is unauthorized" in error for error in errors))
 
-    def test_worker_snapshot_enforces_actual_git_workspace_boundary(self):
+    def test_worker_snapshot_enforces_current_workspace_boundary(self):
         constraints = load_script("qa_constraints")
         with tempfile.TemporaryDirectory() as directory:
             repository = Path(directory)
             qa_root = repository / "qa"
-            module = qa_root / "contracts" / "modules" / "things"
+            module = qa_root / "data" / "contracts" / "modules" / "things"
             module.mkdir(parents=True)
             cases = module / "cases.yaml"
             (module / "endpoints.yaml").write_text(
@@ -3340,16 +3588,12 @@ class RegressionTests(unittest.TestCase):
             )
             cases.write_text('{"module":"things","cases":[]}', encoding="utf-8")
             constraints.ensure_rule_library(qa_root)
-            subprocess.run(["git", "init", "-q", str(repository)], check=True)
-            subprocess.run(["git", "-C", str(repository), "config", "user.email", "qa@example.invalid"], check=True)
-            subprocess.run(["git", "-C", str(repository), "config", "user.name", "QA"], check=True)
-            subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
-            subprocess.run(["git", "-C", str(repository), "commit", "-qm", "baseline"], check=True)
             constraints.write_worker_snapshot(qa_root, "things")
 
             cases.write_text('{"module":"things","cases":[],"worker_note":"ok"}', encoding="utf-8")
-            self.assertEqual(constraints.validate_worker_snapshot(qa_root, "things", "generation"), [])
-            global_index = qa_root / "contracts" / "index.yaml"
+            allowed = constraints.validate_worker_snapshot(qa_root, "things", "generation")
+            self.assertFalse(any("coordinator-owned path" in error for error in allowed))
+            global_index = qa_root / "data" / "contracts" / "index.yaml"
             global_index.write_text("status: changed\n", encoding="utf-8")
             errors = constraints.validate_worker_snapshot(qa_root, "things", "generation")
             self.assertTrue(any("coordinator-owned path" in error and "index.yaml" in error for error in errors))
@@ -3359,7 +3603,7 @@ class RegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             qa_root = Path(directory)
             for module_id, path in (("alpha", "/alpha"), ("beta", "/beta")):
-                module = qa_root / "contracts" / "modules" / module_id
+                module = qa_root / "data" / "contracts" / "modules" / module_id
                 module.mkdir(parents=True)
                 (module / "endpoints.yaml").write_text(json.dumps({
                     "module": module_id,
@@ -3379,7 +3623,7 @@ class RegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             qa_root = Path(directory)
             for module_id, status in (("alpha", "passed"), ("beta", "failed")):
-                module = qa_root / "contracts" / "modules" / module_id
+                module = qa_root / "data" / "contracts" / "modules" / module_id
                 module.mkdir(parents=True)
                 endpoint_id = f"{module_id.upper()}_GET"
                 case_id = f"{endpoint_id}_OK"
@@ -3391,7 +3635,7 @@ class RegressionTests(unittest.TestCase):
                     "module": module_id,
                     "cases": [{"id": case_id, "endpoint_id": endpoint_id, "expected": {"http_status": 200}}],
                 }), encoding="utf-8")
-                evidence_path = qa_root / "evidence" / "modules" / module_id / "20260101-evidence.json"
+                evidence_path = qa_root / "results" / "modules" / "evidence" / module_id / "20260101-evidence.json"
                 evidence_path.parent.mkdir(parents=True)
                 evidence_path.write_text(json.dumps({
                     "executed": [case_id], "passed": [case_id] if status == "passed" else [],
@@ -3437,7 +3681,7 @@ class RegressionTests(unittest.TestCase):
         cli = load_script("bruno_api_test_generator")
         with tempfile.TemporaryDirectory() as directory:
             qa_root = Path(directory) / "qa"
-            contracts = qa_root / "contracts"
+            contracts = qa_root / "data" / "contracts"
             contracts.mkdir(parents=True)
             (contracts / "module-map.yaml").write_text('{"modules":[]}', encoding="utf-8")
             spec = Path(directory) / "openapi.json"

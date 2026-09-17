@@ -10,7 +10,7 @@ The generator always parses a local specification. A checked-in file is preferre
 
    ```bash
    python /path/to/bru-api-test-generator/scripts/fetch_local_openapi.py \
-     --project-root . --output qa/contracts/openapi.json
+     --project-root . --output qa/data/contracts/openapi.json
    ```
 
    The helper detects local TCP listeners and probes only `127.0.0.1`, `localhost`, or `::1`, trying IPv4 before IPv6 on the same port. Use `--base-url http://127.0.0.1:8080` or `--port 8080` when the listener cannot be discovered automatically, and add `--path /your/openapi.json` when the application uses a non-standard documentation path. It tries common JSON/YAML documentation paths, validates the response, and writes the result atomically. Contract identity ignores deployment-only `servers`, Swagger `host`/`schemes`, and collection provenance while retaining paths, components, security, and `basePath`. If different local services still expose different contracts, it blocks instead of silently selecting one; rerun with an explicit base URL/path.

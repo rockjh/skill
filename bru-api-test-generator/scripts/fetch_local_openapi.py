@@ -230,8 +230,8 @@ def main() -> int:
         "-o",
         "--output",
         type=Path,
-        default=Path("qa/contracts/openapi.json"),
-        help="offline output path (default: qa/contracts/openapi.json)",
+        default=Path("qa/data/contracts/openapi.json"),
+        help="offline output path (default: qa/data/contracts/openapi.json)",
     )
     parser.add_argument(
         "--base-url",

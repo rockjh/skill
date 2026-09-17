@@ -1848,8 +1848,7 @@ def main() -> int:
     qa_root = qa_root_for_contracts(args.contracts_root)
     constraint_stage = (
         "post-execution" if args.results
-        else "pre-execution" if args.require_scenarios or args.require_auth
-        else "materialization"
+        else "check"
     )
     constraint_errors = validate_stage(
         qa_root,
@@ -1916,7 +1915,7 @@ def main() -> int:
         )
         if version_check.returncode:
             detail = (version_check.stdout or version_check.stderr).strip()
-            warnings.append(f"business version lock is not current: {detail or version_check.returncode}")
+            errors.append(f"business version lock is not current: {detail or version_check.returncode}")
     if args.results:
         errors.extend(
             check_module_lock(qa_root, args.module)
@@ -2325,6 +2324,7 @@ def main() -> int:
         warnings.append("offline OpenAPI provenance or business version is not aligned")
     runtime_error_re = re.compile(r"(?:^|\]) case [^ ]+ (?:was not executed|failed)$")
     errors = list(dict.fromkeys(errors))
+    manual_budget_failed = any("[MAN-002]" in error for error in errors)
     static_errors = [error for error in errors if not runtime_error_re.search(error)]
     static_ok = not static_errors
     module_completion_ok = False
@@ -2357,6 +2357,12 @@ def main() -> int:
     if args.module and not args.results:
         module_status = status
         status = "draft"
+    if manual_budget_failed:
+        status = "draft"
+        completion_ok = False
+        if args.module:
+            module_status = "draft"
+            module_completion_ok = False
     report = {
         **totals,
         "report_version": STRICT_REPORT_VERSION,

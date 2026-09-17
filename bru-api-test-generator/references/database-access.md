@@ -81,7 +81,7 @@ database_steps:
 - Elasticsearch scripts may use `@elastic/elasticsearch` and an exact index/document ID for `index`, `get`, or a tightly filtered `search`.
 - Other engines use the same contract: an already approved client, exact identifiers, source-backed fields, bounded results, and explicit cleanup for setup writes.
 
-Declare required Node clients in `qa/bruno/package.json` and pin their versions. Do not add a generic database abstraction for a one-off step.
+Declare required Node clients in `qa/data/bruno/package.json` and pin their versions. Do not add a generic database abstraction for a one-off step.
 
 ## Runtime And Safety
 

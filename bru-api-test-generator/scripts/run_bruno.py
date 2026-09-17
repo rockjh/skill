@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import re
 import subprocess
 import sys
@@ -30,6 +31,18 @@ from execution_config import (
 )
 from manifest_io import first_list, load_data
 from qa_lock import check as check_qa_lock
+from qa_paths import (
+    BRUNO,
+    CONSTRAINTS,
+    CONTRACTS,
+    EXECUTION,
+    GLOBAL_EVIDENCE,
+    GLOBAL_RESULTS,
+    LOGS,
+    MODULE_EVIDENCE,
+    MODULE_RESULTS,
+    migrate_legacy_layout,
+)
 from qa_constraints import (
     check_module_lock,
     database_steps,
@@ -73,7 +86,7 @@ def log_path(qa_root: Path, module: str | None) -> Path:
     scope = module or "all"
     safe_scope = re.sub(r'[<>:"/\\|?*\s]+', "-", scope).strip("-.") or "all"
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    root = qa_root / "logs" / "modules" / safe_scope if module else qa_root / "logs"
+    root = qa_root / LOGS / "modules" / safe_scope if module else qa_root / LOGS
     return root / f"{timestamp}-run-bruno-{safe_scope}.log"
 
 
@@ -433,7 +446,7 @@ def _report_from_rows(rows: list[dict[str, Any]], scope: str) -> dict[str, Any]:
         modules.append({
             "module": module_id,
             "status": "passed" if scoped and all(
-                row.get("status") == "passed" or row.get("needs_manual_confirmation") is True
+                row.get("status") == "passed" and row.get("needs_manual_confirmation") is not True
                 for row in scoped
             ) else "attention_required",
             "total": len(scoped),
@@ -465,7 +478,8 @@ def aggregate_module_results(qa_root: Path) -> tuple[Path, Path, dict[str, Any]]
     """Merge the latest independent module reports and evidence into one global result."""
 
     qa_root = qa_root.resolve()
-    contracts_root = qa_root / "contracts"
+    migrate_legacy_layout(qa_root)
+    contracts_root = qa_root / CONTRACTS
     cases = scope_cases(contracts_root, None)
     by_module: dict[str, list[dict[str, Any]]] = {}
     for case in cases:
@@ -481,7 +495,7 @@ def aggregate_module_results(qa_root: Path) -> tuple[Path, Path, dict[str, Any]]
         "module_evidence": [],
     }
     for module_id, module_cases in sorted(by_module.items()):
-        result_root = qa_root / "results" / "modules" / module_id
+        result_root = qa_root / MODULE_RESULTS / module_id
         candidates = sorted(result_root.glob("*-result.json")) if result_root.is_dir() else []
         latest = candidates[-1] if candidates else None
         expected_ids = {str(case.get("id")) for case in module_cases}
@@ -534,12 +548,19 @@ def aggregate_module_results(qa_root: Path) -> tuple[Path, Path, dict[str, Any]]
             reconciliation_errors.append(f"module {module_id} report has no readable execution evidence")
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    evidence_root = qa_root / "evidence" / "global"
-    result_root = qa_root / "results" / "global"
+    evidence_root = qa_root / GLOBAL_EVIDENCE
+    result_root = qa_root / GLOBAL_RESULTS
     evidence_root.mkdir(parents=True, exist_ok=True)
     result_root.mkdir(parents=True, exist_ok=True)
     evidence_path = evidence_root / f"{timestamp}-evidence.json"
     evidence_path.write_text(json.dumps(merged_evidence, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    write_observed_rules(
+        qa_root,
+        cases,
+        merged_evidence,
+        evidence_path.relative_to(qa_root).as_posix(),
+        qa_root / CONSTRAINTS / "observed-rules.yaml",
+    )
     report = _report_from_rows(rows, "aggregated-modules")
     report["execution_evidence"] = evidence_path.relative_to(qa_root).as_posix()
     report["source_module_reports"] = source_reports
@@ -550,13 +571,98 @@ def aggregate_module_results(qa_root: Path) -> tuple[Path, Path, dict[str, Any]]
         report["status"] = "failed"
     else:
         required_incomplete = any(
-            row.get("status") != "passed" and row.get("needs_manual_confirmation") is not True
+            row.get("status") != "passed" or row.get("needs_manual_confirmation") is True
             for row in rows
         )
         report["status"] = "failed" if required_incomplete else "verified"
     report_path = result_root / f"{timestamp}-result.json"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return report_path, evidence_path, report
+
+
+def _response_shape(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _response_shape(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return {"type": "array", "items": _response_shape(value[0]) if value else None}
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    return "string"
+
+
+def _reusable_values(value: Any, path: str = "$") -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if re.search(r"password|secret|token|authorization|cookie|key", str(key), re.IGNORECASE):
+                continue
+            result.update(_reusable_values(child, f"{path}.{key}"))
+    elif isinstance(value, list):
+        if value:
+            result.update(_reusable_values(value[0], f"{path}[0]"))
+    elif value != "<redacted>" and value is not None:
+        result[path] = value
+    return result
+
+
+def write_observed_rules(
+    qa_root: Path,
+    cases: list[dict[str, Any]],
+    evidence: dict[str, Any],
+    evidence_reference: str,
+    observed_path: Path,
+) -> None:
+    case_map = {str(case.get("id")): case for case in cases}
+    observations = []
+    evidence_cases = evidence.get("cases", {}) if isinstance(evidence.get("cases"), dict) else {}
+    for case_id in evidence.get("passed", []):
+        value = evidence_cases.get(case_id, {}) if isinstance(evidence_cases.get(case_id), dict) else {}
+        actual = value.get("actual") if isinstance(value.get("actual"), dict) else {}
+        case = case_map.get(str(case_id), {})
+        endpoint_id = str(case.get("endpoint_id", ""))
+        body = actual.get("body") if isinstance(actual, dict) else None
+        observations.append({
+            "case_id": str(case_id),
+            "endpoint_id": endpoint_id,
+            "response": actual,
+            "response_shape": _response_shape(body),
+            "reusable_values": _reusable_values(body),
+            "evidence_file": evidence_reference,
+            "evidence": {
+                "source_kind": "runtime",
+                "file": evidence_reference,
+                "symbol": str(case_id),
+                "line": 1,
+                "endpoint_scope": [endpoint_id],
+                "confidence": "high",
+            },
+        })
+    try:
+        import yaml  # type: ignore[import-not-found]
+    except ModuleNotFoundError as exc:
+        raise ValueError("observed evidence requires PyYAML") from exc
+    observed_path.parent.mkdir(parents=True, exist_ok=True)
+    previous = load_data(observed_path) if observed_path.is_file() else {}
+    previous_items = previous.get("observations", []) if isinstance(previous, dict) else []
+    merged = {
+        (str(item.get("endpoint_id")), str(item.get("case_id"))): item
+        for item in previous_items
+        if isinstance(item, dict)
+    }
+    merged.update({
+        (str(item.get("endpoint_id")), str(item.get("case_id"))): item
+        for item in observations
+    })
+    observed_path.write_text(
+        yaml.safe_dump({"version": 1, "observations": list(merged.values())}, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
 
 
 def persist_execution_artifacts(
@@ -569,8 +675,8 @@ def persist_execution_artifacts(
 ) -> tuple[Path, Path | None, dict[str, Any]]:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     module_id = str(cases[0].get("_module")) if module and cases else (module or "unknown")
-    result_root = qa_root / "results" / "modules" / module_id if module else qa_root / "results" / "global"
-    evidence_root = qa_root / "evidence" / "modules" / module_id if module else qa_root / "evidence" / "global"
+    result_root = qa_root / MODULE_RESULTS / module_id if module else qa_root / GLOBAL_RESULTS
+    evidence_root = qa_root / MODULE_EVIDENCE / module_id if module else qa_root / GLOBAL_EVIDENCE
     result_root.mkdir(parents=True, exist_ok=True)
     report = result_report(
         cases,
@@ -587,50 +693,12 @@ def persist_execution_artifacts(
         evidence_output.write_text(json.dumps(evidence, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         evidence_reference = evidence_output.relative_to(qa_root).as_posix()
         report["execution_evidence"] = evidence_reference
-        observations = [
-            {
-                "case_id": case_id,
-                "endpoint_id": next(
-                    (str(case.get("endpoint_id")) for case in cases if str(case.get("id")) == str(case_id)),
-                    None,
-                ),
-                "response": value.get("actual"),
-                "evidence_file": evidence_reference,
-            }
-            for case_id, value in evidence.get("cases", {}).items()
-            if case_id in set(evidence.get("passed", [])) and isinstance(value, dict)
-        ] if isinstance(evidence.get("cases"), dict) else []
-        if observations:
-            observed_path = (
-                qa_root / "contracts" / "modules" / str(cases[0].get("_module_directory")) / "observed-rules.yaml"
-                if module and cases
-                else qa_root / "constraints" / "observed-rules.yaml"
-            )
-            try:
-                import yaml  # type: ignore[import-not-found]
-
-                observed_path.parent.mkdir(parents=True, exist_ok=True)
-                previous = load_data(observed_path) if observed_path.is_file() else {}
-                previous_items = previous.get("observations", []) if isinstance(previous, dict) else []
-                merged = {
-                    (str(item.get("endpoint_id")), str(item.get("case_id"))): item
-                    for item in previous_items
-                    if isinstance(item, dict)
-                }
-                merged.update({
-                    (str(item.get("endpoint_id")), str(item.get("case_id"))): item
-                    for item in observations
-                })
-                observed_path.write_text(
-                    yaml.safe_dump(
-                        {"version": 1, "observations": list(merged.values())},
-                        allow_unicode=True,
-                        sort_keys=False,
-                    ),
-                    encoding="utf-8",
-                )
-            except ModuleNotFoundError:
-                pass
+        observed_path = (
+            qa_root / CONTRACTS / "modules" / str(cases[0].get("_module_directory")) / "observed-rules.yaml"
+            if module and cases
+            else qa_root / CONSTRAINTS / "observed-rules.yaml"
+        )
+        write_observed_rules(qa_root, cases, evidence, evidence_reference, observed_path)
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return report_path, evidence_output, report
 
@@ -739,9 +807,9 @@ def run_json(command: list[str], output: Path, cwd: Path | None = None) -> tuple
 def execute(args: argparse.Namespace, qa_root: Path, execution_log: Path) -> int:
     scripts_root = Path(__file__).resolve().parent
     app_root = qa_root.parent
-    contracts_root = qa_root / "contracts"
-    bruno_root = qa_root / "bruno"
-    config_path = qa_root / "execution" / "config.yaml"
+    contracts_root = qa_root / CONTRACTS
+    bruno_root = qa_root / BRUNO
+    config_path = qa_root / EXECUTION / "config.yaml"
     openapi = next(
         (path for path in (contracts_root / "openapi.json", contracts_root / "openapi.yaml", contracts_root / "openapi.yml") if path.is_file()),
         contracts_root / "openapi.json",
@@ -753,6 +821,13 @@ def execute(args: argparse.Namespace, qa_root: Path, execution_log: Path) -> int
         print(f"ERROR: {exc}", file=sys.stderr)
         return finish_failed_attempt(
             qa_root, [], args.module, "generation_failure", str(exc), [], execution_log, 2,
+        )
+    gate_errors = validate_stage(qa_root, "run", module=args.module)
+    if gate_errors:
+        for error in gate_errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+        return finish_failed_attempt(
+            qa_root, cases, args.module, "generation_failure", "; ".join(gate_errors), [], execution_log, 2,
         )
     if args.module:
         try:
@@ -816,7 +891,11 @@ def execute(args: argparse.Namespace, qa_root: Path, execution_log: Path) -> int
     )
     if version_check.returncode:
         detail = (version_check.stdout or version_check.stderr).strip()
-        version_warnings.append(detail or f"local business version check exited with {version_check.returncode}")
+        reason = detail or f"local business version check exited with {version_check.returncode}"
+        print(f"ERROR: {reason}", file=sys.stderr)
+        return finish_failed_attempt(
+            qa_root, cases, args.module, "generation_failure", reason, [], execution_log, version_check.returncode,
+        )
     version_warnings.extend(target_version_warnings(environment, contracts_root))
     for warning in version_warnings:
         print(red_warning(warning))
@@ -870,10 +949,12 @@ def execute(args: argparse.Namespace, qa_root: Path, execution_log: Path) -> int
             "--openapi", str(openapi),
             "--static-results", str(static_path),
             "--bruno-cli", args.bruno_cli,
+            "--cli-timeout", str(args.cli_timeout if args.cli_timeout is not None else config["cli_timeout"]),
             "--public-method", route[0],
             "--public-path", route[1],
             "--public-status", "200-403,405-499",
             "--output", str(preflight_path),
+            "--qa-root", str(qa_root),
         ]
         preflight_result = subprocess.run(
             preflight_command,
@@ -1075,21 +1156,36 @@ def execute(args: argparse.Namespace, qa_root: Path, execution_log: Path) -> int
     return result_code
 
 
-def main() -> int:
+def positive_cli_timeout(value: str) -> float:
+    try:
+        timeout = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive number of seconds") from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise argparse.ArgumentTypeError("must be a positive number of seconds")
+    return timeout
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Run every Bruno case by default, or select one module with --module.",
     )
     parser.add_argument("--qa-root", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--module", help="module id, display name, OpenAPI Tag, or directory")
     parser.add_argument("--bruno-cli", default="bru", help=argparse.SUPPRESS)
-    args = parser.parse_args()
+    parser.add_argument(
+        "--cli-timeout", type=positive_cli_timeout,
+        help="seconds allowed for the Bruno CLI version probe (overrides execution config; default: 60)",
+    )
+    args = parser.parse_args(argv)
     scripts_root = Path(__file__).resolve().parent
     qa_root = (args.qa_root or scripts_root.parent).resolve()
+    migrate_legacy_layout(qa_root)
     log_scope = args.module
     if args.module:
         try:
-            directory = module_directory(qa_root / "contracts", args.module)
-            document = load_data(qa_root / "contracts" / "modules" / directory / "endpoints.yaml")
+            directory = module_directory(qa_root / CONTRACTS, args.module)
+            document = load_data(qa_root / CONTRACTS / "modules" / directory / "endpoints.yaml")
             if isinstance(document, dict):
                 log_scope = str(document.get("module", directory))
         except (OSError, ValueError, TypeError):

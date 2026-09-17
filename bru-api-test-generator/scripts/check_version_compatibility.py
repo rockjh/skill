@@ -7,7 +7,6 @@ import argparse
 import fnmatch
 import hashlib
 import json
-import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -128,120 +127,20 @@ STRICT_COMPLETION_FIELDS = (
 )
 
 
-def git(repo: Path, *args: str) -> str:
-    try:
-        return subprocess.check_output(
-            ["git", "-C", str(repo), *args],
-            text=True,
-            encoding="utf-8",
-            errors="strict",
-            stderr=subprocess.STDOUT,
-        ).strip()
-    except subprocess.CalledProcessError as exc:
-        raise SystemExit(f"git {' '.join(args)} failed in {repo}: {exc.output.strip()}") from exc
-
-
-def current_git_commit(repo: Path) -> str:
-    commit = git(repo, "rev-parse", "HEAD")
-    if not commit:
-        raise SystemExit(f"git rev-parse HEAD returned an empty commit in {repo}")
-    return commit
-
-
 def is_qa_path(path: str) -> bool:
     normalized = path.replace("\\", "/").lstrip("./")
     return normalized == "qa" or normalized.startswith("qa/")
 
 
-def git_available(repo: Path) -> bool:
-    try:
-        subprocess.run(
-            ["git", "-C", str(repo), "rev-parse", "--git-dir"],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        return True
-    except (OSError, subprocess.CalledProcessError):
-        return False
-
-
-def changed_files(repo: Path, old_sha: str, current_sha: str) -> list[str]:
-    try:
-        raw = subprocess.check_output(
-            ["git", "-C", str(repo), "diff", "--name-status", "-z", f"{old_sha}..{current_sha}"],
-            encoding="utf-8", errors="strict", stderr=subprocess.STDOUT,
-        )
-    except subprocess.CalledProcessError as exc:
-        raise SystemExit(f"git diff failed in {repo}: {exc.output.strip()}") from exc
-    fields = raw.split("\0")
-    paths: list[str] = []
-    index = 0
-    while index < len(fields) and fields[index]:
-        status = fields[index]
-        index += 1
-        if index >= len(fields):
-            break
-        first = fields[index]
-        index += 1
-        if status[:1] in {"R", "C"} and index < len(fields):
-            paths.append(fields[index])
-            index += 1
-        else:
-            paths.append(first)
-    return paths
-
-
-def dirty_files(repo: Path) -> list[str]:
-    """Return business worktree paths that are not represented by HEAD."""
-
-    try:
-        # Do not use git(), whose strip() would remove the leading porcelain
-        # status column and shift the path by one character.
-        raw = subprocess.check_output(
-            ["git", "-C", str(repo), "status", "--porcelain=v1", "-z", "--untracked-files=all"],
-            text=True,
-            encoding="utf-8",
-            errors="strict",
-            stderr=subprocess.STDOUT,
-        )
-    except subprocess.CalledProcessError as exc:
-        raise SystemExit(f"git status failed in {repo}: {exc.output.strip()}") from exc
-    paths: list[str] = []
-    fields = raw.split("\0")
-    index = 0
-    while index < len(fields) and fields[index]:
-        record = fields[index]
-        index += 1
-        if len(record) < 4:
-            continue
-        status = record[:2]
-        value = record[3:]
-        if ("R" in status or "C" in status) and index < len(fields):
-            index += 1
-        if not is_qa_path(value):
-            paths.append(value)
-    return paths
-
-
 def source_digest(repo: Path) -> str:
-    """Hash tracked business files while ignoring the repository's qa tree."""
+    """Hash current business files without reading version-control history."""
 
-    try:
-        raw = subprocess.check_output(
-            ["git", "-C", str(repo), "ls-files", "-z"],
-            encoding="utf-8",
-            errors="strict",
-            stderr=subprocess.DEVNULL,
-        )
-        values = [item for item in raw.split("\0") if item]
-    except (OSError, subprocess.CalledProcessError):
-        values = [
-            str(path.relative_to(repo))
-            for path in repo.rglob("*")
-            if path.is_file()
-            and not any(part in {".git", "qa", "node_modules", "target", "build", ".venv", "venv"} for part in path.parts)
-        ]
+    values = [
+        str(path.relative_to(repo))
+        for path in repo.rglob("*")
+        if path.is_file()
+        and not any(part in {".git", "qa", "node_modules", "target", "build", ".venv", "venv"} for part in path.parts)
+    ]
     digest = hashlib.sha256()
     for value in sorted(values):
         if value == "qa" or value.startswith("qa/"):
@@ -249,9 +148,13 @@ def source_digest(repo: Path) -> str:
         path = repo / value
         if not path.is_file():
             continue
+        try:
+            content = path.read_bytes()
+        except (OSError, PermissionError):
+            continue
         digest.update(value.encode("utf-8"))
         digest.update(b"\0")
-        digest.update(path.read_bytes())
+        digest.update(content)
         digest.update(b"\0")
     return digest.hexdigest()
 
@@ -333,9 +236,8 @@ def main() -> int:
             print(f"ERROR: version lock already exists: {lock_path}")
             return 3
         digest = source_digest(args.business_repo)
-        has_git = git_available(args.business_repo)
-        current_sha = current_git_commit(args.business_repo) if has_git else f"filesystem:{digest[:16]}"
-        current_ref = git(args.business_repo, "symbolic-ref", "--short", "-q", "HEAD") or "detached" if has_git else "filesystem"
+        current_sha = f"filesystem:{digest[:16]}"
+        current_ref = "filesystem"
         initialized_at = datetime.now(timezone.utc).isoformat()
         lock = {
             "version": 1,
@@ -392,127 +294,47 @@ def main() -> int:
         return 3
     business = lock.get("business", {})
     locked_sha = business.get("commit") if isinstance(business, dict) else None
-    if not locked_sha:
-        locked_sha = lock.get("business_git_sha")
-    has_git = git_available(args.business_repo)
     current_digest = source_digest(args.business_repo)
-    if has_git:
-        current_sha = current_git_commit(args.business_repo)
-        current_ref = git(args.business_repo, "symbolic-ref", "--short", "-q", "HEAD") or "detached"
-        dirty = dirty_files(args.business_repo)
-    else:
-        current_sha = f"filesystem:{current_digest[:16]}"
-        current_ref = "filesystem"
-        dirty = []
+    current_sha = f"filesystem:{current_digest[:16]}"
+    current_ref = "filesystem"
     locked_digest = business.get("source_digest") if isinstance(business, dict) else None
 
     report: dict[str, Any] = {
         "locked_sha": locked_sha,
         "current_sha": current_sha,
         "current_ref": current_ref,
-        "version_control": "git" if has_git else "filesystem",
+        "version_control": "filesystem",
         "status": "current",
         "impact": "none",
         "changed_files": [],
-        "dirty_files": dirty,
+        "dirty_files": [],
         "locked_source_digest": locked_digest,
         "current_source_digest": current_digest,
     }
     if locked_digest and locked_digest == current_digest:
-        if dirty:
-            rules = load_data(args.rules) if args.rules else {}
-            if not isinstance(rules, dict):
-                raise SystemExit("impact rules must contain an object")
-            ignore_patterns = [*DEFAULT_IGNORE_PATTERNS, *rules.get("ignore_patterns", [])]
-            business_dirty = [
-                path for path in dirty
-                if not any(fnmatch.fnmatch(path, pattern) for pattern in ignore_patterns)
-            ]
-            if business_dirty:
-                impact = classify(business_dirty, rules)
-                report.update({
-                    "status": "dirty",
-                    "impact": impact,
-                    "changed_files": business_dirty,
-                    "change_classes": change_classes(dirty, rules),
-                })
-                message = "business repository has untracked or modified files not represented by the locked source digest"
-                if args.as_json:
-                    print(json.dumps({**report, "error": message}, ensure_ascii=True, indent=2))
-                else:
-                    print(f"ERROR: {message}")
-                    print(f"impact: {impact}")
-                    for path in business_dirty:
-                        print(f"dirty: {path}")
-                return 3 if impact == "api-impact" else 2
         report["status"] = "current"
         report["source_digest_match"] = True
-        if dirty:
-            report["qa_dirty_files"] = dirty
         if args.as_json:
             print(json.dumps(report, ensure_ascii=True, indent=2))
         else:
-            suffix = " (only ignored QA files are dirty)" if dirty else ""
-            print(f"version lock source digest is current: {current_digest}{suffix}")
+            print(f"version lock source digest is current: {current_digest}")
         return 0
-    if locked_sha == current_sha:
-        if dirty:
-            rules = load_data(args.rules) if args.rules else {}
-            if not isinstance(rules, dict):
-                raise SystemExit("impact rules must contain an object")
-            ignore_patterns = [*DEFAULT_IGNORE_PATTERNS, *rules.get("ignore_patterns", [])]
-            business_dirty = [
-                path for path in dirty
-                if not any(fnmatch.fnmatch(path, pattern) for pattern in ignore_patterns)
-            ]
-            if not business_dirty:
-                report.update({"status": "current", "impact": "non-api", "qa_dirty_files": dirty})
-                if args.as_json:
-                    print(json.dumps(report, ensure_ascii=True, indent=2))
-                else:
-                    print("version lock is current; only ignored QA files are dirty")
-                return 0
-            impact = classify(dirty, rules)
-            report.update({"status": "dirty", "impact": impact, "changed_files": dirty})
-            message = "business repository has tracked changes not represented by the locked commit"
-            if args.as_json:
-                print(json.dumps({**report, "error": message}, ensure_ascii=True, indent=2))
-            else:
-                print(f"ERROR: {message}")
-                print(f"impact: {impact}")
-                for path in dirty:
-                    print(f"dirty: {path}")
-            return 3 if impact == "api-impact" else 2
-        print(json.dumps(report, ensure_ascii=True, indent=2) if args.as_json else f"version lock is current: {current_sha}")
-        return 0
-    if not locked_sha and has_git:
-        report["status"] = "missing-locked-sha"
-        message = "version-lock.yaml has no business commit; initialize it after a reviewed baseline"
-        if args.as_json:
-            print(json.dumps({**report, "error": message}, ensure_ascii=True, indent=2))
-        else:
-            print(f"ERROR: {message}")
-        return 3
-    if not locked_sha and not has_git:
+    if not locked_sha:
         report.update(
             {
                 "status": "unlocked-filesystem",
                 "impact": "api-impact",
                 "changed_files": ["<filesystem baseline missing>"],
-                "error": "business repository has no Git baseline; review the filesystem digest before execution",
+                "error": "business repository has no filesystem baseline; review the current source digest before execution",
             }
         )
         if args.as_json:
             print(json.dumps(report, ensure_ascii=True, indent=2))
         else:
-            print("ERROR: business repository has no Git baseline; initialize version-lock.yaml after review")
+            print("ERROR: business repository has no filesystem baseline; initialize version-lock.yaml after review")
         return 2
 
-    if has_git and not str(locked_sha).startswith("filesystem:"):
-        all_paths = changed_files(args.business_repo, str(locked_sha), current_sha)
-        paths = [path for path in all_paths if not is_qa_path(path)]
-    else:
-        paths = ["<filesystem source digest changed>"]
+    paths = ["<filesystem source digest changed>"]
     rules = load_data(args.rules) if args.rules else {}
     if not isinstance(rules, dict):
         raise SystemExit("impact rules must contain an object")
@@ -520,12 +342,12 @@ def main() -> int:
     # changed source tree as API-impacting until a human reviews and adapts the
     # collection; classifying the placeholder as non-api would make the lock
     # advance without knowing what changed.
-    impact = "api-impact" if not has_git else classify(paths, rules)
+    impact = "api-impact"
     report.update({
         "status": "stale",
         "impact": impact,
         "changed_files": paths,
-        "change_classes": change_classes(all_paths if has_git else paths, rules),
+        "change_classes": change_classes(paths, rules),
     })
 
     if args.write:

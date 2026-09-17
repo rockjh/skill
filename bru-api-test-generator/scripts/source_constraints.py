@@ -15,7 +15,8 @@ from typing import Any
 
 sys.dont_write_bytecode = True
 
-from manifest_io import load_data
+from manifest_io import first_list, load_data
+from qa_paths import CONSTRAINTS, CONTRACTS, migrate_legacy_layout
 
 
 SOURCE_SUFFIXES = {".java", ".kt", ".kts", ".sql", ".properties", ".yaml", ".yml", ".json"}
@@ -42,6 +43,9 @@ CONTROLLER_METHOD_RE = re.compile(
     r"(?:public|protected|private)?\s*(?:static\s+)?"
     r"(?P<return>[A-Za-z_$][\w$<>,.? \[\]]*)\s+"
     r"(?P<name>[A-Za-z_$][\w$]*)\s*\("
+)
+CONTROLLER_PARAMETERS_RE = re.compile(
+    r"(?:@[\w.]+(?:\([^)]*\))?\s+)*(?:final\s+)?([A-Z][\w$<>.?]*)\s+([a-zA-Z_$][\w$]*)"
 )
 
 
@@ -75,6 +79,16 @@ def _source_role(path: Path) -> str:
 
 def _line(text: str, offset: int) -> int:
     return text.count("\n", 0, offset) + 1
+
+
+def _brace_depth(text: str, offset: int) -> int:
+    prefix = re.sub(
+        r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'',
+        lambda match: " " * len(match.group(0)),
+        text[:offset],
+        flags=re.DOTALL,
+    )
+    return prefix.count("{") - prefix.count("}")
 
 
 def _literal(value: str | None) -> Any:
@@ -226,10 +240,13 @@ def extract_source_constraints(roots: list[Path]) -> dict[str, Any]:
                 error_codes.append({
                     "name": match.group(1),
                     "code": next(value for value in match.groups()[1:] if value is not None),
-                    "evidence": {"file": str(path), "line": _line(text, match.start()), "source_kind": role},
+                    "evidence": {
+                        "file": str(path), "line": _line(text, match.start()), "source_kind": role,
+                        "symbol": match.group(1), "confidence": "high",
+                    },
                 })
             for enum in re.finditer(r"(?s)\benum\s+([A-Za-z_$][\w$]*)[^\{]*\{(.*?)\}", text):
-                values = re.findall(r"(?m)^\s*([A-Z][A-Z0-9_]*)\s*(?:\(|,|;)", enum.group(2))
+                values = re.findall(r"(?:^|,)\s*([A-Z][A-Z0-9_]*)\b", enum.group(2))
                 if values:
                     enum_values[enum.group(1)] = list(dict.fromkeys(values))
             if role == "test":
@@ -295,27 +312,46 @@ def extract_source_constraints(roots: list[Path]) -> dict[str, Any]:
                 for method in CONTROLLER_METHOD_RE.finditer(text):
                     if "Mapping" not in method.group("annotations"):
                         continue
+                    closing = text.find(")", method.end())
+                    parameters = text[method.end():closing] if closing >= 0 else ""
                     endpoint_response_hints.append({
                         "operation_id": method.group("name"),
                         "return_type": re.sub(r"\s+", "", method.group("return")),
+                        "request_types": list(dict.fromkeys(
+                            value.removesuffix("?").split("<", 1)[0]
+                            for value, _ in CONTROLLER_PARAMETERS_RE.findall(parameters)
+                        )),
                         "evidence": {
                             "file": str(path),
                             "line": _line(text, method.start()),
                             "source_kind": "controller",
                             "symbol": method.group("name"),
+                            "confidence": "high",
                         },
                     })
-            field_matches = list(FIELD_RE.finditer(text))
+            field_matches = [match for match in FIELD_RE.finditer(text) if _brace_depth(text, match.start("type")) <= 1]
             if path.suffix.lower() in {".kt", ".kts"}:
-                field_matches.extend(KOTLIN_FIELD_RE.finditer(text))
+                field_matches.extend(
+                    match for match in KOTLIN_FIELD_RE.finditer(text)
+                    if _brace_depth(text, match.start("type")) <= 1
+                )
+            class_match = re.search(r"\b(?:class|record|data\s+class)\s+([A-Za-z_$][\w$]*)", text)
+            owner_type = class_match.group(1) if class_match else path.stem
             structure_fields: list[str] = []
             structure_field_types: dict[str, str] = {}
             for match in field_matches:
                 name = match.group("name")
                 if SECRET_NAME_RE.search(name):
                     continue
-                key = name.casefold()
-                rule = fields.setdefault(key, {"id": f"source-field-{key}", "field_names": [name], "field": name, "constraints": {}, "evidence": []})
+                key = f"{owner_type.casefold()}::{name.casefold()}"
+                rule = fields.setdefault(key, {
+                    "id": f"source-field-{owner_type.casefold()}-{name.casefold()}",
+                    "owner_type": owner_type,
+                    "field_names": [name],
+                    "field": name,
+                    "constraints": {},
+                    "evidence": [],
+                })
                 annotations = match.group("annotations") or ""
                 java_type = match.group("type")
                 constraints: dict[str, Any] = {}
@@ -372,14 +408,16 @@ def extract_source_constraints(roots: list[Path]) -> dict[str, Any]:
                 _merge_rule(
                     rule,
                     constraints,
-                    {"file": str(path), "line": _line(text, match.start()), "source_kind": role, "symbol": name},
-                    examples.get(key),
+                    {
+                        "file": str(path), "line": _line(text, match.start()),
+                        "source_kind": role, "symbol": f"{owner_type}.{name}", "confidence": "high",
+                    },
+                    examples.get(name.casefold()),
                 )
                 structure_fields.append(name)
                 structure_field_types[name] = re.sub(r"\s+", "", java_type)
-            class_match = re.search(r"\b(?:class|record|data\s+class)\s+([A-Za-z_$][\w$]*)", text)
-            if class_match and structure_fields and (
-                role == "dto" or re.search(r"(?:Output|Response|Result|CommonResponse|VO)$", class_match.group(1))
+            if class_match and structure_fields and re.search(
+                r"(?:Output|Response|Result|CommonResponse|VO)$", class_match.group(1)
             ):
                 response_structures.append({
                     "id": f"source-response-{class_match.group(1).casefold()}",
@@ -391,6 +429,7 @@ def extract_source_constraints(roots: list[Path]) -> dict[str, Any]:
                         "line": _line(text, class_match.start()),
                         "source_kind": role,
                         "symbol": class_match.group(1),
+                        "confidence": "high",
                     },
                 })
     for rule in fields.values():
@@ -409,8 +448,12 @@ def extract_source_constraints(roots: list[Path]) -> dict[str, Any]:
                         {
                             "name": name,
                             "source_type": structure.get("field_types", {}).get(name),
-                            "constraints": copy.deepcopy(fields.get(name.casefold(), {}).get("constraints", {})),
-                            "example": copy.deepcopy(fields.get(name.casefold(), {}).get("example")),
+                            "constraints": copy.deepcopy(fields.get(
+                                f"{str(structure.get('type_name', '')).casefold()}::{name.casefold()}", {}
+                            ).get("constraints", {})),
+                            "example": copy.deepcopy(fields.get(
+                                f"{str(structure.get('type_name', '')).casefold()}::{name.casefold()}", {}
+                            ).get("example")),
                         }
                 for name in structure["field_names"]
             ],
@@ -439,14 +482,23 @@ def extract_source_constraints(roots: list[Path]) -> dict[str, Any]:
         "error_codes": error_codes,
         "response_rules": response_rules,
         "endpoint_response_rules": endpoint_response_rules,
+        "controller_bindings": endpoint_response_hints,
     }
 
 
-def _field_rules(document: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def _field_rules(document: dict[str, Any], endpoint: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    endpoint_id = str(endpoint.get("id", ""))
+    endpoint_key = f"{str(endpoint.get('method', '')).upper()} {endpoint.get('path')}"
+    operation = str(endpoint.get("operation_id", ""))
     return {
         str(name).casefold(): item
         for item in document.get("field_rules", [])
         if isinstance(item, dict)
+        and (
+            endpoint_id in {str(value) for value in item.get("endpoint_scope", [])}
+            or endpoint_key in {str(value) for value in item.get("endpoint_scope", [])}
+            or operation == str(item.get("operation", ""))
+        )
         for name in item.get("field_names", [])
     }
 
@@ -552,7 +604,6 @@ def _merge_schema(target: dict[str, Any], source: dict[str, Any]) -> None:
 
 
 def apply_constraints_to_manifest(manifest: dict[str, Any], constraints: dict[str, Any]) -> None:
-    rules = _field_rules(constraints)
     response_rules = {
         str(item.get("type_name")): item
         for item in constraints.get("response_rules", [])
@@ -566,6 +617,7 @@ def apply_constraints_to_manifest(manifest: dict[str, Any], constraints: dict[st
     for endpoint in manifest.get("endpoints", []):
         if not isinstance(endpoint, dict):
             continue
+        rules = _field_rules(constraints, endpoint)
         for parameter in endpoint.get("parameters", []):
             if not isinstance(parameter, dict):
                 continue
@@ -695,14 +747,236 @@ def apply_environment_values(manifest: dict[str, Any], variables: dict[str, str]
             apply_schema(body.get("schema", body))
 
 
-def write_source_constraints(qa_root: Path, roots: list[Path]) -> dict[str, Any]:
-    document = extract_source_constraints(roots)
-    path = qa_root / "constraints" / "source-rules.yaml"
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _schema_field_names(value: Any) -> set[str]:
+    names: set[str] = set()
+    if isinstance(value, dict):
+        properties = value.get("properties")
+        if isinstance(properties, dict):
+            names.update(str(name).casefold() for name in properties)
+        for child in value.values():
+            names.update(_schema_field_names(child))
+    elif isinstance(value, list):
+        for child in value:
+            names.update(_schema_field_names(child))
+    return names
+
+
+def scope_source_constraints(document: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:
+    """Bind each source field rule to endpoints before it can affect generation."""
+
+    endpoints = [item for item in manifest.get("endpoints", []) if isinstance(item, dict)]
+    bindings = [item for item in document.get("controller_bindings", []) if isinstance(item, dict)]
+    scoped: list[dict[str, Any]] = []
+    for original in document.get("field_rules", []):
+        if not isinstance(original, dict):
+            continue
+        existing_scope = {
+            str(value) for value in original.get("endpoint_scope", [])
+            if str(value).strip()
+        }
+        if existing_scope:
+            rule = copy.deepcopy(original)
+            for evidence in rule.get("evidence", []):
+                if isinstance(evidence, dict):
+                    evidence.setdefault("endpoint_scope", sorted(existing_scope))
+                    evidence.setdefault("confidence", "high")
+            scoped.append(rule)
+            continue
+        names = {str(name).casefold() for name in original.get("field_names", [])}
+        owner = str(original.get("owner_type", ""))
+        matches: list[dict[str, Any]] = []
+        if owner:
+            operations = {
+                str(binding.get("operation_id"))
+                for binding in bindings
+                if owner in {
+                    *[str(value) for value in binding.get("request_types", [])],
+                    *re.findall(r"[A-Za-z_$][\w$]*", str(binding.get("return_type", ""))),
+                }
+            }
+            matches = [endpoint for endpoint in endpoints if str(endpoint.get("operation_id")) in operations]
+        if not matches:
+            candidates = []
+            for endpoint in endpoints:
+                declared = {
+                    str(parameter.get("name", "")).casefold()
+                    for parameter in endpoint.get("parameters", [])
+                    if isinstance(parameter, dict)
+                }
+                declared.update(_schema_field_names(endpoint.get("request_body")))
+                declared.update(_schema_field_names(endpoint.get("responses")))
+                if declared & names:
+                    candidates.append(endpoint)
+            if owner and len(candidates) == 1:
+                matches = candidates
+            elif not owner:
+                matches = candidates
+        for endpoint in matches:
+            rule = copy.deepcopy(original)
+            endpoint_id = str(endpoint.get("id"))
+            endpoint_key = f"{str(endpoint.get('method', '')).upper()} {endpoint.get('path')}"
+            rule["id"] = (
+                str(original.get("id"))
+                if len(matches) == 1
+                else f"{original.get('id')}-{endpoint_id.casefold()}"
+            )
+            rule["endpoint_scope"] = [endpoint_id]
+            rule["operation"] = str(endpoint.get("operation_id") or endpoint_key)
+            rule["call_chain"] = [
+                str(binding.get("operation_id"))
+                for binding in bindings
+                if str(binding.get("operation_id")) == str(endpoint.get("operation_id"))
+            ]
+            for evidence in rule.get("evidence", []):
+                if isinstance(evidence, dict):
+                    evidence.setdefault("endpoint_scope", [endpoint_id])
+                    evidence.setdefault("confidence", "high")
+            scoped.append(rule)
+        if not matches:
+            rule = copy.deepcopy(original)
+            rule.setdefault("endpoint_scope", [])
+            for evidence in rule.get("evidence", []):
+                if isinstance(evidence, dict):
+                    evidence.setdefault("endpoint_scope", [])
+                    evidence.setdefault("confidence", "low")
+            scoped.append(rule)
+    result = copy.deepcopy(document)
+    result["field_rules"] = scoped
+    all_endpoint_ids = [str(endpoint.get("id")) for endpoint in endpoints if endpoint.get("id")]
+    for item in result.get("error_codes", []):
+        evidence = item.get("evidence") if isinstance(item, dict) and isinstance(item.get("evidence"), dict) else None
+        if evidence is not None:
+            evidence.setdefault("endpoint_scope", all_endpoint_ids)
+            evidence.setdefault("confidence", "medium")
+    for item in result.get("response_rules", []):
+        if not isinstance(item, dict):
+            continue
+        type_name = str(item.get("type_name", ""))
+        operations = {
+            str(binding.get("operation_id"))
+            for binding in bindings
+            if type_name in re.findall(r"[A-Za-z_$][\w$]*", str(binding.get("return_type", "")))
+        }
+        scope = [str(endpoint.get("id")) for endpoint in endpoints if str(endpoint.get("operation_id")) in operations]
+        evidence = item.get("evidence") if isinstance(item.get("evidence"), dict) else None
+        if evidence is not None:
+            evidence.setdefault("endpoint_scope", scope)
+            evidence.setdefault("confidence", "high")
+    for collection in (result.get("endpoint_response_rules", []), result.get("controller_bindings", [])):
+        for item in collection if isinstance(collection, list) else []:
+            if not isinstance(item, dict):
+                continue
+            scope = [
+                str(endpoint.get("id")) for endpoint in endpoints
+                if str(endpoint.get("operation_id")) == str(item.get("operation_id"))
+            ]
+            evidence = item.get("evidence") if isinstance(item.get("evidence"), dict) else None
+            if evidence is not None:
+                evidence.setdefault("endpoint_scope", scope)
+                evidence.setdefault("confidence", "high")
+    return result
+
+
+def _walk_request_fields(value: Any, prefix: str = "request") -> list[tuple[str, Any]]:
+    fields: list[tuple[str, Any]] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            path = f"{prefix}.{key}"
+            if isinstance(child, (dict, list)):
+                fields.extend(_walk_request_fields(child, path))
+            else:
+                fields.append((path, child))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            path = f"{prefix}[{index}]"
+            if isinstance(child, (dict, list)):
+                fields.extend(_walk_request_fields(child, path))
+            else:
+                fields.append((path, child))
+    return fields
+
+
+def write_value_resolutions(qa_root: Path, source_rules: dict[str, Any]) -> list[Path]:
+    """Persist endpoint-scoped request values and the evidence used to select them."""
+
+    paths: list[Path] = []
+    contracts = qa_root / CONTRACTS
+    openapi = next(
+        (path for path in (contracts / "openapi.json", contracts / "openapi.yaml", contracts / "openapi.yml") if path.is_file()),
+        contracts / "openapi.json",
+    )
+    modules = contracts / "modules"
+    if not modules.is_dir():
+        return paths
+    for directory in sorted(path for path in modules.iterdir() if path.is_dir()):
+        endpoint_doc = load_data(directory / "endpoints.yaml")
+        case_doc = load_data(directory / "cases.yaml") if (directory / "cases.yaml").is_file() else {}
+        endpoints = {str(item.get("id")): item for item in first_list(endpoint_doc, "endpoints") if item.get("id")}
+        fields: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for case in first_list(case_doc, "cases"):
+            endpoint_id = str(case.get("endpoint_id", ""))
+            if endpoint_id not in endpoints:
+                continue
+            for field_path, value in _walk_request_fields(case.get("request", {})):
+                key = (endpoint_id, field_path)
+                if key in seen:
+                    continue
+                seen.add(key)
+                leaf = re.split(r"[.\[]", field_path)[-1].rstrip("]").casefold()
+                rule = next((
+                    item for item in source_rules.get("field_rules", [])
+                    if isinstance(item, dict)
+                    and endpoint_id in {str(scope) for scope in item.get("endpoint_scope", [])}
+                    and leaf in {str(name).casefold() for name in item.get("field_names", [])}
+                ), None)
+                source_evidence = next((
+                    item for item in (rule.get("evidence", []) if isinstance(rule, dict) else [])
+                    if isinstance(item, dict)
+                ), None)
+                evidence = copy.deepcopy(source_evidence) if source_evidence else {
+                    "source_kind": "openapi",
+                    "file": str(openapi),
+                    "symbol": f"{endpoint_id}:{field_path}",
+                    "line": 1,
+                    "endpoint_scope": [endpoint_id],
+                    "confidence": "medium",
+                }
+                evidence["endpoint_scope"] = [endpoint_id]
+                fields.append({
+                    "endpoint_id": endpoint_id,
+                    "field_path": field_path,
+                    "status": "manual_confirmation" if isinstance(value, str) and value.startswith("review-") else "resolved",
+                    "value": value,
+                    "evidence": evidence,
+                })
+        output = directory / "value-resolution.yaml"
+        output.write_text(
+            _yaml_dump({"version": 1, "module": endpoint_doc.get("module", directory.name), "fields": fields}),
+            encoding="utf-8",
+        )
+        paths.append(output)
+    return paths
+
+
+def _yaml_dump(value: Any) -> str:
     try:
         import yaml  # type: ignore[import-not-found]
     except ModuleNotFoundError as exc:
         raise ValueError("source constraints require PyYAML") from exc
+    return yaml.safe_dump(value, allow_unicode=True, sort_keys=False)
+
+
+def write_source_constraints(
+    qa_root: Path,
+    roots: list[Path],
+    manifest: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    document = extract_source_constraints(roots)
+    if manifest is not None:
+        document = scope_source_constraints(document, manifest)
+    path = qa_root / CONSTRAINTS / "source-rules.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
     if path.is_file():
         previous = load_data(path)
         if isinstance(previous, dict):
@@ -710,7 +984,7 @@ def write_source_constraints(qa_root: Path, roots: list[Path]) -> dict[str, Any]
             current_stable = {key: value for key, value in document.items() if key != "generated_at"}
             if previous_stable == current_stable:
                 document["generated_at"] = previous.get("generated_at", document["generated_at"])
-    rendered = yaml.safe_dump(document, allow_unicode=True, sort_keys=False)
+    rendered = _yaml_dump(document)
     if not path.is_file() or path.read_text(encoding="utf-8", errors="strict") != rendered:
         path.write_text(rendered, encoding="utf-8")
     return document
@@ -727,6 +1001,7 @@ def main() -> int:
     parser.add_argument("--qa-root", type=Path, default=Path("qa"))
     parser.add_argument("--manifest", type=Path, help="optional extracted OpenAPI manifest to enrich in place")
     args = parser.parse_args()
+    migrate_legacy_layout(args.qa_root)
     missing = [str(root) for root in args.source_roots if not root.is_dir()]
     if missing:
         parser.error("source root(s) do not exist: " + ", ".join(missing))

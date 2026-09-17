@@ -8,14 +8,29 @@ import subprocess
 from pathlib import Path
 
 
+WINDOWS_EXECUTABLE_SUFFIXES = (".cmd", ".exe", ".bat", "", ".ps1")
+
+
 def _cmd_quote(value: str) -> str:
     if "\0" in value or "\r" in value or "\n" in value:
         raise ValueError("Windows command arguments cannot contain NUL or newlines")
     return '"' + value.replace("%", "^%").replace('"', '""') + '"'
 
 
+def resolve_executable(executable: str) -> str | None:
+    """Resolve a command predictably, preferring npm's Windows launcher."""
+
+    if os.name != "nt" or Path(executable).suffix:
+        return shutil.which(executable)
+    for suffix in WINDOWS_EXECUTABLE_SUFFIXES:
+        resolved = shutil.which(f"{executable}{suffix}")
+        if resolved:
+            return resolved
+    return None
+
+
 def command_argv(executable: str, *arguments: str) -> list[str] | str:
-    resolved = shutil.which(executable)
+    resolved = resolve_executable(executable)
     if not resolved:
         raise FileNotFoundError(executable)
     if os.name == "nt" and Path(resolved).suffix.lower() in {".cmd", ".bat"}:

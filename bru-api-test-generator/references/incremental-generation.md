@@ -3,10 +3,10 @@
 Run:
 
 ```bash
-bruno-api-test-generator generate --openapi qa/contracts/openapi.json --incremental
+bruno-api-test-generator generate --openapi qa/data/contracts/openapi.json --incremental
 ```
 
-`qa/contracts/generation-state.yaml` records the OpenAPI SHA, stable endpoint
+`qa/data/contracts/generation-state.yaml` records the OpenAPI SHA, stable endpoint
 IDs, endpoint fingerprints, module contract fingerprints, case structural
 fingerprints, last generation time, generator version, deleted endpoints, and
 manual-review cases. `qa-lock.yaml` independently seals the current state.
@@ -20,7 +20,7 @@ The generator follows these rules:
 - Existing case content is fingerprinted without generated path fields. A
   manual change is preserved and marked `manual_review: true`.
 - Writes use content comparison, so identical regeneration does not change
-  timestamps or create meaningless Git diffs.
+  timestamps or create meaningless workspace changes.
 
 The stable endpoint ID and stable English case ID are identities; business
 titles and filenames are presentation. A title change must reconcile

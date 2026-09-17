@@ -17,6 +17,7 @@ from typing import Any
 sys.dont_write_bytecode = True
 
 from execution_config import initialize_execution_layout
+from qa_paths import EXECUTION, canonicalize_legacy_path
 from tool_version import GENERATOR_VERSION
 
 HTTP_METHODS = {
@@ -199,8 +200,9 @@ def extract(path: Path, document: dict[str, Any]) -> dict[str, Any]:
                     None,
                 )
             endpoint_tags = operation_tags(operation, method, route)
+            endpoint_id = stable_id(method.upper(), route, operation)
             endpoint = {
-                "id": stable_id(method.upper(), route, operation),
+                "id": endpoint_id,
                 "method": method.upper(),
                 "path": route,
                 "operation_id": operation.get("operationId"),
@@ -210,6 +212,14 @@ def extract(path: Path, document: dict[str, Any]) -> dict[str, Any]:
                 "request_body": body,
                 "responses": resolve_value(document, operation.get("responses", {})),
                 "security": operation.get("security", document.get("security")),
+                "evidence": {
+                    "source_kind": "openapi",
+                    "file": str(path),
+                    "symbol": str(operation.get("operationId") or f"{method.upper()} {route}"),
+                    "line": 1,
+                    "endpoint_scope": [endpoint_id],
+                    "confidence": "high",
+                },
             }
             for extension in (
                 "x-permissions", "x-permission", "x-roles", "x-role",
@@ -816,6 +826,14 @@ def inferred_scenario_matrix(endpoint: dict[str, Any]) -> dict[str, dict[str, An
     parameters = [item for item in endpoint.get("parameters", []) if isinstance(item, dict)]
     media_type, body_schema = request_body_schema(endpoint)
     query = [item for item in parameters if item.get("in") == "query"]
+    body_properties = body_schema.get("properties", {}) if isinstance(body_schema.get("properties"), dict) else {}
+    body_required = body_schema.get("required", []) if isinstance(body_schema.get("required"), list) else []
+    non_file_required = any(
+        name not in body_properties
+        or not isinstance(body_properties.get(name), dict)
+        or body_properties[name].get("format") != "binary"
+        for name in body_required
+    )
     validation_applicable = any(
         parameter.get("required") is True
         or any(
@@ -824,18 +842,17 @@ def inferred_scenario_matrix(endpoint: dict[str, Any]) -> dict[str, dict[str, An
         )
         for parameter in parameters
     ) or bool(
-        body_schema.get("required")
+        non_file_required
         or any(
             isinstance(schema, dict)
+            and schema.get("format") != "binary"
             and any(key in schema for key in ("enum", "pattern", "minimum", "maximum", "minLength", "maxLength", "format"))
             for schema in (
-                body_schema.get("properties", {}).values()
-                if isinstance(body_schema.get("properties"), dict)
-                else []
+                body_properties.values()
             )
         )
     ) or bool(media_type and "415" in (endpoint.get("responses") or {}))
-    properties = body_schema.get("properties", {}) if isinstance(body_schema.get("properties"), dict) else {}
+    properties = body_properties
     file_applicable = media_type == "multipart/form-data" or any(
         isinstance(value, dict) and value.get("format") == "binary"
         for value in properties.values()
@@ -1120,12 +1137,21 @@ def seed_contract_cases(
     endpoint_id = str(endpoint.get("id", "ENDPOINT"))
     responses = endpoint.get("responses", {}) if isinstance(endpoint.get("responses"), dict) else {}
     success_status = next((int(code) for code in responses if str(code).isdigit() and 200 <= int(code) < 300), None)
-    error_status = next((int(code) for code in responses if str(code) in {"400", "422"}), None)
+    exception_profile = endpoint.get("x-exception-profile", {}) if isinstance(endpoint.get("x-exception-profile"), dict) else {}
+    profile_status = exception_profile.get("http_status")
+    error_status = profile_status if isinstance(profile_status, int) else next(
+        (int(code) for code in responses if str(code) in {"400", "422"}), None,
+    )
     obligations = {
         str(item.get("id")): item
         for item in endpoint.get("obligations", constraint_obligations(endpoint))
         if isinstance(item, dict) and item.get("id")
     }
+
+    fixture_prefix = re.sub(r"[^A-Za-z0-9]+", "_", endpoint_id).strip("_").upper() or "ENDPOINT"
+
+    def fixture_variable(fixture_type: str) -> str:
+        return f"{fixture_prefix}_FILE_{fixture_type.replace('-', '_').upper()}"
 
     def obligation_ids(target: str, *constraints: str) -> list[str]:
         wanted = set(constraints)
@@ -1143,7 +1169,7 @@ def seed_contract_cases(
         if isinstance(enum, list) and enum:
             return copy.deepcopy(enum[0])
         if schema.get("format") == "binary":
-            return {"file": "{{UPLOAD_FILE}}"}
+            return {"file": "{{" + fixture_variable("legal") + "}}"}
         kind = str(schema.get("type", "string")).lower()
         if kind == "integer":
             return max(int(schema.get("minimum", 1)), 1)
@@ -1162,6 +1188,16 @@ def seed_contract_cases(
                 str(field): schema_value(properties.get(field, {}) if isinstance(properties.get(field), dict) else {}, str(field))
                 for field in names
             }
+        if kind == "string" and not schema.get("pattern"):
+            value = {
+                "date": "2026-01-01",
+                "date-time": "2026-01-01T00:00:00Z",
+                "email": "qa@example.com",
+                "uuid": "00000000-0000-4000-8000-000000000001",
+            }.get(str(schema.get("format", "")).lower(), f"test-{name}")
+            minimum = max(int(schema.get("minLength", 0)), 1)
+            maximum = int(schema.get("maxLength", max(len(value), minimum)))
+            return value.ljust(minimum, "x")[:maximum]
         return f"review-{name}"
 
     def set_parameter(request: dict[str, Any], parameter: dict[str, Any], value: Any) -> None:
@@ -1210,7 +1246,13 @@ def seed_contract_cases(
         success_request["body"] = schema_value(body_schema, "body")
 
     success_assertions = exact_response_assertions(endpoint, success_status) if success_status is not None else []
-    error_assertions = exact_error_assertions(endpoint, error_status) if error_status is not None else []
+    profile_codes = exception_profile.get("business_codes", []) if isinstance(exception_profile.get("business_codes"), list) else []
+    profile_code_path = str(exception_profile.get("business_code_path") or "")
+    error_assertions = (
+        [{"path": profile_code_path, "equals": profile_codes[0]}]
+        if error_status is not None and profile_code_path and profile_codes
+        else exact_error_assertions(endpoint, error_status) if error_status is not None else []
+    )
 
     def build(
         suffix: str,
@@ -1220,9 +1262,13 @@ def seed_contract_cases(
         request: dict[str, Any],
         coverage_ids: list[str] | None = None,
         assertions: list[dict[str, Any]] | None = None,
+        fixture_type: str | None = None,
     ) -> dict[str, Any]:
+        failure_scenarios = {"validation", "authentication", "authorization", "business_error", "file"}
         case_assertions = copy.deepcopy(
-            assertions if assertions is not None else (success_assertions if 200 <= status < 300 else error_assertions)
+            assertions if assertions is not None else (
+                error_assertions if scenario in failure_scenarios else success_assertions
+            )
         )
         exact = bool(case_assertions)
         if scenario == "query" and 200 <= status < 300:
@@ -1249,6 +1295,13 @@ def seed_contract_cases(
             "coverage_ids": list(dict.fromkeys(coverage_ids or [])),
             "assertions": case_assertions,
         }
+        if scenario != "success" and status == profile_status and profile_code_path and profile_codes:
+            built["expected"].update({
+                "business_code": profile_codes[0],
+                "business_code_path": profile_code_path,
+            })
+        if fixture_type:
+            built["fixture_type"] = fixture_type
         if review_values:
             built["review_reasons"] = {
                 value: "OpenAPI、源码约束库、执行证据和本地环境均未提供可用值"
@@ -1256,6 +1309,22 @@ def seed_contract_cases(
             }
         elif not exact:
             built["review_reason"] = "OpenAPI、源码和已有执行证据不足以生成精确响应断言"
+        if review_required:
+            evidence = copy.deepcopy(endpoint.get("evidence")) if isinstance(endpoint.get("evidence"), dict) else {
+                "source_kind": "openapi",
+                "file": "openapi",
+                "symbol": endpoint_id,
+                "line": 1,
+                "endpoint_scope": [endpoint_id],
+                "confidence": "medium",
+            }
+            built["manual_confirmation"] = {
+                "automation_blocker": (
+                    "No exact source, SQL, test, configuration, environment, or runtime value was found"
+                    if review_values else "No exact response result could be derived from current evidence"
+                ),
+                "search_records": [evidence],
+            }
         return built
 
     seeded = [build("SUCCESS", "success", "", success_status, success_request)] if success_status is not None else []
@@ -1426,6 +1495,10 @@ def seed_contract_cases(
                 obligation_ids(target, constraint),
             ))
     binary_fields = [item for item in members if item[2].get("format") == "binary"]
+    if binary_fields:
+        for case in seeded:
+            if case.get("scenario") == "success":
+                case["fixture_type"] = "legal"
     if media_type == "multipart/form-data" and binary_fields and error_status is not None:
         request = copy.deepcopy(success_request)
         for _, access, _, _ in binary_fields:
@@ -1517,19 +1590,26 @@ def seed_contract_cases(
             seeded.append(build("FORBIDDEN", "authorization", "权限不足", 403, request))
 
         if binary_fields and error_status is not None:
+            excel_upload = any(
+                any(str(value).casefold().lstrip(".") in {"xls", "xlsx"} for value in constraints.get("x-allowed-extensions", []))
+                or "spreadsheet" in str(constraints.get("contentMediaType", "")).casefold()
+                or constraints.get("x-excel-template") is not None
+                for _, _, constraints, _ in binary_fields
+            )
             file_cases = (
-                ("EMPTY_UPLOAD_FILE", "上传空文件", "{{EMPTY_UPLOAD_FILE}}", ("minLength", "x-min-size")),
-                ("INVALID_FILE_EXTENSION", "文件扩展名非法", "{{INVALID_EXTENSION_FILE}}", ("x-allowed-extensions",)),
-                ("INVALID_FILE_MIME", "文件 MIME 类型非法", "{{INVALID_MIME_FILE}}", ("contentMediaType", "x-allowed-mime-types")),
-                ("OVERSIZED_UPLOAD_FILE", "文件超过声明大小", "{{OVERSIZED_UPLOAD_FILE}}", ("maxLength", "x-max-size")),
+                ("EMPTY_UPLOAD_FILE", "上传空文件", "empty", ("minLength", "x-min-size")),
+                ("INVALID_FILE_EXTENSION", "文件扩展名非法", "invalid-extension", ("x-allowed-extensions",)),
+                ("INVALID_FILE_MIME", "文件 MIME 类型非法", "invalid-mime", ("contentMediaType", "x-allowed-mime-types")),
+                ("OVERSIZED_UPLOAD_FILE", "文件超过声明大小", "oversized", ("maxLength", "x-max-size")),
             )
             for target, access, constraints, _ in binary_fields:
                 field_suffix = "" if len(binary_fields) == 1 else "_" + slugify_tag(target).replace("-", "_").upper()
-                for suffix, detail, value, evidence_keys in file_cases:
-                    if not any(key in constraints for key in evidence_keys):
+                for suffix, detail, fixture_type, evidence_keys in file_cases:
+                    excel_required = excel_upload and fixture_type in {"empty", "oversized"}
+                    if not excel_required and not any(key in constraints for key in evidence_keys):
                         continue
                     request = copy.deepcopy(success_request)
-                    mutate_body(request, access, {"file": value})
+                    mutate_body(request, access, {"file": "{{" + fixture_variable(fixture_type) + "}}"})
                     constraint = {
                         "EMPTY_UPLOAD_FILE": "empty",
                         "INVALID_FILE_EXTENSION": "extension",
@@ -1539,7 +1619,20 @@ def seed_contract_cases(
                     seeded.append(build(
                         suffix + field_suffix, "file", detail, error_status, request,
                         obligation_ids(target, constraint),
+                        fixture_type=fixture_type,
                     ))
+                if excel_upload:
+                    for suffix, detail, fixture_type in (
+                        ("HEADER_ONLY_UPLOAD_FILE", "Excel 表头下无数据", "header-only"),
+                        ("MISSING_COLUMN_UPLOAD_FILE", "Excel 缺少必需列", "missing-column"),
+                        ("INVALID_CONTENT_UPLOAD_FILE", "Excel 内容非法", "invalid-content"),
+                    ):
+                        request = copy.deepcopy(success_request)
+                        mutate_body(request, access, {"file": "{{" + fixture_variable(fixture_type) + "}}"})
+                        seeded.append(build(
+                            suffix + field_suffix, "file", detail, error_status, request,
+                            fixture_type=fixture_type,
+                        ))
 
         if endpoint.get("x-idempotent") or endpoint.get("x-safety"):
             seeded.append(build(
@@ -1580,13 +1673,16 @@ def write_partitioned(
     incremental: bool = False,
     coverage_profile: str = "full-matrix",
 ) -> dict[str, Any]:
-    qa_root = output_dir.parent.parent
+    contracts_root = output_dir.parent
+    qa_root = contracts_root.parent.parent if contracts_root.parent.name == "data" else contracts_root.parent
     if coverage_profile not in {"contract-draft", "full-matrix"}:
         raise ValueError(f"unsupported coverage profile: {coverage_profile}")
     try:
         initialize_execution_layout(qa_root)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
+    module_map_path = canonicalize_legacy_path(qa_root, module_map_path)
+    output_dir = canonicalize_legacy_path(qa_root, output_dir)
     module_map = load_document(module_map_path)
     grouped = partition_manifest(manifest, module_map)
     state_path = output_dir.parent / "generation-state.yaml"
@@ -1629,7 +1725,7 @@ def write_partitioned(
         "version": 1,
         "source": manifest["source"],
         "module_map": str(module_map_path),
-        "execution_config_file": str((qa_root / "execution" / "config.yaml")),
+        "execution_config_file": str((qa_root / EXECUTION / "config.yaml")),
         "generation_status": "draft",
         "coverage_profile": coverage_profile,
         "inventory_endpoints": len(manifest["endpoints"]),

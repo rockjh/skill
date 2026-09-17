@@ -42,11 +42,21 @@ OBSERVABLE_BRANCH_RE = re.compile(
     r"\b(?:if|switch|case|catch)\b[^\n]*(?:throw|error|fail|forbidden|unauthor|duplicate|exists|notFound|status|code)",
     re.IGNORECASE,
 )
+FILE_CONSTRAINT_RE = re.compile(
+    r"\b(?:MultipartFile|isEmpty\s*\(|getSize\s*\(|getOriginalFilename\s*\(|"
+    r"EasyExcel|ExcelReader|header|column|sheet|fileSize|maxFileSize)\b",
+    re.IGNORECASE,
+)
 EXCEPTION_HANDLER_RE = re.compile(r"@ExceptionHandler\s*\((.*?)\)", re.DOTALL)
 ERROR_CODE_TYPE_RE = re.compile(r"\b([A-Z]\w*(?:ErrorCode(?:Enum)?|ErrorCodes))\b")
 ERROR_CODE_VALUE_RE = re.compile(
     r"\b([A-Z][A-Z0-9_]*)\s*\(\s*(?:\"([^\"]+)\"|'([^']+)'|([A-Za-z0-9_.-]+))"
 )
+HTTP_STATUS_VALUES = {
+    "OK": 200, "BAD_REQUEST": 400, "UNAUTHORIZED": 401, "FORBIDDEN": 403,
+    "NOT_FOUND": 404, "CONFLICT": 409, "UNPROCESSABLE_ENTITY": 422,
+    "INTERNAL_SERVER_ERROR": 500,
+}
 SKIP_PARTS = {".git", "qa", "target", "build", "node_modules", "vendor", ".venv", "venv", "test", "tests"}
 JAVA_KEYWORDS = {"if", "for", "while", "switch", "catch", "return", "throw", "new", "super", "this", "synchronized"}
 
@@ -378,8 +388,8 @@ def scan(
         for block_kind, block in blocks:
             base_offset = method["text"].find(block) if block_kind == "normal_entrypoint" else method["body_offset"]
             for line_offset, line in enumerate(block.splitlines()):
-                evidence = " ".join(line.strip().split())[:300]
-                if not evidence:
+                excerpt = " ".join(line.strip().split())[:300]
+                if not excerpt:
                     continue
                 thrown = THROWN_EXCEPTION_RE.search(line)
                 selected_exception = bool(thrown and exception_name and thrown.group(1) == exception_name)
@@ -394,6 +404,8 @@ def scan(
                     kind, coverage_required = "authorization", True
                 elif selected_exception or selected_code:
                     kind, coverage_required = "business_exception", True
+                elif FILE_CONSTRAINT_RE.search(line):
+                    kind, coverage_required = "file_exception", True
                 elif VALIDATION_RE.search(line):
                     kind, coverage_required = "validation", True
                 elif OBSERVABLE_BRANCH_RE.search(line):
@@ -401,22 +413,30 @@ def scan(
                 if not kind:
                     continue
                 line_no = _line_number(method["text"], base_offset) + line_offset
-                key = (kind, symbol, line_no, evidence)
+                key = (kind, symbol, line_no, excerpt)
                 if key in seen_candidates:
                     continue
                 seen_candidates.add(key)
                 candidate: dict[str, Any] = {
-                    "id": _candidate_id(kind, symbol, line_no, evidence),
+                    "id": _candidate_id(kind, symbol, line_no, excerpt),
                     "kind": kind,
                     "file": str(method["path"]),
                     "line": line_no,
                     "language": "java",
                     "symbol": symbol,
-                    "evidence": evidence,
+                    "source_excerpt": excerpt,
                     "needs_case": coverage_required,
                     "coverage_required": coverage_required,
                     "endpoint_keys": endpoint_keys,
                     "endpoint_operation_ids": list(dict.fromkeys(operation_ids_by_key[key] for key in endpoint_keys)),
+                    "source_evidence": {
+                        "source_kind": kind,
+                        "file": str(method["path"]),
+                        "symbol": symbol,
+                        "line": line_no,
+                        "endpoint_scope": endpoint_keys,
+                        "confidence": "high",
+                    },
                 }
                 header = HEADER_RE.search(line)
                 if header:
@@ -427,7 +447,61 @@ def scan(
                     candidate["expected_business_codes"] = list(dict.fromkeys(codes))
                 if selected_exception and thrown:
                     candidate["exception_type"] = thrown.group(1)
+                if kind == "file_exception":
+                    lowered = line.casefold()
+                    candidate["fixture_type"] = (
+                        "empty" if "isempty" in lowered
+                        else "oversized" if "getsize" in lowered or "maxfilesize" in lowered or "filesize" in lowered
+                        else "missing-column" if "column" in lowered or "header" in lowered
+                        else "invalid-content"
+                    )
                 candidates.append(candidate)
+    exception_handlers: list[dict[str, Any]] = []
+    reachable_scopes = sorted({
+        scope
+        for candidate in candidates
+        if candidate.get("kind") == "business_exception"
+        for scope in candidate.get("endpoint_keys", [])
+    })
+    for path, class_name, text in files:
+        if "ControllerAdvice" not in text and "RestControllerAdvice" not in text:
+            continue
+        for match in METHOD_RE.finditer(text):
+            annotations = _leading_annotations(text, match.start())
+            handler_match = EXCEPTION_HANDLER_RE.search(annotations)
+            if not handler_match:
+                continue
+            opening = text.find("{", match.start())
+            closing = _matching_brace(text, opening)
+            body = text[opening + 1:closing]
+            status_name = next(iter(re.findall(r"HttpStatus\.([A-Z_]+)", annotations + body)), None)
+            numeric_status = next(iter(re.findall(r"(?:ResponseStatus|status)\s*\(\s*(\d{3})", annotations + body)), None)
+            http_status = int(numeric_status) if numeric_status else HTTP_STATUS_VALUES.get(str(status_name), 200)
+            combined = annotations + "\n" + body
+            business_code_path = (
+                "$.errorCode" if re.search(r"(?:setErrorCode|\berrorCode\b)", combined, re.IGNORECASE)
+                else "$.code" if re.search(r"(?:setCode|\bcode\b)", combined, re.IGNORECASE)
+                else None
+            )
+            exceptions = re.findall(r"\b([A-Z]\w*Exception)\s*\.class\b", handler_match.group(1))
+            handler_codes = [error_codes.get(name, name) for name in (code_re.findall(body) if code_re else [])]
+            handler_codes.extend(NUMERIC_CODE_RE.findall(body))
+            exception_handlers.append({
+                "id": f"{class_name}.{match.group('name')}",
+                "exception_types": exceptions,
+                "http_status": http_status,
+                "business_code_path": business_code_path,
+                "response_structure": list(dict.fromkeys(re.findall(r"\bset([A-Z]\w*)\s*\(", body))),
+                "business_codes": list(dict.fromkeys(handler_codes)),
+                "evidence": {
+                    "source_kind": "controller_advice",
+                    "file": str(path),
+                    "symbol": f"{class_name}.{match.group('name')}",
+                    "line": _line_number(text, match.start()),
+                    "endpoint_scope": reachable_scopes or sorted({scope for values in entrypoints.values() for scope in values}),
+                    "confidence": "high",
+                },
+            })
     return {
         "version": 2,
         "source": {"roots": [str(root) for root in roots], "language": "java"},
@@ -440,6 +514,7 @@ def scan(
         "entrypoint_count": len(entrypoints),
         "errors": errors,
         "candidates": candidates,
+        "exception_profile": {"version": 1, "handlers": exception_handlers},
     }
 
 

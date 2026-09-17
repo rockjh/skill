@@ -14,6 +14,7 @@ from typing import Any
 
 sys.dont_write_bytecode = True
 
+from qa_paths import BRUNO, CONSTRAINTS, CONTRACTS, EXECUTION, GLOBAL_EVIDENCE, LOGS, MODULE_EVIDENCE, RESULTS
 from tool_version import SCRIPTS_VERSION, SKILL_VERSION, SOURCE_REPOSITORY
 
 
@@ -40,6 +41,7 @@ SCRIPT_NAMES = (
     "parse_openapi.py",
     "qa_constraints.py",
     "qa_lock.py",
+    "qa_paths.py",
     "run_bruno.py",
     "runtime_preflight.py",
     "scripts_manager.py",
@@ -78,6 +80,16 @@ def metadata(source_root: Path, synchronized_at: str | None = None) -> dict[str,
         "skill_version": SKILL_VERSION,
         "scripts_version": SCRIPTS_VERSION,
         "source_repository": SOURCE_REPOSITORY,
+        "paths": {
+            "bruno": BRUNO.as_posix(),
+            "contracts": CONTRACTS.as_posix(),
+            "constraints": CONSTRAINTS.as_posix(),
+            "execution": EXECUTION.as_posix(),
+            "results": RESULTS.as_posix(),
+            "global_evidence": GLOBAL_EVIDENCE.as_posix(),
+            "module_evidence": MODULE_EVIDENCE.as_posix(),
+            "logs": LOGS.as_posix(),
+        },
         "scripts_sha256": bundle_sha(hashes),
         "synchronized_at": synchronized_at or datetime.now(timezone.utc).isoformat(),
         "files": hashes,
@@ -129,7 +141,7 @@ def check_scripts(qa_root: Path, source_root: Path) -> list[str]:
     except ValueError as exc:
         errors.append(str(exc))
         current = {}
-    for field in ("skill_version", "scripts_version", "source_repository", "scripts_sha256", "files"):
+    for field in ("skill_version", "scripts_version", "source_repository", "paths", "scripts_sha256", "files"):
         if current.get(field) != expected.get(field):
             errors.append(
                 f"qa/scripts/scripts-version.yaml {field} is {current.get(field)!r}, expected {expected.get(field)!r}"
@@ -166,7 +178,7 @@ def sync_scripts(qa_root: Path, source_root: Path) -> list[Path]:
             changed.append(target_readme)
     same_release = all(
         current.get(field) == expected.get(field)
-        for field in ("skill_version", "scripts_version", "source_repository", "scripts_sha256")
+        for field in ("skill_version", "scripts_version", "source_repository", "paths", "scripts_sha256")
     )
     if not same_release:
         version_path.write_text(render_metadata(expected), encoding="utf-8")

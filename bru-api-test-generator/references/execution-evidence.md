@@ -5,8 +5,8 @@ Static manifests prove intent. Normalized evidence proves what ran, and result r
 The runner keeps Bruno's raw report only in a temporary directory. It removes headers, redacts sensitive keys and token-shaped values, limits response size/depth, and persists normalized evidence under:
 
 ```text
-qa/evidence/global/<timestamp>-evidence.json
-qa/evidence/modules/<module-id>/<timestamp>-evidence.json
+qa/results/global/evidence/<timestamp>-evidence.json
+qa/results/modules/evidence/<module-id>/<timestamp>-evidence.json
 ```
 
 Pass status requires an executed request, successful request status, no runtime error, at least one assertion/test observation, and every observation passing. A top-level Bruno `pass` value alone is insufficient.

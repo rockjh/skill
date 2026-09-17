@@ -6,8 +6,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Iterable
@@ -16,14 +16,57 @@ sys.dont_write_bytecode = True
 
 from check_artifact_safety import scan as scan_secrets
 from manifest_io import first_list, load_data
+from qa_paths import (
+    BRUNO,
+    CONSTRAINTS,
+    CONTRACTS,
+    GLOBAL_EVIDENCE,
+    MODULE_EVIDENCE,
+    MODULE_RESULTS,
+    LOGS,
+    RESULTS,
+    migrate_legacy_layout,
+)
 
 
-RULES_VERSION = 1
+RULES_VERSION = 2
 REVIEW_RE = re.compile(r"review-[A-Za-z0-9_.-]+", re.IGNORECASE)
 META_NAME_RE = re.compile(r"(?ms)^\s*meta\s*\{.*?^\s*name:\s*([^\r\n}]+).*?^\s*\}")
+VARIABLE_RE = re.compile(r"\{\{([^{}]+)\}\}")
+FORBIDDEN_GIT_RE = re.compile(
+    r"(?:^|[;&|]\s*|\b)git\s+(?:log|show|blame|diff|rev-parse)\b",
+    re.IGNORECASE,
+)
+ALL_STAGES = (
+    "generation",
+    "materialization",
+    "check",
+    "pre-execution",
+    "run",
+    "post-execution",
+)
+EVIDENCE_FIELDS = ("source_kind", "file", "symbol", "line", "endpoint_scope", "confidence")
 
 
-DEFAULT_RULES: tuple[dict[str, Any], ...] = (
+MANDATORY_RULES: tuple[dict[str, Any], ...] = (
+    {"id": "SRC-001", "stages": list(ALL_STAGES), "required": True},
+    {"id": "SRC-002", "stages": ["generation", "materialization"], "required": True},
+    {"id": "RES-001", "stages": list(ALL_STAGES), "required": True},
+    {"id": "MAN-001", "stages": list(ALL_STAGES), "required": True},
+    {"id": "MAN-002", "stages": list(ALL_STAGES), "required": True},
+    {"id": "SCN-001", "stages": list(ALL_STAGES), "required": True},
+    {"id": "FILE-001", "stages": ["materialization", "pre-execution", "run"], "required": True},
+    {"id": "FILE-002", "stages": ["generation", "materialization"], "required": True},
+    {"id": "ERR-001", "stages": list(ALL_STAGES), "required": True},
+    {"id": "LOGIC-001", "stages": ["generation", "materialization"], "required": True},
+    {"id": "ASSERT-001", "stages": list(ALL_STAGES), "required": True},
+    {"id": "MAT-001", "stages": ["materialization", "pre-execution", "run"], "required": True},
+    {"id": "RUN-001", "stages": ["pre-execution", "run"], "required": True},
+    {"id": "OBS-001", "stages": ["post-execution"], "required": True},
+)
+
+
+DEFAULT_RULES: tuple[dict[str, Any], ...] = (*MANDATORY_RULES,
     {"id": "module-owner-unique", "stages": ["generation", "materialization", "pre-execution", "post-execution"], "required": True},
     {"id": "endpoint-unique", "stages": ["generation", "materialization", "pre-execution", "post-execution"], "required": True},
     {"id": "case-id-unique", "stages": ["generation", "materialization", "pre-execution", "post-execution"], "required": True},
@@ -38,6 +81,12 @@ DEFAULT_RULES: tuple[dict[str, Any], ...] = (
     {"id": "qa-assets-secret-free", "stages": ["generation", "materialization", "pre-execution", "post-execution"], "required": True},
     {"id": "source-domain-rules", "stages": ["generation", "materialization", "pre-execution", "post-execution"], "required": True},
 )
+
+DEFAULT_MANUAL_CONFIRMATION = {
+    "max_count": 20,
+    "max_ratio": 0.02,
+    "available_evidence_count": 0,
+}
 
 DATABASE_STEP_REASONS = {
     "setup": "missing_prerequisite_api",
@@ -99,14 +148,14 @@ def database_access_errors(case: dict[str, Any]) -> list[str]:
 
 
 def rules_path(qa_root: Path) -> Path:
-    return qa_root / "constraints" / "rules.yaml"
+    return qa_root / CONSTRAINTS / "rules.yaml"
 
 
 def qa_root_for_contracts(contracts_root: Path) -> Path:
     resolved = contracts_root.resolve()
     for candidate in (resolved, *resolved.parents):
         if candidate.name == "contracts":
-            return candidate.parent
+            return candidate.parent.parent if candidate.parent.name == "data" else candidate.parent
     return resolved.parent
 
 
@@ -124,7 +173,11 @@ def ensure_rule_library(qa_root: Path) -> Path:
     path = rules_path(qa_root)
     if not path.is_file():
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_render_yaml({"version": RULES_VERSION, "rules": list(DEFAULT_RULES)}), encoding="utf-8")
+        path.write_text(_render_yaml({
+            "version": RULES_VERSION,
+            "manual_confirmation": dict(DEFAULT_MANUAL_CONFIRMATION),
+            "rules": list(DEFAULT_RULES),
+        }), encoding="utf-8")
     errors = rule_library_errors(path)
     if errors:
         raise ValueError("; ".join(errors))
@@ -153,11 +206,17 @@ def rule_library_errors(path: Path) -> list[str]:
             errors.append(f"required machine constraint has incomplete stages: {required['id']}")
     unknown = sorted(set(configured) - {str(item["id"]) for item in DEFAULT_RULES})
     errors.extend(f"unknown machine constraint: {rule_id}" for rule_id in unknown)
+    manual = document.get("manual_confirmation", {}) if isinstance(document, dict) else {}
+    if manual != DEFAULT_MANUAL_CONFIRMATION:
+        errors.append(
+            "manual_confirmation budget must be max_count=20, max_ratio=0.02, "
+            "available_evidence_count=0"
+        )
     return errors
 
 
 def _module_documents(qa_root: Path, module: str | None = None) -> list[tuple[str, Path, dict[str, Any], dict[str, Any]]]:
-    contracts_root = qa_root / "contracts"
+    contracts_root = qa_root / CONTRACTS
     module_map_path = contracts_root / "module-map.yaml"
     module_map = load_data(module_map_path) if module_map_path.is_file() else {}
     metadata = {
@@ -244,8 +303,8 @@ def _review_authorization_errors(
     qa_root: Path,
     records: list[tuple[str, Path, dict[str, Any], dict[str, Any]]],
 ) -> list[str]:
-    available: dict[str, str] = {}
-    source_paths = [qa_root / "constraints" / "source-rules.yaml"]
+    available: dict[str, list[tuple[set[str], str]]] = {}
+    source_paths = [qa_root / CONSTRAINTS / "source-rules.yaml"]
     source_paths.extend(directory / "source-rules.yaml" for _, directory, _, _ in records)
     for path in source_paths:
         document = load_data(path) if path.is_file() else {}
@@ -260,7 +319,10 @@ def _review_authorization_errors(
             )
             if reusable:
                 for name in rule.get("field_names", []):
-                    available[_normalized_field(str(name))] = f"source rule {rule.get('id', '<unknown>')}"
+                    available.setdefault(_normalized_field(str(name)), []).append((
+                        _scope_values(rule.get("endpoint_scope")),
+                        f"source rule {rule.get('id', '<unknown>')}",
+                    ))
     config_path = qa_root / "execution" / "config.yaml"
     if config_path.is_file():
         try:
@@ -270,22 +332,31 @@ def _review_authorization_errors(
             environment_path = environment_file(config_path, config)
             for name, value in load_bruno_environment(environment_path).items():
                 if str(value).strip():
-                    available[_normalized_field(name)] = f"local environment variable {name}"
+                    available.setdefault(_normalized_field(name), []).append((set(), f"local environment variable {name}"))
         except (OSError, ValueError, TypeError):
             pass
     errors: list[str] = []
     for _, _, _, case_doc in records:
         for case in first_list(case_doc, "cases"):
             case_id = str(case.get("id", "<unknown>"))
+            endpoint_id = str(case.get("endpoint_id", ""))
             for value_path, placeholder in _walk_review_values(case.get("request", {}), "$.request"):
                 names = {
                     _normalized_field(placeholder.removeprefix("review-")),
                     _normalized_field(re.split(r"[.\[]", value_path)[-1].rstrip("]")),
                 }
-                source = next((available[name] for name in names if name in available), None)
+                source = next((
+                    description
+                    for name in names
+                    for scope, description in available.get(name, [])
+                    if not scope or endpoint_id in scope
+                ), None)
                 if source:
                     errors.append(
-                        f"case {case_id} review placeholder {placeholder} is unauthorized because {source} provides a value"
+                        _rule_error(
+                            "RES-001",
+                            f"case {case_id} review placeholder {placeholder} is unauthorized because {source} provides a value",
+                        )
                     )
     return errors
 
@@ -300,6 +371,505 @@ def needs_manual_confirmation(case: dict[str, Any]) -> bool:
             "assertions": case.get("assertions"),
         }))
     )
+
+
+def _rule_error(rule_id: str, message: str) -> str:
+    return f"[{rule_id}] {message}"
+
+
+def _scope_values(value: Any) -> set[str]:
+    if isinstance(value, str):
+        return {value} if value.strip() else set()
+    if isinstance(value, list):
+        return {str(item) for item in value if str(item).strip()}
+    return set()
+
+
+def evidence_errors(value: Any, label: str, require_scope: bool = True) -> list[str]:
+    if not isinstance(value, dict):
+        return [f"{label} evidence must be an object"]
+    errors: list[str] = []
+    for field in EVIDENCE_FIELDS:
+        if field == "endpoint_scope" and not require_scope:
+            continue
+        item = value.get(field)
+        if field == "line":
+            if not isinstance(item, int) or item < 1:
+                errors.append(f"{label} evidence.line must be a positive integer")
+        elif field == "endpoint_scope":
+            if not _scope_values(item):
+                errors.append(f"{label} evidence.endpoint_scope must name an endpoint or operation")
+        elif not str(item or "").strip():
+            errors.append(f"{label} evidence.{field} is required")
+    if str(value.get("source_kind", "")).casefold() == "git_history":
+        errors.append(f"{label} evidence uses forbidden source_kind git_history")
+    return errors
+
+
+def _structured_values(value: Any) -> Iterable[Any]:
+    yield value
+    if isinstance(value, dict):
+        for child in value.values():
+            yield from _structured_values(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _structured_values(child)
+
+
+def _source_provenance_errors(qa_root: Path) -> list[str]:
+    errors: list[str] = []
+    roots = [qa_root / CONSTRAINTS, qa_root / CONTRACTS, qa_root / "fixtures"]
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in sorted(item for item in root.rglob("*") if item.is_file()):
+            if path.suffix.lower() not in {".yaml", ".yml", ".json", ".bru", ".md", ".txt"}:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="strict")
+            except (OSError, UnicodeDecodeError):
+                continue
+            if FORBIDDEN_GIT_RE.search(text):
+                errors.append(_rule_error("SRC-001", f"forbidden Git history command found in {path}"))
+            if path.suffix.lower() in {".yaml", ".yml", ".json"}:
+                try:
+                    document = load_data(path)
+                except (OSError, ValueError, TypeError):
+                    continue
+                if any(
+                    isinstance(item, dict)
+                    and str(item.get("source_kind", "")).casefold() == "git_history"
+                    for item in _structured_values(document)
+                ):
+                    errors.append(_rule_error("SRC-001", f"git_history evidence found in {path}"))
+    return errors
+
+
+def _source_scope_errors(
+    qa_root: Path,
+    records: list[tuple[str, Path, dict[str, Any], dict[str, Any]]],
+) -> list[str]:
+    paths = [qa_root / CONSTRAINTS / "source-rules.yaml"]
+    paths.extend(directory / "source-rules.yaml" for _, directory, _, _ in records)
+    errors: list[str] = []
+    if records and not paths[0].is_file():
+        errors.append(_rule_error("SRC-002", f"source rule library is missing: {paths[0]}"))
+    endpoint_ids = {
+        str(endpoint.get("id"))
+        for _, _, endpoint_doc, _ in records
+        for endpoint in first_list(endpoint_doc, "endpoints")
+        if endpoint.get("id")
+    }
+    endpoint_keys = {
+        f"{str(endpoint.get('method', '')).upper()} {endpoint.get('path')}"
+        for _, _, endpoint_doc, _ in records
+        for endpoint in first_list(endpoint_doc, "endpoints")
+    }
+    for path in dict.fromkeys(paths):
+        if not path.is_file():
+            continue
+        document = load_data(path)
+        for rule in document.get("field_rules", []) if isinstance(document, dict) else []:
+            if not isinstance(rule, dict):
+                continue
+            label = f"source rule {rule.get('id', '<unknown>')}"
+            scope = _scope_values(rule.get("endpoint_scope"))
+            operation = str(rule.get("operation", "")).strip()
+            call_chain = rule.get("call_chain")
+            if not scope and not operation and not (isinstance(call_chain, list) and call_chain):
+                errors.append(_rule_error("SRC-002", f"{label} is not bound to an endpoint, operation, or call chain"))
+            unknown = scope - endpoint_ids - endpoint_keys
+            if unknown:
+                errors.append(_rule_error("SRC-002", f"{label} has unknown endpoint scope: {', '.join(sorted(unknown))}"))
+            evidence = rule.get("evidence", [])
+            if not isinstance(evidence, list) or not evidence:
+                errors.append(_rule_error("SRC-002", f"{label} has no source evidence"))
+            for index, item in enumerate(evidence if isinstance(evidence, list) else []):
+                errors.extend(
+                    _rule_error("SRC-002", message)
+                    for message in evidence_errors(item, f"{label}[{index}]")
+                )
+        for collection_name in ("error_codes", "response_rules", "endpoint_response_rules", "controller_bindings"):
+            for index, item in enumerate(document.get(collection_name, []) if isinstance(document, dict) else []):
+                if not isinstance(item, dict) or "evidence" not in item:
+                    continue
+                for message in evidence_errors(item.get("evidence"), f"{collection_name}[{index}]"):
+                    errors.append(_rule_error("SRC-002", message))
+    return errors
+
+
+def _manual_confirmation_errors(
+    records: list[tuple[str, Path, dict[str, Any], dict[str, Any]]],
+) -> list[str]:
+    errors: list[str] = []
+    for _, _, _, case_doc in records:
+        for case in first_list(case_doc, "cases"):
+            if not needs_manual_confirmation(case):
+                continue
+            case_id = str(case.get("id", "<unknown>"))
+            confirmation = case.get("manual_confirmation")
+            if not isinstance(confirmation, dict):
+                errors.append(_rule_error("MAN-001", f"case {case_id} has no manual_confirmation record"))
+                continue
+            if not str(confirmation.get("automation_blocker", "")).strip():
+                errors.append(_rule_error("MAN-001", f"case {case_id} does not explain why it cannot be automated"))
+            records_value = confirmation.get("search_records")
+            if not isinstance(records_value, list) or not records_value:
+                errors.append(_rule_error("MAN-001", f"case {case_id} has no complete search_records"))
+                continue
+            for index, evidence in enumerate(records_value):
+                errors.extend(
+                    _rule_error("MAN-001", message)
+                    for message in evidence_errors(evidence, f"case {case_id} search_records[{index}]")
+                )
+    return errors
+
+
+def _manual_budget_errors(
+    records: list[tuple[str, Path, dict[str, Any], dict[str, Any]]],
+    budget: dict[str, Any],
+    post_execution: bool = False,
+) -> list[str]:
+    cases = [case for _, _, _, document in records for case in first_list(document, "cases")]
+    manual = [case for case in cases if needs_manual_confirmation(case)]
+    count = len(manual)
+    ratio = count / len(cases) if cases else 0.0
+    errors: list[str] = []
+    if count > int(budget.get("max_count", -1)):
+        errors.append(_rule_error("MAN-002", f"manual confirmation count {count} exceeds {budget.get('max_count')}"))
+    if ratio > float(budget.get("max_ratio", -1)):
+        errors.append(_rule_error("MAN-002", f"manual confirmation ratio {ratio:.4f} exceeds {budget.get('max_ratio')}"))
+    if int(budget.get("available_evidence_count", -1)) != 0:
+        errors.append(_rule_error("MAN-002", "available_evidence_count must remain 0"))
+    if post_execution and count:
+        errors.append(_rule_error("MAN-002", "verified status requires zero manual confirmations"))
+    return errors
+
+
+def _scenario_errors(records: list[tuple[str, Path, dict[str, Any], dict[str, Any]]]) -> list[str]:
+    errors: list[str] = []
+    for _, _, endpoint_doc, case_doc in records:
+        cases_by_endpoint: dict[str, list[dict[str, Any]]] = {}
+        for case in first_list(case_doc, "cases"):
+            cases_by_endpoint.setdefault(str(case.get("endpoint_id", "")), []).append(case)
+        for endpoint in first_list(endpoint_doc, "endpoints"):
+            endpoint_id = str(endpoint.get("id", "<unknown>"))
+            matrix = endpoint.get("scenario_matrix", {}) if isinstance(endpoint.get("scenario_matrix"), dict) else {}
+            endpoint_cases = cases_by_endpoint.get(endpoint_id, [])
+            for scenario, decision in matrix.items():
+                if not isinstance(decision, dict):
+                    continue
+                matching = [case for case in endpoint_cases if str(case.get("scenario")) == str(scenario)]
+                if decision.get("applicable") is False and matching:
+                    errors.append(_rule_error(
+                        "SCN-001",
+                        f"endpoint {endpoint_id} scenario {scenario} is inapplicable but has cases: "
+                        + ", ".join(str(case.get("id")) for case in matching),
+                    ))
+                if decision.get("applicable") is True and not matching:
+                    errors.append(_rule_error("SCN-001", f"endpoint {endpoint_id} applicable scenario {scenario} has no case"))
+    return errors
+
+
+def _is_upload_endpoint(endpoint: dict[str, Any]) -> bool:
+    body = endpoint.get("request_body", {}) if isinstance(endpoint.get("request_body"), dict) else {}
+    content = body.get("content", {}) if isinstance(body.get("content"), dict) else {}
+    if "multipart/form-data" in content:
+        return True
+    return any(
+        isinstance(item, dict) and item.get("format") == "binary"
+        for item in _structured_values(body)
+    )
+
+
+def _fixture_document(qa_root: Path) -> tuple[Path, dict[str, Any]]:
+    path = qa_root / "fixtures" / "generated" / "manifest.yaml"
+    document = load_data(path) if path.is_file() else {}
+    return path, document if isinstance(document, dict) else {}
+
+
+def _environment_variables(qa_root: Path) -> dict[str, str]:
+    config_path = qa_root / "execution" / "config.yaml"
+    if not config_path.is_file():
+        return {}
+    try:
+        from execution_config import environment_file, load_bruno_environment, load_execution_config
+
+        config = load_execution_config(config_path)
+        return load_bruno_environment(environment_file(config_path, config))
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _file_fixture_errors(
+    qa_root: Path,
+    records: list[tuple[str, Path, dict[str, Any], dict[str, Any]]],
+    include_consistency: bool,
+) -> list[str]:
+    path, document = _fixture_document(qa_root)
+    fixtures = [item for item in document.get("fixtures", []) if isinstance(item, dict)]
+    variables = _environment_variables(qa_root)
+    errors: list[str] = []
+    uploads: dict[str, dict[str, Any]] = {}
+    cases: list[dict[str, Any]] = []
+    for _, _, endpoint_doc, case_doc in records:
+        uploads.update({
+            str(endpoint.get("id")): endpoint
+            for endpoint in first_list(endpoint_doc, "endpoints")
+            if endpoint.get("id") and _is_upload_endpoint(endpoint)
+        })
+        cases.extend(first_list(case_doc, "cases"))
+    if uploads and not path.is_file():
+        errors.append(_rule_error("FILE-001", f"fixture manifest is missing: {path}"))
+        return errors
+    for endpoint_id in uploads:
+        legal = [
+            item for item in fixtures
+            if item.get("type") == "legal" and endpoint_id in _scope_values(item.get("endpoint_scope"))
+        ]
+        if len(legal) != 1:
+            errors.append(_rule_error("FILE-001", f"upload endpoint {endpoint_id} must have exactly one dedicated legal fixture"))
+            continue
+        variable = str(legal[0].get("variable", ""))
+        if not variable or variable in {"UPLOAD_FILE", "FILE"}:
+            errors.append(_rule_error("FILE-001", f"upload endpoint {endpoint_id} uses a generic fixture variable"))
+        elif variable not in variables:
+            errors.append(_rule_error("FILE-001", f"upload endpoint {endpoint_id} fixture variable {variable} is missing"))
+        success_cases = [
+            case for case in cases
+            if str(case.get("endpoint_id")) == endpoint_id and str(case.get("scenario")) == "success"
+        ]
+        if not any(variable in VARIABLE_RE.findall(json.dumps(case.get("request", {}), ensure_ascii=False)) for case in success_cases):
+            errors.append(_rule_error("FILE-001", f"upload endpoint {endpoint_id} success case does not use {variable}"))
+    for case in cases:
+        if str(case.get("scenario")) != "file":
+            continue
+        endpoint_id = str(case.get("endpoint_id", ""))
+        if endpoint_id not in uploads:
+            errors.append(_rule_error("SCN-001", f"non-upload endpoint {endpoint_id} has file case {case.get('id')}"))
+    if not include_consistency:
+        return errors
+    for fixture in fixtures:
+        label = f"fixture {fixture.get('id', '<unknown>')}"
+        scope = _scope_values(fixture.get("endpoint_scope"))
+        if len(scope) != 1 or not scope.issubset(uploads):
+            errors.append(_rule_error("MAT-001", f"{label} must belong to exactly one upload endpoint"))
+        fixture_path = qa_root / str(fixture.get("path", ""))
+        if not fixture_path.is_file():
+            errors.append(_rule_error("MAT-001", f"{label} file is missing: {fixture_path}"))
+        elif fixture.get("sha256") != hashlib.sha256(fixture_path.read_bytes()).hexdigest():
+            errors.append(_rule_error("MAT-001", f"{label} checksum does not match"))
+        variable = str(fixture.get("variable", ""))
+        if variable and variable not in variables:
+            errors.append(_rule_error("MAT-001", f"{label} variable {variable} is missing from the active environment"))
+        elif variable:
+            configured_path = Path(variables[variable])
+            resolved_path = configured_path.resolve() if configured_path.is_absolute() else (qa_root / BRUNO / configured_path).resolve()
+            if fixture_path.resolve() != resolved_path:
+                errors.append(_rule_error("MAT-001", f"{label} variable {variable} points to {resolved_path}"))
+        for message in evidence_errors(fixture.get("evidence"), label):
+            errors.append(_rule_error("MAT-001", message))
+    fixture_keys = {
+        (next(iter(_scope_values(item.get("endpoint_scope"))), ""), str(item.get("type", ""))): str(item.get("variable", ""))
+        for item in fixtures
+    }
+    for case in cases:
+        fixture_type = str(case.get("fixture_type", ""))
+        if not fixture_type:
+            continue
+        endpoint_id = str(case.get("endpoint_id", ""))
+        expected_variable = fixture_keys.get((endpoint_id, fixture_type))
+        referenced = set(VARIABLE_RE.findall(json.dumps(case.get("request", {}), ensure_ascii=False)))
+        if not expected_variable or expected_variable not in referenced:
+            errors.append(_rule_error(
+                "MAT-001",
+                f"case {case.get('id')} fixture type {fixture_type} is inconsistent with the fixture manifest",
+            ))
+    return errors
+
+
+def _file_exception_errors(
+    qa_root: Path,
+    records: list[tuple[str, Path, dict[str, Any], dict[str, Any]]],
+) -> list[str]:
+    _, fixture_document = _fixture_document(qa_root)
+    fixtures = [item for item in fixture_document.get("fixtures", []) if isinstance(item, dict)]
+    errors: list[str] = []
+    for _, directory, _, case_doc in records:
+        cases = first_list(case_doc, "cases")
+        logic_doc = load_data(directory / "logic.yaml") if (directory / "logic.yaml").is_file() else {}
+        for logic in first_list(logic_doc, "logic"):
+            fixture_type = str(logic.get("fixture_type", ""))
+            if not fixture_type:
+                continue
+            endpoint_id = str(logic.get("endpoint_id", ""))
+            case_ids = {str(value) for value in logic.get("case_ids", [])}
+            if not any(str(case.get("id")) in case_ids and str(case.get("scenario")) == "file" for case in cases):
+                errors.append(_rule_error("FILE-002", f"source file exception {logic.get('id')} has no file case"))
+            if not any(
+                item.get("type") == fixture_type
+                and endpoint_id in _scope_values(item.get("endpoint_scope"))
+                for item in fixtures
+            ):
+                errors.append(_rule_error("FILE-002", f"source file exception {logic.get('id')} has no {fixture_type} fixture"))
+    return errors
+
+
+def _exception_profile_errors(
+    qa_root: Path,
+    records: list[tuple[str, Path, dict[str, Any], dict[str, Any]]],
+) -> list[str]:
+    path = qa_root / CONTRACTS / "exception-profile.yaml"
+    if records and not path.is_file():
+        return [_rule_error("ERR-001", f"exception profile is missing: {path}")]
+    document = load_data(path) if path.is_file() else {}
+    handlers = [item for item in document.get("handlers", []) if isinstance(item, dict)] if isinstance(document, dict) else []
+    errors: list[str] = []
+    for index, handler in enumerate(handlers):
+        for message in evidence_errors(handler.get("evidence"), f"exception handler[{index}]"):
+            errors.append(_rule_error("ERR-001", message))
+    for _, _, _, case_doc in records:
+        for case in first_list(case_doc, "cases"):
+            if str(case.get("scenario")) not in {"validation", "business_error"}:
+                continue
+            expected = case.get("expected", {}) if isinstance(case.get("expected"), dict) else {}
+            business_code = expected.get("business_code")
+            matching = [
+                item for item in handlers
+                if business_code is None
+                or not item.get("business_codes")
+                or str(business_code) in {str(value) for value in item.get("business_codes", [])}
+            ]
+            if not matching:
+                continue
+            handler = matching[0]
+            if expected.get("http_status") != handler.get("http_status"):
+                errors.append(_rule_error(
+                    "ERR-001",
+                    f"case {case.get('id')} HTTP status {expected.get('http_status')} does not match ControllerAdvice {handler.get('http_status')}",
+                ))
+            path_value = str(handler.get("business_code_path", ""))
+            assertions = case.get("assertions", []) if isinstance(case.get("assertions"), list) else []
+            if path_value and business_code is not None and not any(
+                isinstance(item, dict)
+                and str(item.get("path")) == path_value
+                and str(item.get("equals", item.get("eq"))) == str(business_code)
+                for item in assertions
+            ):
+                errors.append(_rule_error("ERR-001", f"case {case.get('id')} does not assert {path_value} exactly"))
+    return errors
+
+
+def _logic_errors(records: list[tuple[str, Path, dict[str, Any], dict[str, Any]]]) -> list[str]:
+    errors: list[str] = []
+    for _, directory, _, case_doc in records:
+        cases = {str(case.get("id")): case for case in first_list(case_doc, "cases") if case.get("id")}
+        logic_doc = load_data(directory / "logic.yaml") if (directory / "logic.yaml").is_file() else {}
+        for logic in first_list(logic_doc, "logic"):
+            if logic.get("reachable", True) is False or not logic.get("source_candidate_id"):
+                continue
+            for message in evidence_errors(logic.get("evidence"), f"logic {logic.get('id', '<unknown>')}"):
+                errors.append(_rule_error("LOGIC-001", message))
+            linked = [cases.get(str(case_id)) for case_id in logic.get("case_ids", [])]
+            executable = [case for case in linked if case and not needs_manual_confirmation(case)]
+            if not executable:
+                errors.append(_rule_error("LOGIC-001", f"reachable source branch {logic.get('id')} has no executable case"))
+    return errors
+
+
+def success_assertion_errors(case: dict[str, Any]) -> list[str]:
+    if str(case.get("scenario", "")).casefold() != "success":
+        return []
+    case_id = str(case.get("id", "<unknown>"))
+    expected = case.get("expected", {}) if isinstance(case.get("expected"), dict) else {}
+    assertions = [item for item in case.get("assertions", []) if isinstance(item, dict)] if isinstance(case.get("assertions"), list) else []
+    exact = [item for item in assertions if "equals" in item or "eq" in item or "equals_variable" in item or "length" in item]
+    business_paths = {"$.errorCode", "$.code", "$.status", "$.businessCode"}
+    has_business = expected.get("business_code") is not None or any(str(item.get("path")) in business_paths for item in exact)
+    envelope = business_paths | {"$.message", "$.msg", "$.errorMsg", "$"}
+    has_result = any(str(item.get("path", "")) not in envelope for item in exact) or any(
+        step.get("phase") == "assertion" and isinstance(step.get("expected"), dict) and step.get("expected")
+        for step in database_steps(case)
+    )
+    errors: list[str] = []
+    if not has_business:
+        errors.append(f"success case {case_id} has no exact business-code assertion")
+    if not has_result:
+        errors.append(f"success case {case_id} has no exact result assertion")
+    return errors
+
+
+def _success_assertion_rule_errors(records: list[tuple[str, Path, dict[str, Any], dict[str, Any]]]) -> list[str]:
+    return [
+        _rule_error("ASSERT-001", error)
+        for _, _, _, case_doc in records
+        for case in first_list(case_doc, "cases")
+        for error in success_assertion_errors(case)
+    ]
+
+
+def _value_resolution_errors(records: list[tuple[str, Path, dict[str, Any], dict[str, Any]]]) -> list[str]:
+    errors: list[str] = []
+    for _, directory, endpoint_doc, _ in records:
+        path = directory / "value-resolution.yaml"
+        if first_list(endpoint_doc, "endpoints") and not path.is_file():
+            errors.append(_rule_error("RES-001", f"value resolution is missing: {path}"))
+            continue
+        document = load_data(path) if path.is_file() else {}
+        for item in document.get("fields", []) if isinstance(document, dict) else []:
+            if not isinstance(item, dict):
+                continue
+            for message in evidence_errors(item.get("evidence"), f"value resolution {item.get('field_path', '<unknown>')}"):
+                errors.append(_rule_error("RES-001", message))
+            if item.get("status") == "resolved" and str(item.get("value", "")).startswith("review-"):
+                errors.append(_rule_error("RES-001", f"resolved field {item.get('field_path')} still uses review placeholder"))
+    return errors
+
+
+def _materialization_consistency_errors(
+    qa_root: Path,
+    records: list[tuple[str, Path, dict[str, Any], dict[str, Any]]],
+) -> list[str]:
+    errors = [_rule_error("MAT-001", item) for item in _registered_bru_errors(qa_root, records)]
+    variables = _environment_variables(qa_root)
+    for _, _, _, case_doc in records:
+        for case in first_list(case_doc, "cases"):
+            case_id = str(case.get("id", "<unknown>"))
+            referenced = set(VARIABLE_RE.findall(json.dumps(case.get("request", {}), ensure_ascii=False)))
+            missing = sorted(name for name in referenced if not str(variables.get(name, "")).strip())
+            if missing:
+                errors.append(_rule_error("MAT-001", f"case {case_id} references missing variable(s): {', '.join(missing)}"))
+    errors.extend(_file_fixture_errors(qa_root, records, include_consistency=True))
+    return errors
+
+
+def _observed_errors(
+    qa_root: Path,
+    records: list[tuple[str, Path, dict[str, Any], dict[str, Any]]],
+    module_scoped: bool,
+) -> list[str]:
+    passed: set[str] = set()
+    for document in _latest_evidence_documents(qa_root, records, module_scoped):
+        passed.update(str(value) for value in document.get("passed", []))
+    if not passed:
+        return []
+    paths = [directory / "observed-rules.yaml" for _, directory, _, _ in records] if module_scoped else [qa_root / CONSTRAINTS / "observed-rules.yaml"]
+    observations: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    for path in paths:
+        if not path.is_file():
+            continue
+        document = load_data(path)
+        for item in document.get("observations", []) if isinstance(document, dict) else []:
+            if not isinstance(item, dict):
+                continue
+            observations[str(item.get("case_id"))] = item
+            for message in evidence_errors(item.get("evidence"), f"observation {item.get('case_id', '<unknown>')}"):
+                errors.append(_rule_error("OBS-001", message))
+    missing = sorted(passed - set(observations))
+    if missing:
+        errors.append(_rule_error("OBS-001", f"successful cases have no observed evidence: {', '.join(missing)}"))
+    return errors
 
 
 def _request_errors(case: dict[str, Any]) -> list[str]:
@@ -371,9 +941,9 @@ def check_module_lock(qa_root: Path, module: str) -> list[str]:
 
 
 def _module_bru_root(qa_root: Path, directory: Path) -> Path:
-    candidate = qa_root / "bruno" / directory.name
-    canonical = (qa_root / "contracts" / "modules").is_dir()
-    return candidate if canonical or candidate.is_dir() else qa_root / "bruno"
+    candidate = qa_root / BRUNO / directory.name
+    canonical = (qa_root / CONTRACTS / "modules").is_dir()
+    return candidate if canonical or candidate.is_dir() else qa_root / BRUNO
 
 
 def _registered_bru_errors(qa_root: Path, records: list[tuple[str, Path, dict[str, Any], dict[str, Any]]]) -> list[str]:
@@ -494,7 +1064,7 @@ def _value_constraint_errors(case_id: str, field: str, value: Any, constraints: 
 
 def _source_rule_errors(qa_root: Path, records: list[tuple[str, Path, dict[str, Any], dict[str, Any]]]) -> list[str]:
     documents: list[dict[str, Any]] = []
-    global_path = qa_root / "constraints" / "source-rules.yaml"
+    global_path = qa_root / CONSTRAINTS / "source-rules.yaml"
     if global_path.is_file():
         loaded = load_data(global_path)
         if isinstance(loaded, dict):
@@ -584,9 +1154,9 @@ def _latest_evidence_documents(
     module_ids = {module_id for module_id, _, _, _ in records}
     roots: list[Path]
     if module_scoped:
-        roots = [qa_root / "evidence" / "modules" / module_id for module_id in sorted(module_ids)]
+        roots = [qa_root / MODULE_EVIDENCE / module_id for module_id in sorted(module_ids)]
     else:
-        roots = [qa_root / "evidence" / "global"]
+        roots = [qa_root / GLOBAL_EVIDENCE]
     documents: list[dict[str, Any]] = []
     for root in roots:
         paths = sorted(root.glob("*-evidence.json")) if root.is_dir() else []
@@ -636,14 +1206,6 @@ def _source_response_errors(
     return errors
 
 
-def _git_repository(path: Path) -> Path | None:
-    completed = subprocess.run(
-        ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
-        check=False, capture_output=True, text=True, encoding="utf-8", errors="replace",
-    )
-    return Path(completed.stdout.strip()).resolve() if completed.returncode == 0 and completed.stdout.strip() else None
-
-
 def _path_marker(path: Path) -> str:
     if not path.exists():
         return "<deleted>"
@@ -654,33 +1216,19 @@ def _path_marker(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _git_workspace_state(repository: Path) -> dict[str, Any]:
-    head = subprocess.run(
-        ["git", "-C", str(repository), "rev-parse", "HEAD"],
-        check=False, capture_output=True, text=True, encoding="utf-8", errors="replace",
-    )
-    changed = subprocess.run(
-        ["git", "-C", str(repository), "diff", "--name-only", "--no-renames", "-z", "HEAD"],
-        check=False, capture_output=True,
-    )
-    untracked = subprocess.run(
-        ["git", "-C", str(repository), "ls-files", "--others", "--exclude-standard", "-z"],
-        check=False, capture_output=True,
-    )
-    if head.returncode or changed.returncode or untracked.returncode:
-        raise ValueError(f"cannot capture Git workspace state under {repository}")
-    names = {
-        item.decode("utf-8", errors="surrogateescape")
-        for output in (changed.stdout, untracked.stdout)
-        for item in output.split(b"\0")
-        if item
+def _workspace_state(root: Path) -> dict[str, Any]:
+    """Capture current files without consulting version-control history."""
+
+    root = root.resolve()
+    files = {
+        path.relative_to(root).as_posix(): _path_marker(path)
+        for path in root.rglob("*")
+        if path.is_file()
+        and ".git" not in path.parts
+        and "__pycache__" not in path.parts
+        and "/worker-assignments/" not in f"/{path.relative_to(root).as_posix()}"
     }
-    names = {name for name in names if "/worker-assignments/" not in f"/{name.replace(chr(92), '/')}"}
-    return {
-        "repository": str(repository),
-        "head": head.stdout.strip(),
-        "files": {name: _path_marker(repository / name) for name in sorted(names)},
-    }
+    return {"root": str(root), "files": dict(sorted(files.items()))}
 
 
 def worker_snapshot_path(qa_root: Path, module: str) -> Path:
@@ -689,14 +1237,11 @@ def worker_snapshot_path(qa_root: Path, module: str) -> Path:
         raise ValueError(f"module is not unique: {module}")
     module_id = records[0][0]
     safe_id = re.sub(r"[^A-Za-z0-9._-]+", "-", module_id).strip("-") or "module"
-    return qa_root.resolve() / "contracts" / "worker-assignments" / f"{safe_id}.yaml"
+    return qa_root.resolve() / CONTRACTS / "worker-assignments" / f"{safe_id}.yaml"
 
 
 def write_worker_snapshot(qa_root: Path, module: str) -> Path:
     qa_root = qa_root.resolve()
-    repository = _git_repository(qa_root)
-    if repository is None:
-        raise ValueError("module-worker boundary enforcement requires a Git repository")
     records = _module_documents(qa_root, module)
     if len(records) != 1:
         raise ValueError(f"module is not unique: {module}")
@@ -705,7 +1250,7 @@ def write_worker_snapshot(qa_root: Path, module: str) -> Path:
         "version": 1,
         "module": records[0][0],
         "directory": records[0][1].name,
-        "baseline": _git_workspace_state(repository),
+        "baseline": _workspace_state(qa_root.parent),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(_render_yaml(document), encoding="utf-8")
@@ -718,14 +1263,14 @@ def worker_changed_paths(qa_root: Path, module: str) -> list[Path]:
         raise ValueError(f"module-worker snapshot is missing: {path}")
     document = load_data(path)
     baseline = document.get("baseline", {}) if isinstance(document, dict) else {}
-    repository = Path(str(baseline.get("repository", ""))).resolve()
-    current = _git_workspace_state(repository)
-    if current["head"] != baseline.get("head"):
-        raise ValueError("module-worker changed the Git HEAD; commits are coordinator-owned")
+    root = Path(str(baseline.get("root", ""))).resolve()
+    if not str(baseline.get("root", "")).strip() or not root.is_dir():
+        raise ValueError("module-worker filesystem snapshot has an invalid root")
+    current = _workspace_state(root)
     before = baseline.get("files", {}) if isinstance(baseline.get("files"), dict) else {}
     after = current.get("files", {}) if isinstance(current.get("files"), dict) else {}
     changed = sorted(name for name in set(before) | set(after) if before.get(name) != after.get(name))
-    return [repository / name for name in changed]
+    return [root / name for name in changed]
 
 
 def validate_worker_snapshot(qa_root: Path, module: str, stage: str) -> list[str]:
@@ -737,7 +1282,7 @@ def validate_worker_snapshot(qa_root: Path, module: str, stage: str) -> list[str
 
 
 def _manual_change_errors(qa_root: Path, records: list[tuple[str, Path, dict[str, Any], dict[str, Any]]]) -> list[str]:
-    state_path = qa_root / "contracts" / "generation-state.yaml"
+    state_path = qa_root / CONTRACTS / "generation-state.yaml"
     state = load_data(state_path) if state_path.is_file() else {}
     baselines = state.get("cases", {}) if isinstance(state, dict) and isinstance(state.get("cases"), dict) else {}
     errors: list[str] = []
@@ -771,11 +1316,11 @@ def _boundary_errors(qa_root: Path, actor: str, module: str | None, changed_path
         return [f"module-worker module is not unique: {module}"]
     module_id, directory, _, _ = records[0]
     allowed = (
-        qa_root / "contracts" / "modules" / directory.name,
-        qa_root / "bruno" / directory.name,
-        qa_root / "results" / "modules" / module_id,
-        qa_root / "evidence" / "modules" / module_id,
-        qa_root / "logs" / "modules" / module_id,
+        qa_root / CONTRACTS / "modules" / directory.name,
+        qa_root / BRUNO / directory.name,
+        qa_root / MODULE_RESULTS / module_id,
+        qa_root / MODULE_EVIDENCE / module_id,
+        qa_root / LOGS / "modules" / module_id,
     )
     errors: list[str] = []
     for raw in changed_paths:
@@ -807,6 +1352,30 @@ def validate_stage(
     }
     records = _module_documents(qa_root, module)
     identity_records = _module_documents(qa_root)
+    budget = document.get("manual_confirmation", {}) if isinstance(document, dict) else {}
+    if "SRC-001" in active:
+        errors.extend(_source_provenance_errors(qa_root))
+    if "SRC-002" in active:
+        errors.extend(_source_scope_errors(qa_root, records))
+    if "MAN-001" in active:
+        errors.extend(_manual_confirmation_errors(records))
+    if "MAN-002" in active:
+        errors.extend(_manual_budget_errors(records, budget, post_execution=stage == "post-execution"))
+    if "SCN-001" in active:
+        errors.extend(_scenario_errors(records))
+    if "RES-001" in active:
+        errors.extend(_review_authorization_errors(qa_root, records))
+        errors.extend(_value_resolution_errors(records))
+    if "FILE-001" in active:
+        errors.extend(_file_fixture_errors(qa_root, records, include_consistency=False))
+    if "FILE-002" in active:
+        errors.extend(_file_exception_errors(qa_root, records))
+    if "ERR-001" in active:
+        errors.extend(_exception_profile_errors(qa_root, records))
+    if "LOGIC-001" in active:
+        errors.extend(_logic_errors(records))
+    if "ASSERT-001" in active:
+        errors.extend(_success_assertion_rule_errors(records))
     if "module-owner-unique" in active:
         module_ids = [module_id for module_id, _, _, _ in identity_records]
         for module_id in sorted(set(module_ids)):
@@ -841,7 +1410,7 @@ def validate_stage(
                 errors.extend(database_access_errors(case))
             if "review-reason-required" in active:
                 errors.extend(review_reason_errors(case))
-    if "review-placeholder-authorized" in active:
+    if "review-placeholder-authorized" in active and "RES-001" not in active:
         errors.extend(_review_authorization_errors(qa_root, records))
     if "bru-registered" in active:
         errors.extend(_registered_bru_errors(qa_root, records))
@@ -849,6 +1418,10 @@ def validate_stage(
         errors.extend(_source_rule_errors(qa_root, records))
         if stage == "post-execution":
             errors.extend(_source_response_errors(qa_root, records, module_scoped=module is not None))
+    if "MAT-001" in active:
+        errors.extend(_materialization_consistency_errors(qa_root, records))
+    if "OBS-001" in active:
+        errors.extend(_observed_errors(qa_root, records, module_scoped=module is not None))
     if "manual-change-preserved" in active:
         errors.extend(_manual_change_errors(qa_root, records))
     if "registered-case-no-drift" in active:
@@ -858,14 +1431,14 @@ def validate_stage(
             try:
                 from qa_lock import check as check_qa_lock
 
-                errors.extend(check_qa_lock(qa_root / "contracts"))
+                errors.extend(check_qa_lock(qa_root / CONTRACTS))
             except (OSError, ValueError, TypeError) as exc:
                 errors.append(f"cannot validate registered case drift: {exc}")
     if "qa-assets-secret-free" in active:
         targets = [
             path for path in (
-                qa_root / "contracts", qa_root / "constraints", qa_root / "bruno",
-                qa_root / "evidence", qa_root / "results",
+                qa_root / CONTRACTS, qa_root / CONSTRAINTS, qa_root / BRUNO,
+                qa_root / RESULTS,
             )
             if path.exists()
         ]
@@ -878,12 +1451,13 @@ def validate_stage(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("qa_root", type=Path)
-    parser.add_argument("--stage", required=True, choices=("generation", "materialization", "pre-execution", "post-execution"))
+    parser.add_argument("--stage", required=True, choices=ALL_STAGES)
     parser.add_argument("--module")
     parser.add_argument("--actor", choices=("coordinator", "module-worker"), default="coordinator")
     parser.add_argument("--changed-path", action="append", type=Path, default=[])
     parser.add_argument("--init", action="store_true")
     args = parser.parse_args()
+    migrate_legacy_layout(args.qa_root)
     if args.init:
         ensure_rule_library(args.qa_root)
     errors = validate_stage(args.qa_root, args.stage, args.module, args.actor, args.changed_path or None)

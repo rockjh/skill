@@ -5,15 +5,16 @@ Use module manifests as the source of truth. The global index is generated from 
 ## Version Lock
 
 Keep `version-lock.yaml` and `qa-lock.yaml` at the contracts root. The first
-records the non-empty business Git commit and a digest excluding `qa/**`; the
-second records OpenAPI, module, case, and generation-state fingerprints. A
-stale lock is not a passing state.
+records a current-workspace source digest excluding `qa/**`; the second records
+OpenAPI, module, case, and generation-state fingerprints. A stale lock is not a
+passing state.
 
     version: 1
     business:
       repo: /path/to/business-repository
-      commit: abc123...
-      ref: main
+      commit: filesystem:0123456789abcdef
+      ref: filesystem
+      source_digest: 0123456789abcdef...
       impact_review: non-api
 
 The generated global index should also record `generation_status` (`draft`,
@@ -71,7 +72,7 @@ Each module owns its endpoint inventory:
     version: 1
     module: system-user
     source:
-      openapi_file: contracts/openapi.json
+      openapi_file: data/contracts/openapi.json
     endpoints:
       - id: USER_CREATE
         method: POST
@@ -177,9 +178,9 @@ must match the same deterministic name. Tag, summary, stable ID, and hash
 fallbacks are forbidden; collisions block generation. English IDs remain only
 in `meta.name`, manifests, and execution evidence.
 
-## contracts/README.md and module CASES.md
+## data/contracts/README.md and module CASES.md
 
-The parser generates `contracts/README.md` as the business-facing module
+The parser generates `data/contracts/README.md` as the business-facing module
 overview. It must contain every Tag module, its business scope, included
 contract artifacts, endpoint inventory, and a link to the module's `CASES.md`.
 Keep this overview aligned with `module-map.yaml` and `index.yaml`.
@@ -313,7 +314,7 @@ Generate this file; do not hand-edit it:
     generated_cases: 0
     failed_modules: 0
     source:
-      openapi_file: contracts/openapi.json
+      openapi_file: data/contracts/openapi.json
       swagger_sha256: ...
     modules:
       - id: system-user
@@ -335,4 +336,4 @@ Generate this file; do not hand-edit it:
 
 The global checker compares the union of module endpoints with the offline Swagger inventory and verifies that every endpoint, logic path, source candidate, case, and flow is accounted for. JSON request bodies are extracted as complete brace-balanced blocks, parsed with `json.loads()`, and compared structurally; malformed JSON reports its parse location.
 
-The checker should also reject duplicate IDs, duplicate case-to-file mappings, unregistered Bruno files, unknown case endpoint references, and missing scenario decisions when strict matrix validation is enabled. Pass the saved offline document explicitly (`--openapi contracts/openapi.json`) so a manifest cannot validate against itself.
+The checker should also reject duplicate IDs, duplicate case-to-file mappings, unregistered Bruno files, unknown case endpoint references, and missing scenario decisions when strict matrix validation is enabled. Pass the saved offline document explicitly (`--openapi qa/data/contracts/openapi.json`) so a manifest cannot validate against itself.

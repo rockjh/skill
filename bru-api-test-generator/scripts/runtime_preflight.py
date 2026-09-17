@@ -7,11 +7,13 @@ import argparse
 import ctypes
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -22,13 +24,15 @@ from typing import Any
 sys.dont_write_bytecode = True
 
 from execution_config import (
+    DEFAULT_CLI_TIMEOUT,
     environment_file,
     load_bruno_environment,
     load_execution_config,
     required_environment_names,
 )
-from command_execution import command_argv
+from command_execution import command_argv, resolve_executable
 from qa_lock import check as check_qa_lock
+from qa_constraints import validate_stage
 from manifest_io import load_data
 
 
@@ -139,11 +143,44 @@ def process_is_running(pid: Any) -> bool:
     return True
 
 
-def bruno_cli_version(executable: str, timeout: float = 10.0) -> tuple[tuple[int, int, int] | None, str]:
+def _output_text(value: str | bytes | None) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value or ""
+
+
+def _semantic_version(stdout: str, stderr: str) -> tuple[int, int, int] | None:
+    match = re.search(r"(?<!\d)(\d+)\.(\d+)\.(\d+)(?!\d)", f"{stdout}\n{stderr}")
+    return tuple(int(value) for value in match.groups()) if match else None
+
+
+def bruno_cli_probe(executable: str, timeout: float = DEFAULT_CLI_TIMEOUT) -> dict[str, Any]:
+    started = time.monotonic()
+    resolved = resolve_executable(executable)
+    result: dict[str, Any] = {
+        "name": "bruno_cli",
+        "ok": False,
+        "executable": executable,
+        "requested_executable": executable,
+        "resolved_executable": resolved,
+        "timeout_seconds": timeout,
+        "elapsed_seconds": 0.0,
+        "version": None,
+        "stdout": "",
+        "stderr": "",
+        "return_code": None,
+        "conclusion": "not_found" if not resolved else "execution_error",
+    }
+    if not resolved:
+        result["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        return result
     try:
-        command = command_argv(executable, "--version")
+        command = command_argv(resolved, "--version")
     except FileNotFoundError:
-        return None, ""
+        result["resolved_executable"] = None
+        result["conclusion"] = "not_found"
+        result["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        return result
     try:
         completed = subprocess.run(
             command,
@@ -151,13 +188,94 @@ def bruno_cli_version(executable: str, timeout: float = 10.0) -> tuple[tuple[int
             capture_output=True,
             text=True,
             encoding="utf-8",
+            errors="replace",
             timeout=timeout,
         )
+    except subprocess.TimeoutExpired as exc:
+        result["stdout"] = _output_text(exc.stdout).strip()
+        result["stderr"] = _output_text(exc.stderr).strip()
+        result["conclusion"] = "timeout"
+    except (OSError, subprocess.SubprocessError) as exc:
+        result["stderr"] = str(exc)
+        result["conclusion"] = "execution_error"
+    else:
+        stdout = (completed.stdout or "").strip()
+        stderr = (completed.stderr or "").strip()
+        version = _semantic_version(stdout, stderr)
+        result.update({
+            "stdout": stdout,
+            "stderr": stderr,
+            "return_code": completed.returncode,
+            "version": ".".join(str(value) for value in version) if version else None,
+        })
+        if completed.returncode:
+            result["conclusion"] = "execution_error"
+        elif version is None:
+            result["conclusion"] = "invalid_version_output"
+        elif version < MIN_BRUNO_VERSION:
+            result["conclusion"] = "unsupported_version"
+        else:
+            result["ok"] = True
+            result["conclusion"] = "ready"
+    result["elapsed_seconds"] = round(time.monotonic() - started, 3)
+    return result
+
+
+def bruno_cli_version(
+    executable: str, timeout: float = DEFAULT_CLI_TIMEOUT,
+) -> tuple[tuple[int, int, int] | None, str]:
+    """Compatibility wrapper for callers that only need the parsed version."""
+
+    check = bruno_cli_probe(executable, timeout)
+    version = check["version"]
+    parsed = tuple(int(value) for value in version.split(".")) if version else None
+    return parsed, check["stdout"] or check["stderr"]
+
+
+def node_runtime_version(timeout: float = 10.0) -> tuple[str | None, str | None]:
+    resolved = resolve_executable("node")
+    if not resolved:
+        return None, None
+    try:
+        completed = subprocess.run(
+            command_argv(resolved, "--version"), check=False, capture_output=True,
+            text=True, encoding="utf-8", errors="replace", timeout=timeout,
+        )
     except (OSError, subprocess.SubprocessError):
-        return None, ""
-    output = (completed.stdout or completed.stderr).strip()
-    match = re.search(r"(?<!\d)(\d+)\.(\d+)\.(\d+)(?!\d)", output)
-    return (tuple(int(value) for value in match.groups()) if match else None), output
+        return resolved, None
+    version = _semantic_version(completed.stdout or "", completed.stderr or "")
+    return resolved, ".".join(str(value) for value in version) if version else None
+
+
+def bruno_cli_failure(check: dict[str, Any]) -> str | None:
+    conclusion = check["conclusion"]
+    if conclusion == "ready":
+        return None
+    if conclusion == "not_found":
+        return f"Bruno CLI executable was not found on PATH: {check['requested_executable']}"
+    if conclusion == "timeout":
+        return (
+            f"Bruno CLI version probe timed out after {check['timeout_seconds']:g} seconds: "
+            f"{check['resolved_executable']}"
+        )
+    if conclusion == "unsupported_version":
+        return f"Bruno CLI {check['version']} is unsupported; version 4.1.0 or newer is required"
+    if conclusion == "invalid_version_output":
+        return f"Bruno CLI version probe did not report a semantic version: {check['resolved_executable']}"
+    return (
+        f"Bruno CLI version probe failed with exit code {check['return_code']}: "
+        f"{check['resolved_executable']}"
+    )
+
+
+def positive_timeout(value: str) -> float:
+    try:
+        timeout = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive number of seconds") from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise argparse.ArgumentTypeError("must be a positive number of seconds")
+    return timeout
 
 
 def atomic_write(path: Path, payload: str) -> None:
@@ -196,8 +314,12 @@ def main() -> int:
     parser.add_argument("--fixture", action="append", type=Path, default=[])
     parser.add_argument("--timeout", type=float, default=3.0)
     parser.add_argument("--bruno-cli", default="bru", help="Bruno CLI executable checked for execution readiness")
-    parser.add_argument("--cli-timeout", type=float, default=10.0, help="seconds allowed for the Bruno version probe")
+    parser.add_argument(
+        "--cli-timeout", type=positive_timeout,
+        help="seconds allowed for the Bruno version probe (overrides execution config; default: 60)",
+    )
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--qa-root", type=Path, help="QA root whose shared pre-execution rules must pass")
     args = parser.parse_args()
 
     checks: list[dict[str, Any]] = []
@@ -205,6 +327,13 @@ def main() -> int:
     context_failures: list[str] = []
     execution_failures: list[str] = []
     warnings: list[str] = []
+    constraint_failures = validate_stage(args.qa_root, "pre-execution") if args.qa_root else []
+    static_failures.extend(constraint_failures)
+    checks.append({
+        "name": "shared_constraint_gate",
+        "ok": not constraint_failures,
+        "errors": constraint_failures,
+    })
     config_path = args.execution_config or (Path(__file__).resolve().parents[1] / "execution" / "config.yaml")
     config: dict[str, Any] | None = None
     environment_values: dict[str, str] = {}
@@ -255,24 +384,20 @@ def main() -> int:
         execution_failures.append("base URL is missing; configure baseUrl in the active Bruno environment")
     if args.timeout <= 0:
         execution_failures.append("timeout must be positive")
-    if args.cli_timeout <= 0:
-        execution_failures.append("CLI timeout must be positive")
-
-    cli_version, cli_output = bruno_cli_version(args.bruno_cli, args.cli_timeout)
-    cli_available = cli_version is not None
-    cli_supported = cli_version is not None and cli_version >= MIN_BRUNO_VERSION
-    checks.append({
-        "name": "bruno_cli",
-        "ok": cli_supported,
-        "executable": args.bruno_cli,
-        "version": ".".join(str(value) for value in cli_version) if cli_version else None,
-    })
-    if not cli_available:
-        execution_failures.append(f"Bruno CLI is unavailable or did not report a semantic version: {args.bruno_cli}")
-    elif not cli_supported:
-        execution_failures.append(
-            f"Bruno CLI {cli_output} is unsupported; version 4.1.0 or newer is required"
-        )
+    cli_timeout = args.cli_timeout if args.cli_timeout is not None else (
+        config["cli_timeout"] if config else DEFAULT_CLI_TIMEOUT
+    )
+    if constraint_failures:
+        checks.append({"name": "bruno_cli", "ok": False, "skipped": "shared constraint gate failed"})
+    else:
+        cli_check = bruno_cli_probe(args.bruno_cli, cli_timeout)
+        node_executable, node_version = node_runtime_version(min(cli_timeout, 10.0))
+        cli_check["node_executable"] = node_executable
+        cli_check["node_version"] = node_version
+        checks.append(cli_check)
+        cli_failure = bruno_cli_failure(cli_check)
+        if cli_failure:
+            execution_failures.append(cli_failure)
 
     required_envs = list(args.require_env)
     if config:

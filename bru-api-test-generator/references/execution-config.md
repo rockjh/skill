@@ -1,16 +1,20 @@
 # Bruno Execution Configuration
 
-`qa/execution/config.yaml` has exactly four responsibilities:
+`qa/execution/config.yaml` keeps the active environment, tooling mode, coverage profile,
+Bruno CLI probe timeout, and optional signing mode:
 
 ```yaml
 active_environment: local
 tooling: project-scripts
 coverage_profile: full-matrix
+cli_timeout: 60
 sign:
   provider: disabled
 ```
 
 Allowed tool modes are `project-scripts` and `shared-cli`. Allowed coverage profiles are `contract-draft` and `full-matrix`; `verified` is an execution state, not a profile.
+`cli_timeout` is the positive number of seconds allowed for `bru --version`; `60` is the default.
+Use `run --cli-timeout 90` for a one-run override.
 
 Optional SHA-256 signing is structured:
 
@@ -18,6 +22,7 @@ Optional SHA-256 signing is structured:
 active_environment: local
 tooling: project-scripts
 coverage_profile: full-matrix
+cli_timeout: 60
 sign:
   provider: sha256
   version: v1
@@ -65,22 +70,27 @@ The launcher has one optional scope selector:
 ```bat
 qa\execution\run.bat
 qa\execution\run.bat --module "users"
+qa\execution\run.bat --cli-timeout 90
 ```
 
 No argument runs every module. `--module` accepts a module ID, display name, directory, or OpenAPI Tag and runs every registered request in that module. The generated launchers contain these examples as comments. There are no alternate scope classes, named plans, tags, or confirmation parameters.
 
+The launchers pass all options through to `run`. When Node or npm's global binary
+directory is not already on `PATH`, set `BRUNO_NODE_HOME` and/or `BRUNO_NPM_BIN`
+before launching; the scripts prepend only values explicitly provided by the operator.
+
 Bruno executes a directory directly instead of using tag filtering:
 
 ```text
-no argument -> bru run qa/bruno -r
---module x  -> bru run qa/bruno/<module-directory> -r
+no argument -> bru run qa/data/bruno -r
+--module x  -> bru run qa/data/bruno/<module-directory> -r
 ```
 
 Generated business requests do not contain `meta.tags`; execution scope is always the selected directory.
 
 ## Output And Logs
 
-The runner prints stage progress and a `PASS` or `FAIL` line for every selected case. Its final summary contains total, executed, passed, failed, and not-executed counts, plus failed IDs, manual confirmations, result/evidence paths, and version warnings. Global logs live under `qa/logs/`; module logs live under `qa/logs/modules/<module>/`.
+The runner prints stage progress and a `PASS` or `FAIL` line for every selected case. Its final summary contains total, executed, passed, failed, and not-executed counts, plus failed IDs, manual confirmations, result/evidence paths, and version warnings. Global logs live under `qa/results/logs/`; module logs live under `qa/results/logs/modules/<module>/`.
 
 ## Local And Remote Versions
 
@@ -102,7 +112,7 @@ vars {
 
 ## Tooling Modes And Migration
 
-`project-scripts` keeps a synchronized `qa/scripts` bundle. Its `scripts-version.yaml` records skill/script versions, source, aggregate and per-file SHA, and synchronization time:
+`project-scripts` keeps a synchronized `qa/scripts` bundle. Its `scripts-version.yaml` records canonical QA paths, skill/script versions, source, aggregate and per-file SHA, and synchronization time:
 
 ```bash
 bruno-api-test-generator scripts sync
@@ -111,6 +121,6 @@ bruno-api-test-generator scripts check
 
 `shared-cli` keeps only QA assets and calls the installed `bruno-api-test-generator` command from the launchers.
 
-Initialization migrates supported legacy runtime fields into the active environment, moves tooling into `execution/config.yaml`, and removes obsolete `qa.yaml` and `execution/plans.yaml`.
+Initialization migrates supported legacy runtime fields into the active environment, moves `bruno/`, `contracts/`, and `constraints/` into `data/`, merges legacy evidence and logs into `results/`, moves tooling into `execution/config.yaml`, and removes obsolete `qa.yaml` and `execution/plans.yaml`. Canonical directories win when both layouts exist.
 
 Module execution produces module-local evidence and `module_status`. It never updates the global version lock, generation state, index completion, or verified state.

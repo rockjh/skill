@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import shutil
 import subprocess
 import sys
-import tempfile
 import urllib.parse
+from datetime import datetime
 from pathlib import Path
 
 sys.dont_write_bytecode = True
@@ -28,6 +29,16 @@ from parse_openapi import (
 from qa_lock import check as check_qa_lock
 from qa_lock import refresh_generation_state_cases
 from qa_lock import write as write_qa_lock
+from qa_paths import (
+    BRUNO,
+    CONSTRAINTS,
+    CONTRACTS,
+    EXECUTION,
+    GLOBAL_RESULTS,
+    LOGS,
+    canonicalize_legacy_path,
+    migrate_legacy_layout,
+)
 from qa_constraints import (
     ensure_rule_library,
     validate_stage,
@@ -40,6 +51,8 @@ from source_constraints import (
     apply_constraints_to_manifest,
     apply_environment_values,
     apply_observed_constraints,
+    scope_source_constraints,
+    write_value_resolutions,
     write_source_constraints,
 )
 
@@ -52,7 +65,7 @@ def qa_root_argument(parser: argparse.ArgumentParser) -> None:
 
 
 def shared_cli_mode(qa_root: Path) -> bool:
-    config_path = qa_root / "execution" / "config.yaml"
+    config_path = qa_root / EXECUTION / "config.yaml"
     if not config_path.is_file():
         return False
     try:
@@ -81,7 +94,21 @@ def init_command(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     changed = initialize_execution_layout(args.qa_root, local_scripts=False if args.shared_cli else None)
     ensure_rule_library(args.qa_root)
-    (args.qa_root / "contracts" / "modules").mkdir(parents=True, exist_ok=True)
+    (args.qa_root / CONTRACTS / "modules").mkdir(parents=True, exist_ok=True)
+    initial_artifacts = {
+        args.qa_root / CONSTRAINTS / "source-rules.yaml": {
+            "version": 1, "source_roots": [], "source_inventory": {}, "field_rules": [],
+            "error_codes": [], "response_rules": [], "endpoint_response_rules": [], "controller_bindings": [],
+        },
+        args.qa_root / CONSTRAINTS / "observed-rules.yaml": {"version": 1, "observations": []},
+        args.qa_root / CONTRACTS / "exception-profile.yaml": {"version": 1, "handlers": []},
+        args.qa_root / "fixtures" / "generated" / "manifest.yaml": {"version": 1, "fixtures": []},
+    }
+    for path, document in initial_artifacts.items():
+        if not path.is_file():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(render_manifest(document, path), encoding="utf-8")
+            changed.append(path)
     print(f"initialized {args.qa_root} ({len(changed)} file(s) changed)")
     return 0
 
@@ -104,11 +131,11 @@ def generate_command(argv: list[str]) -> int:
     ensure_rule_library(qa_root)
     from execution_config import environment_file, load_bruno_environment, load_execution_config
 
-    execution_config = load_execution_config(qa_root / "execution" / "config.yaml")
+    execution_config = load_execution_config(qa_root / EXECUTION / "config.yaml")
     coverage_profile = args.coverage_profile or execution_config["coverage_profile"]
-    contracts = qa_root / "contracts"
+    contracts = qa_root / CONTRACTS
     contracts.mkdir(parents=True, exist_ok=True)
-    source_spec = (args.openapi or (contracts / "openapi.json")).resolve()
+    source_spec = canonicalize_legacy_path(qa_root, args.openapi) if args.openapi else contracts / "openapi.json"
     if not source_spec.is_file():
         parser.error(f"offline OpenAPI document does not exist: {source_spec}")
     saved_spec = contracts / ("openapi.yaml" if source_spec.suffix.lower() in {".yaml", ".yml"} else "openapi.json")
@@ -116,28 +143,69 @@ def generate_command(argv: list[str]) -> int:
         shutil.copy2(source_spec, saved_spec)
     source_document = load_document(saved_spec)
     manifest = extract(saved_spec, source_document)
-    source_constraints_path = qa_root / "constraints" / "source-rules.yaml"
+    source_constraints_path = qa_root / CONSTRAINTS / "source-rules.yaml"
     if args.source_root:
         missing = [str(path) for path in args.source_root if not path.is_dir()]
         if missing:
             parser.error("source root(s) do not exist: " + ", ".join(missing))
-        source_constraints = write_source_constraints(qa_root, args.source_root)
+        source_constraints = write_source_constraints(qa_root, args.source_root, manifest)
         apply_constraints_to_manifest(manifest, source_constraints)
     elif source_constraints_path.is_file():
-        apply_constraints_to_manifest(manifest, load_document(source_constraints_path))
-    observed_paths = [qa_root / "constraints" / "observed-rules.yaml"]
+        source_constraints = scope_source_constraints(load_document(source_constraints_path), manifest)
+        source_constraints_path.write_text(render_manifest(source_constraints, source_constraints_path), encoding="utf-8")
+        apply_constraints_to_manifest(manifest, source_constraints)
+    else:
+        source_constraints = {
+            "version": 1,
+            "generated_at": datetime.now().isoformat(),
+            "source_roots": [],
+            "source_inventory": {},
+            "field_rules": [],
+            "error_codes": [],
+            "response_rules": [],
+            "endpoint_response_rules": [],
+            "controller_bindings": [],
+        }
+        source_constraints_path.parent.mkdir(parents=True, exist_ok=True)
+        source_constraints_path.write_text(render_manifest(source_constraints, source_constraints_path), encoding="utf-8")
+    observed_paths = [qa_root / CONSTRAINTS / "observed-rules.yaml"]
     observed_paths.extend((contracts / "modules").glob("*/observed-rules.yaml"))
     for observed_path in observed_paths:
         if observed_path.is_file():
             observed = load_document(observed_path)
             apply_observed_constraints(manifest, observed)
-    environment_path = environment_file(qa_root / "execution" / "config.yaml", execution_config)
+    environment_path = environment_file(qa_root / EXECUTION / "config.yaml", execution_config)
     if environment_path.is_file():
         apply_environment_values(manifest, load_bruno_environment(environment_path))
     for endpoint in manifest.get("endpoints", []):
         if isinstance(endpoint, dict):
             endpoint["obligations"] = constraint_obligations(endpoint)
-    module_map = (args.module_map or (contracts / "module-map.yaml")).resolve()
+    source_candidates: dict[str, object] | None = None
+    if args.source_root:
+        source_candidates = scan_source_logic(args.source_root, None, args.exception_type, args.error_code_type)
+        if source_candidates.get("errors"):
+            for error in source_candidates["errors"]:
+                print(f"ERROR: {error}", file=sys.stderr)
+            return 2
+        profile = source_candidates.get("java", {}).get("exception_profile", {}) if isinstance(source_candidates.get("java"), dict) else {}
+        handlers = profile.get("handlers", []) if isinstance(profile, dict) else []
+        for endpoint in manifest.get("endpoints", []):
+            if not isinstance(endpoint, dict):
+                continue
+            endpoint_key = f"{str(endpoint.get('method', '')).upper()} {endpoint.get('path')}"
+            handler = next((
+                item for item in handlers
+                if isinstance(item, dict)
+                and endpoint_key in {
+                    str(value) for value in (
+                        item.get("evidence", {}).get("endpoint_scope", [])
+                        if isinstance(item.get("evidence"), dict) else []
+                    )
+                }
+            ), None)
+            if handler:
+                endpoint["x-exception-profile"] = copy.deepcopy(handler)
+    module_map = canonicalize_legacy_path(qa_root, args.module_map) if args.module_map else contracts / "module-map.yaml"
     if not module_map.is_file():
         module_map.parent.mkdir(parents=True, exist_ok=True)
         module_map.write_text(render_manifest(generate_module_map(manifest), module_map), encoding="utf-8")
@@ -150,13 +218,8 @@ def generate_command(argv: list[str]) -> int:
         incremental=args.incremental,
         coverage_profile=coverage_profile,
     )
-    if args.source_root:
-        candidates = scan_source_logic(args.source_root, None, args.exception_type, args.error_code_type)
-        if candidates.get("errors"):
-            for error in candidates["errors"]:
-                print(f"ERROR: {error}", file=sys.stderr)
-            return 2
-        unresolved = apply_candidates(candidates, contracts)
+    if source_candidates is not None:
+        unresolved = apply_candidates(source_candidates, contracts)
         if unresolved:
             for candidate_id in unresolved:
                 print(
@@ -165,7 +228,15 @@ def generate_command(argv: list[str]) -> int:
                 )
             return 2
         refresh_generation_state_cases(contracts)
-    materialize(contracts, qa_root / "bruno", execution_config_path=qa_root / "execution" / "config.yaml")
+    exception_profile = contracts / "exception-profile.yaml"
+    if not exception_profile.is_file():
+        exception_profile.write_text(
+            render_manifest({"version": 1, "handlers": []}, exception_profile),
+            encoding="utf-8",
+        )
+    write_value_resolutions(qa_root, source_constraints)
+    materialize(contracts, qa_root / BRUNO, execution_config_path=qa_root / EXECUTION / "config.yaml")
+    write_value_resolutions(qa_root, source_constraints)
     write_qa_lock(contracts)
     constraint_errors = [
         *validate_stage(qa_root, "generation"),
@@ -202,16 +273,18 @@ def coverage_command(argv: list[str], reconcile: bool) -> int:
     if reconcile and (not args.results or not args.preflight_results):
         parser.error("reconcile requires --results and --preflight-results")
     qa_root = args.qa_root.resolve()
+    migrate_legacy_layout(qa_root)
+    contracts = qa_root / CONTRACTS
     openapi = next(
-        (path for path in (qa_root / "contracts" / "openapi.json", qa_root / "contracts" / "openapi.yaml", qa_root / "contracts" / "openapi.yml") if path.is_file()),
-        qa_root / "contracts" / "openapi.json",
+        (path for path in (contracts / "openapi.json", contracts / "openapi.yaml", contracts / "openapi.yml") if path.is_file()),
+        contracts / "openapi.json",
     )
     try:
         script_errors = script_bundle_errors(qa_root)
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    lock_errors = check_qa_lock(qa_root / "contracts")
+    lock_errors = check_qa_lock(contracts)
     if script_errors or lock_errors:
         for error in [*script_errors, *lock_errors]:
             print(f"ERROR: {error}", file=sys.stderr)
@@ -219,21 +292,21 @@ def coverage_command(argv: list[str], reconcile: bool) -> int:
     command = [
         sys.executable,
         str(SCRIPTS_ROOT / "check_api_coverage.py"),
-        str(qa_root / "contracts"),
-        str(qa_root / "bruno"),
+        str(contracts),
+        str(qa_root / BRUNO),
         "--openapi", str(openapi),
         "--require-scenarios",
         "--require-auth",
-        "--execution-config", str(qa_root / "execution" / "config.yaml"),
+        "--execution-config", str(qa_root / EXECUTION / "config.yaml"),
     ]
     if args.module:
         command.extend(["--module", args.module])
     else:
         command.append("--all")
     if args.results:
-        command.extend(["--results", str(args.results)])
+        command.extend(["--results", str(canonicalize_legacy_path(qa_root, args.results))])
     if args.preflight_results:
-        command.extend(["--preflight-results", str(args.preflight_results)])
+        command.extend(["--preflight-results", str(canonicalize_legacy_path(qa_root, args.preflight_results))])
     if args.write_status:
         command.append("--write-status")
     return subprocess.run(command, check=False).returncode
@@ -246,6 +319,7 @@ def run_command(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--qa-root", type=Path, default=Path("qa"))
     known, remaining = parser.parse_known_args(extra)
+    migrate_legacy_layout(known.qa_root.resolve())
     try:
         errors = script_bundle_errors(known.qa_root.resolve())
     except ValueError as exc:
@@ -266,6 +340,7 @@ def materialize_command(argv: list[str]) -> int:
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args(argv)
     qa_root = args.qa_root.resolve()
+    migrate_legacy_layout(qa_root)
     ensure_rule_library(qa_root)
     generation_errors = validate_stage(qa_root, "generation", module=args.module)
     if generation_errors:
@@ -273,10 +348,10 @@ def materialize_command(argv: list[str]) -> int:
             print(f"ERROR: {error}", file=sys.stderr)
         return 1
     changed = materialize(
-        qa_root / "contracts",
-        qa_root / "bruno",
+        qa_root / CONTRACTS,
+        qa_root / BRUNO,
         dry_run=args.check,
-        execution_config_path=qa_root / "execution" / "config.yaml",
+        execution_config_path=qa_root / EXECUTION / "config.yaml",
         module_filter=args.module,
         sync_index=not args.module,
         check=args.check,
@@ -312,6 +387,7 @@ def worker_command(argv: list[str], start: bool) -> int:
             default="generation",
         )
     args = parser.parse_args(argv)
+    migrate_legacy_layout(args.qa_root)
     ensure_rule_library(args.qa_root)
     if start:
         try:
@@ -355,12 +431,13 @@ def preflight_command(argv: list[str]) -> int:
     qa_root_argument(parser)
     known, remaining = parser.parse_known_args(argv)
     qa_root = known.qa_root.resolve()
-    contracts = qa_root / "contracts"
+    migrate_legacy_layout(qa_root)
+    contracts = qa_root / CONTRACTS
     openapi = next(
         (path for path in (contracts / "openapi.json", contracts / "openapi.yaml", contracts / "openapi.yml") if path.is_file()),
         contracts / "openapi.json",
     )
-    config = qa_root / "execution" / "config.yaml"
+    config = qa_root / EXECUTION / "config.yaml"
     try:
         script_errors = script_bundle_errors(qa_root)
     except ValueError as exc:
@@ -375,48 +452,66 @@ def preflight_command(argv: list[str]) -> int:
         for error in lock_errors:
             print(f"ERROR: {error}", file=sys.stderr)
         return 1
-    with tempfile.TemporaryDirectory(prefix="qa-preflight-") as directory:
-        static_path = Path(directory) / "static-coverage.json"
-        check = subprocess.run(
-            [
-                sys.executable,
-                str(SCRIPTS_ROOT / "check_api_coverage.py"),
-                str(contracts),
-                str(qa_root / "bruno"),
-                "--openapi", str(openapi),
-                "--require-scenarios",
-                "--require-auth",
-                "--execution-config", str(config),
-                "--all",
-                "--json",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-        )
-        try:
-            static_report = json.loads(check.stdout)
-        except json.JSONDecodeError:
-            static_report = None
-        if static_report is None:
-            if check.stderr:
-                print(check.stderr.strip(), file=sys.stderr)
-            print("ERROR: static coverage did not produce JSON", file=sys.stderr)
-            return check.returncode or 1
-        static_path.write_text(json.dumps(static_report, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
-        if check.returncode or static_report.get("static_ok") is not True:
-            print("ERROR: static coverage validation failed", file=sys.stderr)
-            return check.returncode or 1
-        options = {value for value in remaining if value.startswith("--")}
-        command = [sys.executable, str(SCRIPTS_ROOT / "runtime_preflight.py"), *remaining]
-        if "--execution-config" not in options:
-            command.extend(["--execution-config", str(config)])
-        if "--openapi" not in options:
-            command.extend(["--openapi", str(openapi)])
-        if "--static-results" not in options:
-            command.extend(["--static-results", str(static_path)])
-        return subprocess.run(command, check=False).returncode
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    result_root = qa_root / GLOBAL_RESULTS
+    log_root = qa_root / LOGS
+    result_root.mkdir(parents=True, exist_ok=True)
+    log_root.mkdir(parents=True, exist_ok=True)
+    static_path = result_root / f"{timestamp}-static-coverage.json"
+    report_path = result_root / f"{timestamp}-preflight.json"
+    log_path = log_root / f"{timestamp}-preflight.log"
+    check = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS_ROOT / "check_api_coverage.py"),
+            str(contracts),
+            str(qa_root / BRUNO),
+            "--openapi", str(openapi),
+            "--require-scenarios",
+            "--require-auth",
+            "--execution-config", str(config),
+            "--all",
+            "--json",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    try:
+        static_report = json.loads(check.stdout)
+    except json.JSONDecodeError:
+        static_report = None
+    if static_report is None:
+        log_path.write_text((check.stdout or "") + (check.stderr or ""), encoding="utf-8")
+        if check.stderr:
+            print(check.stderr.strip(), file=sys.stderr)
+        print("ERROR: static coverage did not produce JSON", file=sys.stderr)
+        return check.returncode or 1
+    static_path.write_text(json.dumps(static_report, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+    if check.returncode or static_report.get("static_ok") is not True:
+        log_path.write_text((check.stdout or "") + (check.stderr or ""), encoding="utf-8")
+        print("ERROR: static coverage validation failed", file=sys.stderr)
+        return check.returncode or 1
+    options = {value.split("=", 1)[0] for value in remaining if value.startswith("--")}
+    command = [sys.executable, str(SCRIPTS_ROOT / "runtime_preflight.py"), *remaining]
+    if "--qa-root" not in options:
+        command.extend(["--qa-root", str(qa_root)])
+    if "--execution-config" not in options:
+        command.extend(["--execution-config", str(config)])
+    if "--openapi" not in options:
+        command.extend(["--openapi", str(openapi)])
+    if "--static-results" not in options:
+        command.extend(["--static-results", str(static_path)])
+    if "--output" not in options:
+        command.extend(["--output", str(report_path)])
+    completed = subprocess.run(
+        command, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    log_path.write_text((completed.stdout or "") + (completed.stderr or ""), encoding="utf-8")
+    sys.stdout.write(completed.stdout or "")
+    sys.stderr.write(completed.stderr or "")
+    return completed.returncode
 
 
 def scripts_command(argv: list[str]) -> int:
