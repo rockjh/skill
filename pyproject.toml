@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "seres-dev-ai"
+version = "6.0.0"
+description = "Shared runtime for SERES development AI skills"
+requires-python = ">=3.11"
+dependencies = ["PyYAML>=6", "pytest>=8"]
+
+[project.scripts]
+dev-ai = "dev_ai.cli:console_main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
