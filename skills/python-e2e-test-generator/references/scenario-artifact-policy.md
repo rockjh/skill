@@ -50,7 +50,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 @pytest.mark.business_e2e
 @pytest.mark.scenario_id("<STABLE_SCENARIO_ID>")
 def test_业务链路():
-    """验证源码定义的业务动作、下游证据和恢复结果。"""
+    """验证设计定义的业务动作、下游结果和恢复要求。"""
     scenario_context = preflight(PROJECT_ROOT, "<中文业务名称>")
     record_business_entry("<中文业务名称>")
 
@@ -71,12 +71,12 @@ Angle-bracket values are metavariables, not literal generated identifiers. The s
 
 ## Business flow diagram
 
-`业务流程图.md` starts with a short business statement and concise numbered steps, then uses an RCP-style Mermaid `sequenceDiagram`. Use only discovered actors and source-backed branches:
+`业务流程图.md` starts with a short business statement and concise numbered steps, then uses an RCP-style Mermaid `sequenceDiagram`. Use design-defined actors and branches; use formal protocol names for calls:
 
 ````markdown
 # <中文业务名称>
 
-本图说明源码确认的业务入口、跨模块处理、可观测结果和异常分支。
+本图说明设计定义的业务入口、跨服务处理、最终结果和异常分支。
 
 关键步骤：
 
@@ -95,25 +95,25 @@ sequenceDiagram
     participant P4 as 证据系统
 
     P1->>P2: 发起业务动作
-    P2->>P3: 执行源码确认的下游调用
-    alt 满足源码业务规则
+    P2->>P3: 执行正式协议定义的下游调用
+    alt 满足设计业务规则
         P3->>P4: 写入或发布业务证据
         P3-->>P2: 返回业务成功响应
-    else 不满足源码业务规则
-        P3-->>P2: 返回源码错误码 <SOURCE_ERROR_CODE>
+    else 不满足设计业务规则
+        P3-->>P2: 返回设计错误码 <DESIGN_ERROR_CODE>
     end
 ```
 ````
 
-Replace every participant, call, condition, and error code with source evidence. Never copy the generic labels as if they were discovered facts. If a modeled failure code cannot be confirmed, keep the scenario `contract_blocked` rather than inventing one.
+Replace every participant, condition, and error code with design evidence, and every call with formal protocol evidence. Never copy the generic labels as if they were reviewed facts. If a modeled business result cannot be confirmed in design, keep the scenario `manual_confirmation` rather than inventing one.
 
 Diagram rules:
 
 - Use `sequenceDiagram`, never a flowchart.
 - Arrange participants horizontally and progression vertically.
 - Use Chinese business names or discovered service/module IDs.
-- Use paired `alt`/`else` only for real source branches.
-- Include the exact source-confirmed business error code for modeled failure branches.
+- Use paired `alt`/`else` only for design-defined branches.
+- Include the exact design-defined business error code for modeled failure branches.
 - Exclude pytest, fixtures, observer setup, polling implementation, and Python function names.
 
 Every other generated graphic follows the same business-oriented style. A topology, microservice-interaction, or automation view may use Mermaid `sequenceDiagram` or `flowchart`, but stays at the level of business stages, services/modules, external systems, evidence, and recovery. It must not expand method calls, classes, Python functions, line-level conditions, pytest fixtures, or polling implementation. Do not generate class, entity-relationship, state-machine, mind-map, chart, or decorative diagrams for an E2E scenario.
@@ -134,9 +134,9 @@ Every Python module, class, and function has a concise Chinese docstring. Add Ch
 
 ## Mapping, proof, and cleanup
 
-Inspect source DTOs, schemas, or offline API descriptions before implementing a builder. Explicitly map every field, nesting rule, unit, enum representation, and time format. Never pass a loaded business-data mapping wholesale into a request model or payload.
+Inspect OpenAPI or another formal protocol before implementing a builder. Source may only help locate configuration, fixtures, authentication, and preparation controls. Explicitly map every protocol field, nesting rule, unit, enum representation, and time format. Never pass a loaded business-data mapping wholesale into a request model or payload.
 
-Every request that can create, update, cancel, publish, trigger, or otherwise mutate first validates transport and the source-defined business response. Only then may the test poll downstream evidence.
+Every request that can create, update, cancel, publish, trigger, or otherwise mutate first validates the formal transport response and then the design-defined business result. Only then may the test poll downstream evidence.
 
 Prove the requested transition through direct state, an operation record, a correlated message, or persistence evidence. Finding a resource or correlation key proves identity only. Observers start before the action and use bounded deadlines.
 

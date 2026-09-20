@@ -2,15 +2,15 @@
 
 Keep two independent locks under `qa/contracts`.
 
-`version-lock.yaml` records a digest of current business files outside generated QA and build directories. The checker reads only the current workspace; it does not inspect version-control history. A digest change is conservatively classified as API-impacting because a filesystem snapshot cannot prove which individual behavior changed.
+`version-lock.yaml` records a digest of current business files outside generated QA and build directories, plus independent OpenAPI and selected design-document summaries. The checker reads only the current workspace; it does not inspect version-control history. A digest change is conservatively classified as API-impacting because a filesystem snapshot cannot prove which individual behavior changed.
 
 `qa-lock.yaml` records the current OpenAPI, module, case, and generation-state fingerprints. Generation and materialization refresh it; checks and execution reject stale fingerprints.
 
 Initialize and gate the business lock through the shared CLI workflow:
 
 ```bash
-dev-ai api-test init --qa-root qa
-dev-ai api-test generate --qa-root qa --source-root APP
+dev-ai api-test init --qa-root qa --design-root docs/design
+dev-ai api-test generate --qa-root qa --openapi qa/contracts/openapi.json --design-root docs/design --source-root APP
 dev-ai api-test preflight --qa-root qa
 dev-ai api-test run --qa-root qa
 ```

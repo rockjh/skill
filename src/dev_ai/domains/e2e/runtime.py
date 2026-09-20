@@ -7,7 +7,7 @@ import os
 import re
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, TypeVar
@@ -56,7 +56,13 @@ def deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str
     return result
 
 
-def resolve_placeholders(value: Any, *, environ: Mapping[str, str] | None = None, path: str = "$") -> Any:
+def resolve_placeholders(
+    value: Any,
+    *,
+    environ: Mapping[str, str] | None = None,
+    path: str = "$",
+    allow_missing: bool = False,
+) -> Any:
     """仅解析完整环境变量占位符，并报告缺失路径而不泄露值。"""
 
     environment = os.environ if environ is None else environ
@@ -67,13 +73,18 @@ def resolve_placeholders(value: Any, *, environ: Mapping[str, str] | None = None
         name = match.group(1)
         resolved = environment.get(name, "")
         if not resolved.strip():
+            if allow_missing:
+                return value
             raise PreflightError(f"缺少运行值: {path} ({name})")
         return resolved
     if isinstance(value, list):
-        return [resolve_placeholders(item, environ=environment, path=f"{path}[{index}]") for index, item in enumerate(value)]
+        return [
+            resolve_placeholders(item, environ=environment, path=f"{path}[{index}]", allow_missing=allow_missing)
+            for index, item in enumerate(value)
+        ]
     if isinstance(value, dict):
         return {
-            key: resolve_placeholders(item, environ=environment, path=f"{path}.{key}")
+            key: resolve_placeholders(item, environ=environment, path=f"{path}.{key}", allow_missing=allow_missing)
             for key, item in value.items()
         }
     return value
@@ -91,7 +102,12 @@ def _load_yaml(path: Path) -> dict[str, Any]:
 def _has_write_step(definition: Mapping[str, Any]) -> bool:
     """判断场景是否包含会产生副作用的步骤。"""
 
-    return any(isinstance(step, Mapping) and step.get("side_effect") == "write" for step in definition.get("steps", []))
+    return any(
+        isinstance(step, Mapping)
+        and step.get("side_effect") == "write"
+        and step.get("status", "executable") == "executable"
+        for step in definition.get("steps", [])
+    )
 
 
 def _required_control(definition: Mapping[str, Any], name: str) -> bool:
@@ -99,7 +115,26 @@ def _required_control(definition: Mapping[str, Any], name: str) -> bool:
 
     controls = definition.get("controls", {})
     control = controls.get(name, {}) if isinstance(controls, Mapping) else {}
-    return isinstance(control, Mapping) and control.get("status") == "usable" and bool(control.get("planned_use"))
+    active_actions = {
+        str(step.get("action"))
+        for step in definition.get("steps", [])
+        if isinstance(step, Mapping)
+        and step.get("control") == name
+        and step.get("status", "executable") == "executable"
+    }
+    legacy_active = any(
+        isinstance(step, Mapping)
+        and step.get("control") == name
+        and "status" not in step
+        and not isinstance(step.get("action"), str)
+        for step in definition.get("steps", [])
+    )
+    planned = {str(item) for item in control.get("planned_use", [])} if isinstance(control, Mapping) else set()
+    return (
+        isinstance(control, Mapping)
+        and control.get("status") == "usable"
+        and ((legacy_active and bool(planned)) or bool(active_actions & planned))
+    )
 
 
 def _write_control(definition: Mapping[str, Any], name: str) -> bool:
@@ -131,7 +166,11 @@ def preflight(project_root: Path, scenario_name: str, *, environ: Mapping[str, s
     scenario_root = project_root / "scenarios" / scenario_name
     definition = _load_yaml(scenario_root / "场景定义.yaml")
     status = definition.get("meta", {}).get("status")
-    if status != "ready":
+    partial = status == "pending_environment" and any(
+        isinstance(step, Mapping) and step.get("status") == "executable"
+        for step in definition.get("steps", [])
+    )
+    if status != "ready" and not partial:
         raise PreflightError(f"场景状态不是 ready: {status}")
 
     runtime = _load_yaml(project_root / "config" / "config.yaml")
@@ -221,15 +260,24 @@ def preflight(project_root: Path, scenario_name: str, *, environ: Mapping[str, s
         if collection == "components":
             identifiers = [item.get("id") for item in identifiers if isinstance(item, Mapping) and item.get("required") is True]
         missing = [identifier for identifier in identifiers if identifier not in available]
-        if missing:
+        if missing and not partial:
             raise PreflightError(f"环境配置缺少场景依赖: {collection}.{','.join(str(item) for item in missing)}")
-        selected_configuration[collection] = {identifier: available[identifier] for identifier in identifiers}
+        selected_configuration[collection] = {identifier: available[identifier] for identifier in identifiers if identifier in available}
 
     return {
         "active_environment": active,
-        "configuration": resolve_placeholders(selected_configuration, environ=environment, path="$.configuration"),
-        "business_data": resolve_placeholders(business[active], environ=environment, path="$.business_data"),
+        "configuration": resolve_placeholders(
+            selected_configuration, environ=environment, path="$.configuration", allow_missing=partial
+        ),
+        "business_data": resolve_placeholders(
+            business[active], environ=environment, path="$.business_data", allow_missing=partial
+        ),
         "definition": definition,
+        "partial": partial,
+        "executable_steps": [
+            str(step.get("id")) for step in definition.get("steps", [])
+            if isinstance(step, Mapping) and step.get("status", "executable") == "executable"
+        ],
     }
 
 
@@ -294,6 +342,9 @@ def record_endpoint(
     status: int | str,
     summary: Any,
     verified: bool,
+    step_id: str | None = None,
+    protocol_ref: str | None = None,
+    protocol_path: str | None = None,
 ) -> None:
     """记录一次真实接口调用的脱敏结果。"""
 
@@ -302,6 +353,8 @@ def record_endpoint(
         raise PreflightError(f"接口证据阶段无效: {phase}")
     if phase == "smoke" and normalized_method not in {"GET", "HEAD", "READ"}:
         raise PreflightError(f"只读冒烟禁止方法: {normalized_method}")
+    if phase == "business" and (not str(step_id or "").strip() or not str(protocol_ref or "").strip()):
+        raise PreflightError("业务接口证据必须绑定 step_id 和 protocol_ref")
     if not target_ref.strip():
         raise PreflightError("接口证据缺少非敏感目标引用")
     if verified is not True:
@@ -320,6 +373,9 @@ def record_endpoint(
         status=status,
         summary=summary,
         verified=verified,
+        step_id=step_id,
+        protocol_ref=protocol_ref,
+        protocol_path=protocol_path,
     )
 
 
@@ -327,6 +383,60 @@ def record_business_entry(scenario: str) -> None:
     """记录场景已经进入真实业务步骤。"""
 
     _emit_event("business_entered", scenario)
+
+
+def record_step(
+    scenario: str,
+    *,
+    step_id: str,
+    status: str,
+    reason: str,
+    evidence: Sequence[str] = (),
+) -> None:
+    """记录单个业务步骤的执行或阻塞分类。"""
+
+    allowed = {
+        "executable", "environment_missing", "authorization_missing", "control_gap", "product_gap", "runtime_failure",
+    }
+    if not isinstance(step_id, str) or not step_id.strip() or status not in allowed:
+        raise PreflightError("步骤证据 ID 或状态无效")
+    if not isinstance(reason, str) or not reason.strip():
+        raise PreflightError("步骤证据必须包含原因")
+    if not isinstance(evidence, Sequence) or isinstance(evidence, (str, bytes)) or not all(
+        isinstance(item, str) and item.strip() for item in evidence
+    ):
+        raise PreflightError("步骤证据引用必须是字符串序列")
+    _emit_event("step", scenario, step_id=step_id, status=status, reason=reason, evidence=list(evidence))
+
+
+@contextmanager
+def step_guard(
+    scenario: str,
+    *,
+    step_id: str,
+    evidence: Sequence[str],
+) -> Iterator[None]:
+    """将真实步骤成功或异常稳定归类为逐步骤运行证据。"""
+
+    try:
+        yield
+    except BaseException as exc:
+        record_step(
+            scenario,
+            step_id=step_id,
+            status="runtime_failure",
+            reason=f"{type(exc).__name__}: {exc}",
+            evidence=evidence,
+        )
+        raise
+    else:
+        record_step(
+            scenario,
+            step_id=step_id,
+            status="executable",
+            reason="步骤已真实执行并通过断言",
+            evidence=evidence,
+        )
 
 
 def poll_until(
@@ -354,21 +464,36 @@ def poll_until(
         sleeper(min(interval_seconds, remaining))
 
 
-def record_control(scenario: str, *, kind: str, action: str, correlation_ref: str, side_effect: str) -> None:
+def record_control(
+    scenario: str,
+    *,
+    kind: str,
+    action: str,
+    correlation_ref: str,
+    side_effect: str,
+    step_id: str | None = None,
+    protocol_ref: str | None = None,
+    protocol_path: str | None = None,
+) -> None:
     """记录本次场景实际使用的受控能力。"""
 
     if not all(isinstance(value, str) and value.strip() for value in (kind, action, correlation_ref)):
         raise PreflightError("控制证据字段不得为空")
     if side_effect not in {"read", "write"}:
         raise PreflightError("控制证据 side_effect 必须是 read 或 write")
-    _emit_event(
-        "control",
-        scenario,
-        control_kind=kind,
-        action=action,
-        correlation_ref=correlation_ref,
-        side_effect=side_effect,
-    )
+    details: dict[str, Any] = {
+        "control_kind": kind,
+        "action": action,
+        "correlation_ref": correlation_ref,
+        "side_effect": side_effect,
+    }
+    if any(value is not None for value in (step_id, protocol_ref, protocol_path)):
+        if not all(isinstance(value, str) and value.strip() for value in (step_id, protocol_ref)):
+            raise PreflightError("协议控制证据必须绑定 step_id 和 protocol_ref")
+        if protocol_path is not None and (not isinstance(protocol_path, str) or not protocol_path.startswith("/")):
+            raise PreflightError("协议控制证据的 HTTP path 必须以 / 开头")
+        details.update(step_id=step_id, protocol_ref=protocol_ref, protocol_path=protocol_path)
+    _emit_event("control", scenario, **details)
 
 
 def _record_restoration(
@@ -458,7 +583,35 @@ def controlled_database_state(
     restore: Callable[[T, str], int],
     verify_restored: Callable[[T, str], bool],
 ) -> Iterator[T]:
-    """执行精确行数控制并在所有退出路径恢复数据库原值。"""
+    """执行单个精确行数控制；旧场景通过多操作实现共享同一恢复语义。"""
+
+    definition = scenario_context.get("definition", {})
+    controls = definition.get("controls", {}) if isinstance(definition, Mapping) else {}
+    safety = controls.get("database_control", {}).get("safety", {}) if isinstance(controls, Mapping) else {}
+    operation = {
+        "id": "bounded_mutation",
+        "selector_ref": safety.get("exact_selector") if isinstance(safety, Mapping) else None,
+        "snapshot": snapshot,
+        "mutate": mutate,
+        "restore": restore,
+        "verify_restored": verify_restored,
+    }
+    with controlled_database_operations(
+        scenario,
+        scenario_context=scenario_context,
+        operations=[operation],
+    ) as snapshots:
+        yield snapshots["bounded_mutation"]
+
+
+@contextmanager
+def controlled_database_operations(
+    scenario: str,
+    *,
+    scenario_context: Mapping[str, Any],
+    operations: Sequence[Mapping[str, Any]],
+) -> Iterator[dict[str, Any]]:
+    """按依赖顺序执行精确单行数据库操作，并按逆序恢复。"""
 
     active_environment = scenario_context.get("active_environment")
     definition = scenario_context.get("definition", {})
@@ -468,55 +621,103 @@ def controlled_database_state(
     if not isinstance(safety, Mapping) or database_control.get("status") != "usable":
         raise PreflightError("场景契约未声明可用数据库控制")
     expected_environment = safety.get("target_environment")
-    expected_rows = safety.get("expected_rows")
-    selector_ref = safety.get("exact_selector")
-    if not isinstance(selector_ref, str) or not selector_ref.strip():
-        raise PreflightError("数据库控制缺少场景契约派生的精确选择器")
+    contract_operations = safety.get("operations") if isinstance(safety, Mapping) else None
+    if not isinstance(contract_operations, list) or not contract_operations:
+        contract_operations = [{
+            "id": "bounded_mutation",
+            "exact_selector": safety.get("exact_selector") if isinstance(safety, Mapping) else None,
+            "expected_rows": safety.get("expected_rows") if isinstance(safety, Mapping) else None,
+        }]
     authorization = os.environ.get("E2E_CONTROL_AUTHORIZATION_REF", "").strip()
     enabled = os.environ.get("E2E_ENABLE_DATABASE_CONTROL", "").lower() == "true"
     authorized_environment = os.environ.get("E2E_CONTROL_ENVIRONMENT", "").strip()
     if not enabled or not authorization or active_environment != expected_environment or authorized_environment != active_environment:
         raise PreflightError("数据库控制未获得当前测试环境的显式授权")
-    if not isinstance(expected_rows, int) or isinstance(expected_rows, bool) or expected_rows != 1:
-        raise PreflightError("expected_rows 必须精确为 1")
     if _protected_environment_name(active_environment) or _protected_environment_name(expected_environment):
         raise PreflightError("生产或在线环境禁止数据库控制")
 
-    original = snapshot(selector_ref)
+    callbacks = {str(item.get("id")): item for item in operations if isinstance(item, Mapping)}
+    ordered: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
+    completed_ids: set[str] = set()
+    for contract in contract_operations:
+        if not isinstance(contract, Mapping):
+            raise PreflightError("数据库控制操作契约无效")
+        operation_id = str(contract.get("id", ""))
+        callback = callbacks.get(operation_id)
+        if callback is None:
+            raise PreflightError(f"缺少数据库控制回调: {operation_id}")
+        depends_on = contract.get("depends_on", [])
+        if not isinstance(depends_on, list) or not set(str(item) for item in depends_on).issubset(completed_ids):
+            raise PreflightError(f"数据库控制操作未按依赖顺序排列: {operation_id}")
+        selector_ref = contract.get("exact_selector")
+        if not isinstance(selector_ref, str) or not selector_ref.strip():
+            selector_ref = callback.get("selector_ref")
+        if not isinstance(selector_ref, str) or not selector_ref.strip():
+            raise PreflightError(f"数据库控制操作缺少精确选择器: {operation_id}")
+        if contract.get("expected_rows", 1) != 1 or isinstance(contract.get("expected_rows", 1), bool):
+            raise PreflightError(f"数据库控制操作 expected_rows 必须精确为 1: {operation_id}")
+        required_callbacks = ("snapshot", "mutate", "restore", "verify_restored")
+        if isinstance(safety.get("operations"), list):
+            required_callbacks += ("verify",)
+        for name in required_callbacks:
+            if not callable(callback.get(name)):
+                raise PreflightError(f"数据库控制回调无效: {operation_id}.{name}")
+        ordered.append((contract, callback))
+        completed_ids.add(operation_id)
+
+    snapshots: dict[str, Any] = {}
+    successful: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
     body_error: BaseException | None = None
     try:
-        actual = mutate(selector_ref)
-        if not isinstance(actual, int) or isinstance(actual, bool) or actual != expected_rows:
-            raise AssertionError(f"数据库控制影响行数不符: expected={expected_rows}, actual={actual}")
-        record_control(
-            scenario,
-            kind="database_control",
-            action="bounded_mutation",
-            correlation_ref=selector_ref,
-            side_effect="write",
-        )
-        yield original
+        for contract, callback in ordered:
+            operation_id = str(contract.get("id"))
+            selector_ref = str(contract.get("exact_selector") or callback.get("selector_ref"))
+            original = callback["snapshot"](selector_ref)
+            snapshots[operation_id] = original
+            successful.append((contract, callback))
+            actual = callback["mutate"](selector_ref)
+            if not isinstance(actual, int) or isinstance(actual, bool) or actual != 1:
+                raise AssertionError(f"数据库控制影响行数不符: operation={operation_id}, expected=1, actual={actual}")
+            if callback.get("verify") is not None and callback["verify"](selector_ref) is not True:
+                raise AssertionError(f"数据库控制结果校验失败: {operation_id}")
+            record_control(
+                scenario,
+                kind="database_control",
+                action=operation_id,
+                correlation_ref=selector_ref,
+                side_effect="write",
+            )
+        yield snapshots
     except BaseException as exc:
         body_error = exc
         raise
     finally:
         try:
-            restored_rows = restore(original, selector_ref)
-            if (
-                not isinstance(restored_rows, int)
-                or isinstance(restored_rows, bool)
-                or restored_rows != expected_rows
-                or verify_restored(original, selector_ref) is not True
-            ):
-                raise AssertionError(
-                    f"数据库恢复校验失败: expected={expected_rows}, actual={restored_rows}"
-                )
-            _record_restoration(scenario, status="passed", resources=[selector_ref], body_error=body_error)
+            restoration_errors: list[str] = []
+            restored_resources: list[str] = []
+            for contract, callback in reversed(successful):
+                operation_id = str(contract.get("id"))
+                selector_ref = str(contract.get("exact_selector") or callback.get("selector_ref"))
+                try:
+                    restored_rows = callback["restore"](snapshots[operation_id], selector_ref)
+                    if (
+                        not isinstance(restored_rows, int)
+                        or isinstance(restored_rows, bool)
+                        or restored_rows != 1
+                        or callback["verify_restored"](snapshots[operation_id], selector_ref) is not True
+                    ):
+                        raise AssertionError(f"数据库恢复校验失败: expected=1, actual={restored_rows}")
+                    restored_resources.append(selector_ref)
+                except BaseException as cleanup_error:
+                    restoration_errors.append(f"{operation_id}: {cleanup_error}")
+            if restoration_errors:
+                raise RuntimeError("; ".join(restoration_errors))
+            _record_restoration(scenario, status="passed", resources=restored_resources, body_error=body_error)
         except BaseException as cleanup_error:
             _record_restoration(
                 scenario,
                 status="failed",
-                resources=[selector_ref],
+                resources=[str(contract.get("exact_selector") or callback.get("selector_ref")) for contract, callback in successful],
                 body_error=body_error or cleanup_error,
                 error=cleanup_error,
             )

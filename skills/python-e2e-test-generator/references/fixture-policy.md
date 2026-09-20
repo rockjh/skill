@@ -78,26 +78,28 @@ Use one deterministic chain:
 5. Load the scenario's `业务数据.json`, select its exact active-environment root, and resolve `data_ref` only inside that object.
 6. During runtime preflight, recursively resolve only strings that exactly match `${ENV_NAME}`. Never interpolate partial strings.
 
-Business data is not configuration. Inspect the source request models, validators, enums, length/range rules, and downstream correlation use before choosing each input:
+Business data is not configuration. Inspect the formal request models, validators, enums, length/range rules, and design-defined downstream correlation use before choosing each input:
 
-- keep source-valid constants, boundary values, prefixes, and request shapes as explicit JSON literals;
+- keep protocol-valid constants, boundary values, prefixes, and request shapes as explicit JSON literals;
 - construct values that the scenario owns instead of adding an environment variable for each field;
-- generate unique random strings after preflight with the standard-library `secrets` module or `uuid`, preserving source-confirmed length, alphabet, and format constraints;
+- generate unique random strings after preflight with the standard-library `secrets` module or `uuid`, preserving protocol-defined length, alphabet, and format constraints;
 - use exact `${ENV_NAME}` placeholders only for pre-existing environment-owned data that the test cannot safely create, such as an approved test account or seeded external identifier.
 
-Every `data_ref` subtree must contain at least one constructible literal value. The contract gate rejects a referenced subtree made entirely from environment placeholders. A source-valid scenario that truly has no business input omits `data_ref` rather than inventing an empty injected object.
+Every `data_ref` subtree must contain at least one constructible protocol-valid literal value. The contract gate rejects a referenced subtree made entirely from environment placeholders. A protocol-valid scenario that truly has no business input omits `data_ref` rather than inventing an empty injected object.
+
+A precondition is test-owned and constructible when design defines its business meaning, the formal protocol defines its format, it does not depend on real users, devices, or protected resources, it has a run-unique key, and exact cleanup/restoration is possible. The test must build that data through the first safe usable candidate path and may not ask the user for an environment variable instead.
 
 The contract gate also checks only the active scenario's required integrations and business data. A `ready` scenario fails when a required mapping is absent or an exact placeholder has no current value; unrelated service credentials never block it. `pending_environment` blockers are derived from and must exactly equal the missing active-environment values; they do not include per-run control authorization.
 
 This generated merge does not replace application configuration discovery. `discovery/workspace.yaml.configuration.precedence` records the application's actual low-to-high sources. A source default remains unresolved when a higher profile, environment variable, configuration center, command-line value, or local override may replace it.
 
-An unset or blank placeholder is a configuration failure. Report only the configuration/data path and placeholder name, never its resolved value. Parse ports, booleans, durations, and lists only according to the source-confirmed format.
+An unset or blank placeholder is a configuration failure. Report only the configuration/data path and placeholder name, never its resolved value. Parse ports, booleans, durations, and lists only according to the discovered configuration format.
 
 ## Collection without an environment
 
 Configuration and data modules may parse committed files at import time only while placeholders remain inert. They must not read secrets, instantiate clients, open sockets, inspect processes, run health checks, or connect to any component during module import, marker registration, or pytest collection.
 
-Generate complete source-confirmed clients, builders, repositories, controls, assertions, fixtures, steps, and cleanup when runtime values are missing. Delay imports of optional component libraries when importing them would otherwise break collection.
+Generate formal-protocol clients and design-traced assertions; use source/configuration only for repositories, controls, fixtures, steps, and cleanup when runtime values are missing. Delay imports of optional component libraries when importing them would otherwise break collection.
 
 `python -m pytest --collect-only` must succeed with no endpoint, credential, broker, database, cache, scheduler, or environment test value available.
 
@@ -113,9 +115,12 @@ Resolve and validate runtime values immediately before the first runtime action.
 - confirms unique run/scenario namespaces and exact correlation-key ownership;
 - confirms cleanup and restoration operations are registered and source-backed;
 - checks per-run authorization for every dangerous control;
-- reports missing values as `pending_environment` and fails clearly.
+- permits a `pending_environment` scenario to resolve available values and execute its explicitly `executable` prefix while leaving unavailable placeholders inert for later blocked steps;
+- reports missing values per affected step and never treats a partial run as success.
 
 Never call `pytest.skip`, `xfail`, `importorskip`, `unittest.SkipTest`, their aliases, or return a passing no-op for missing runtime configuration. Project `conftest.py` and implicit `usefixtures` are forbidden. Once preflight has resolved the environment and a real request is attempted, an unexpected runtime result is an ordinary failed test.
+
+Every scenario test records exactly one runtime status event for each contract step. `environment_missing` is only for inaccessible required runtime configuration, `authorization_missing` for absent per-run permission, `control_gap` for a fully explored control gap, `product_gap` for missing design-defined product behavior, and `runtime_failure` for a call or observation that ran but did not meet the contract. Business mismatches, absent downstream effects, wrong transitions, and successful transports with wrong state are never environment blockers.
 
 ## Isolation and cleanup
 

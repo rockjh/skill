@@ -7,7 +7,7 @@ Read this reference when a scenario crosses a service boundary or uses messages,
 Keep these concerns separate:
 
 1. `common/clients/` calls public or approved test/admin interfaces.
-2. `common/builders/` explicitly maps reusable source-confirmed payloads.
+2. `common/builders/` explicitly maps reusable formal-protocol payloads.
 3. `common/repositories/` owns parameterized read-only queries and stable record mapping.
 4. `common/controls/` owns default-off authorized and reversible controls.
 5. `common/integrations/` provides generic adapters for discovered component types.
@@ -25,10 +25,10 @@ Instantiate and preflight only the services and components declared by the scena
 - Use health, OpenAPI, query, or guaranteed-miss requests for read-only smoke.
 - Direct `requests`, `httpx`, and `urllib` calls use an explicit positive timeout. `urlopen` with request data is a write and is forbidden in smoke. An arbitrary fixture method such as `client.get()` is not transport proof.
 - A read-only RPC smoke call goes through a common `read_only_rpc` adapter that declares `READ`/`RPC`, a source anchor from discovery, one bounded non-write operation, and a returned real result.
-- Validate transport status and the source-defined business envelope separately.
+- Validate formal transport status and the design-defined business result separately.
 - Record `verified=True` only from a validation expression that consumes that call's result. HTTP smoke status is an integer and 5xx always fails.
 - A successful transport with a failed business result is a failure.
-- Do not retry a non-idempotent call unless source declares an idempotency key and semantics.
+- Do not retry a non-idempotent call unless design declares the idempotency semantics and the formal protocol declares the key shape.
 - Redact credentials and sensitive payload fields in diagnostics while retaining method, non-secret target identity, correlation key name, status, and bounded response summary.
 
 ## Messages
@@ -38,21 +38,21 @@ For any discovered broker or gateway:
 1. create a unique run/scenario consumer identity;
 2. subscribe or capture starting position before the business action and wait for readiness;
 3. observe only a bounded offset/time window;
-4. match with source-confirmed correlation fields;
+4. match with design-defined correlation fields whose transport shape comes from the formal protocol;
 5. assert channel identity, key/headers, schema/version, and relevant business fields;
 6. close deterministically after success or failure.
 
 Publishing is disabled by default. It requires a source-confirmed simulation contract, per-run authorization, and a configured test-only destination prefix or exact allowlist. Reject retained messages, unrestricted wildcards, or business destinations unless the source-backed test contract explicitly requires them and the user authorized the exact test environment.
 
-For Kafka-like logs, wait for assignment and capture starting offsets. For MQTT-like brokers, use a unique client ID, source-confirmed QoS/TLS/session behavior, and deterministic disconnect. For other systems, preserve the same readiness, bounded observation, exact correlation, and cleanup invariants without forcing Kafka or MQTT terminology into generated code.
+For Kafka-like logs, wait for assignment and capture starting offsets. For MQTT-like brokers, use a unique client ID, protocol-defined QoS/TLS/session behavior, and deterministic disconnect. For other systems, preserve the same readiness, bounded observation, exact correlation, and cleanup invariants without forcing Kafka or MQTT terminology into generated code.
 
 ## Database observation
 
 Observation repositories expose only parameterized read methods. Poll by the same scenario correlation key with a monotonic deadline and report the last observed record. Assert ownership, the requested business state/fields, and relevant relationships.
 
-A message proves publication; a database record proves persistence or consumption. When both are evidence sources, assert them independently, then compare every shared source-confirmed field. Define explicit mappings for different field names or representations. A time-range-only row, broad message match, or equal correlation ID alone is insufficient.
+A message proves publication; a database record proves persistence or consumption. When both are evidence sources, assert them independently, then compare every shared design/protocol-defined field. Define explicit mappings for different field names or representations. A time-range-only row, broad message match, or equal correlation ID alone is insufficient.
 
-Database control follows [discovery-and-control-policy.md](discovery-and-control-policy.md). Keep control operations out of read repositories and test entrypoints. Never use control SQL as the business action under test.
+Database control follows [discovery-and-control-policy.md](discovery-and-control-policy.md). Keep control operations out of read repositories and test entrypoints. Multi-table setup is an ordered list of individually snapshotted, parameter-bound, exact single-row operations; restore attempted operations in reverse order and verify every restored state. Never use control SQL as the business action under test or to manufacture the final asserted result.
 
 ## Cache observation
 
@@ -86,3 +86,5 @@ Every adapter reports only non-secret endpoint identity, component type, correla
 Control and endpoint evidence is adapter-owned. Record it immediately after the real external call in the same straight-line block, derive endpoint status, summary, and verification from the returned object, and pass the same scenario-owned correlation value in a resource/key/selector or request-payload argument to both a write operation and its control event. Logging, headers, or tracing metadata do not establish isolation. Scenario steps and test entrypoints cannot emit these events.
 
 Connection or runtime failures after preflight are failed smoke/business checks. They cannot be converted to `pending_environment`, `contract_blocked`, `skip`, or `xfail`.
+
+Likewise, a callable business entry that returns the wrong state, omits a downstream event, leaves a scheduler/consumer result absent, or reports transport success with an incorrect business envelope is a product/runtime failure with evidence. It is not `environment_missing`. Continue recording the remaining independently safe observations and cleanup before failing the scenario.

@@ -66,6 +66,18 @@ configuration:
   middleware: []
   controls: []
 
+# 用途：设计摘要是人工审查的业务权威；不得从源码或运行结果推导。
+design:
+  files: []
+  candidates: []
+  summary: {}
+
+# 用途：正式协议摘要只定义传输结构和字段约束。
+protocol:
+  files: []
+  candidates: []
+  summary: {}
+
 # 只读运行探测；未请求时保持空列表。
 runtime_probe:
   requested: false
@@ -75,6 +87,7 @@ runtime_probe:
   processes: []
   associations: []
   read_only_smoke: []
+  configuration_checks: []
 
 # 发现证据完整后才可全部置为 true。
 gates:
@@ -116,6 +129,7 @@ meta:
   id: <STABLE_SCENARIO_ID>
   name: <业务名称>
   status: pending_environment
+  participants: [<participant-service-a>, <participant-service-b>]
   actor: <业务参与者>
 
 # 生成所有权。
@@ -135,6 +149,25 @@ readiness:
 
 # 可验证的业务前置条件。
 preconditions: [<precondition-symbol>]
+
+# 可构造性：每个前置和步骤都必须穷尽八类控制路径；写入探针必须引用正式隔离与清理符号。
+constructability:
+  preconditions:
+    - id: <precondition-symbol>
+      data_ownership: test_owned
+      constructible: true
+      candidates: &candidate-matrix
+        - {kind: public_api, status: usable, component: <component>, consumer_source: <repository-id>#<source-anchor>, control: <control-symbol>, side_effect: write, trigger: <trigger-symbol>, observation: <observation-symbol>, isolation: <owned-correlation>, cleanup: <cleanup-action>, evidence: [<repository-id>#<source-anchor>]}
+        - {kind: test_or_admin_api, status: not_found, component: <component>, consumer_source: <repository-id>#<source-anchor>, control: <control-symbol>, side_effect: none, trigger: <trigger-symbol>, observation: <observation-symbol>, isolation: <owned-correlation>, cleanup: <cleanup-action>, evidence: [<repository-id>#<source-anchor>]}
+        - {kind: database_control, status: not_found, component: <component>, consumer_source: <repository-id>#<source-anchor>, control: <control-symbol>, side_effect: none, trigger: <trigger-symbol>, observation: <observation-symbol>, isolation: <owned-correlation>, cleanup: <cleanup-action>, evidence: [<repository-id>#<source-anchor>]}
+        - {kind: messages, status: not_found, component: <component>, consumer_source: <repository-id>#<source-anchor>, control: <control-symbol>, side_effect: none, trigger: <trigger-symbol>, observation: <observation-symbol>, isolation: <owned-correlation>, cleanup: <cleanup-action>, evidence: [<repository-id>#<source-anchor>]}
+        - {kind: scheduled_jobs, status: not_found, component: <component>, consumer_source: <repository-id>#<source-anchor>, control: <control-symbol>, side_effect: none, trigger: <trigger-symbol>, observation: <observation-symbol>, isolation: <owned-correlation>, cleanup: <cleanup-action>, evidence: [<repository-id>#<source-anchor>]}
+        - {kind: mocks_and_faults, status: not_found, component: <component>, consumer_source: <repository-id>#<source-anchor>, control: <control-symbol>, side_effect: none, trigger: <trigger-symbol>, observation: <observation-symbol>, isolation: <owned-correlation>, cleanup: <cleanup-action>, evidence: [<repository-id>#<source-anchor>]}
+        - {kind: dynamic_configuration, status: not_found, component: <component>, consumer_source: <repository-id>#<source-anchor>, control: <control-symbol>, side_effect: none, trigger: <trigger-symbol>, observation: <observation-symbol>, isolation: <owned-correlation>, cleanup: <cleanup-action>, evidence: [<repository-id>#<source-anchor>]}
+        - {kind: existing_test_data, status: not_found, component: <component>, consumer_source: <repository-id>#<source-anchor>, control: <control-symbol>, side_effect: none, trigger: <trigger-symbol>, observation: <observation-symbol>, isolation: <owned-correlation>, cleanup: <cleanup-action>, evidence: [<repository-id>#<source-anchor>]}
+  steps:
+    - step_id: <step-id>
+      candidates: *candidate-matrix
 
 # 发现契约中的服务和组件。
 integrations:
@@ -182,8 +215,14 @@ steps:
     action: <business-action>
     control: public_api
     side_effect: read
+    design_rule_id: <DESIGN_RULE_ID>
+    protocol_ref: <FORMAL_PROTOCOL_OPERATION_ID>
+    phase: final_business
     data_ref: 业务数据.json#/<json-pointer>
     expect: [<business-outcome>]
+    status: executable
+    status_reason: <source-backed-reason>
+    evidence: [<repository-id>#<source-anchor>]
 
 # 清理和恢复。
 cleanup:

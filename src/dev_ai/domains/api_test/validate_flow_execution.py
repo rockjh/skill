@@ -80,7 +80,7 @@ def main() -> int:
         if args.exclusions and args.exclusions.is_file():
             exclusions = first_list(load_data(args.exclusions), "exclusions")
         approved_cleanup = any(
-            str(item.get("status", "approved")).lower() == "approved"
+            (item.get("approved") is True or str(item.get("status", "")).lower() == "approved")
             and str(item.get("reason", "")).strip()
             and str(item.get("cleanup_plan", item.get("reset_procedure", ""))).strip()
             and (str(item.get("kind", item.get("type", ""))).lower() in {"flow", "cleanup"} or item.get("flow_id"))
@@ -91,7 +91,7 @@ def main() -> int:
             print("ERROR: module declares flow_required operations but flows.yaml declares no flow or exclusion")
             return 1
         if has_crud and any(
-            str(item.get("status", "approved")).lower() == "approved"
+            (item.get("approved") is True or str(item.get("status", "")).lower() == "approved")
             and str(item.get("reason", "")).strip()
             and not str(item.get("cleanup_plan", item.get("reset_procedure", ""))).strip()
             for item in exclusions

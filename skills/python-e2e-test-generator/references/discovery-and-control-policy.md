@@ -186,7 +186,7 @@ Source capability discovery and configuration inventory are one gate. Valid HTTP
 
 ## Read-only runtime probe
 
-When the user says applications are running, `runtime_probe.requested` must be `true`; `not_requested` is then invalid. Probe read-only:
+Every non-static `dev-ai e2e run` requires `runtime_probe.requested: true` and `outcome: completed`; do not infer absence from an unset E2E variable. Probe read-only:
 
 1. inspect listening ports and process metadata without stopping or reconfiguring processes;
 2. associate command lines, working directories, artifacts, and embedded dependencies with topology nodes;
@@ -201,6 +201,9 @@ processes:
   - id: <process-id>
     pid: <positive-observed-process-id>
     command_reference: <non-secret-command-or-artifact-reference>
+    startup_arguments: [<non-secret-effective-argument>]
+    working_directory: <observed-working-directory-reference>
+    profile: <effective-profile-or-null>
     evidence: [<read-only-observation>]
 listeners:
   - id: <listener-id>
@@ -217,11 +220,24 @@ read_only_smoke:
     method: <GET|HEAD|READ>
     target_ref: <credential-free-local-url-or-source-proven-read-reference>
     result: <status:NNN-for-http-or-bounded-read-result>
+configuration_checks:
+  - id: <service-or-component-id>
+    node: <topology-node-id>
+    profile: <effective-profile-or-null>
+    sources: [<low-to-high-source-id>]
+    effective: <confirmed|unconfirmed>
+    evidence: [<runtime-behavior-or-read-only-observation>]
 ```
 
 The checker rejects an unassociated application listener, an unresolved process/listener reference, or a smoke record with an unsafe method. A completed probe must associate and smoke every relevant `application` node; one service's result cannot stand in for the others. The ordered `runtime_probe` gate re-reads each PID command line, rejects non-local hosts, confirms the declared PID owns the listener, opens it with a bounded TCP connection, and repeats local GET/HEAD calls. The actual status must match `result`, and HTTP 5xx is always failure. Aggregate diagnostics and later static gates do not repeat live I/O. Source-proven read-only RPC uses a `read_only_rpc` common adapter with an exact repository anchor and positive timeout because the generic gate cannot invoke an unknown protocol.
 
-Allowed outcomes are `completed` or `blocked` when requested, and `not_requested` otherwise. `completed` requires non-empty processes, listeners, associations, and read-only smoke results, with every process/listener associated exactly to a known topology node. `blocked` requires a non-empty reason showing why the read-only probe itself could not run. Individual refused connections, timeouts, unexpected statuses, or contract mismatches belong in a completed probe's evidence and remain failures when the live smoke suite runs.
+Allowed outcomes are `completed` or `blocked` when requested, and `not_requested` otherwise. `completed` requires non-empty processes, listeners, associations, and read-only smoke results for every runnable application node, with every process/listener associated exactly to a known topology node. Scenarios that claim confirmed runtime configuration require a confirmed `configuration_checks` entry for every used service/component; source defaults alone never satisfy this. `blocked` requires a non-empty reason showing why the read-only probe itself could not run. Individual refused connections, timeouts, unexpected statuses, or contract mismatches belong in a completed probe's evidence and remain failures when the live smoke suite runs.
+
+## Per-item constructability
+
+For every precondition and business step, evaluate exactly these paths before blocking: public business API, approved test/admin API, database control, messages, scheduled jobs, mocks/fault injection, dynamic configuration, and existing test data. Each result records the owning component, consuming source, candidate control, side effect, real trigger, observable result, isolation, cleanup/restoration, and source or runtime evidence. Status is `usable`, `unusable`, or `not_found`; omission and `not_applicable` do not prove unavailability.
+
+Classify safely generatable data as `test_owned` and `constructible`. Such data must use a controlled usable path and cannot become an environment placeholder or `business_data:` blocker. Any write used to probe a capability is itself a controlled write: declare an exact run-owned key, register cleanup before the write, capture evidence immediately, restore on exceptions, and verify no residue. Only a complete evidence-backed closure of all eight paths for every affected item permits `contract_blocked`.
 
 ## Scenario control matrix
 
@@ -294,6 +310,17 @@ safety:
   verification: <business-verification-symbol>
   restoration: <restoration-operation-symbol>
   restoration_verification: <restoration-verification-symbol>
+  operations:
+    - id: <operation-id>
+      depends_on: []
+      consumer_source: <repository-id>#<source-symbol>
+      exact_selector: <scenario-owned-selector-symbol>
+      expected_rows: 1
+      snapshot: <snapshot-operation-symbol>
+      mutation: <bounded-control-operation-symbol>
+      verification: <post-mutation-verification-symbol>
+      restoration: <restoration-operation-symbol>
+      restoration_verification: <restoration-verification-symbol>
 ```
 
 Generated control code must:
@@ -301,12 +328,13 @@ Generated control code must:
 1. query and retain original values before mutation;
 2. use parameter binding and an exact scenario correlation key;
 3. require `expected_rows: 1`, capture the actual affected-row count, compare it with one, report both, and reject zero or multiple rows before continuing;
-4. trigger or wait for source-confirmed business logic and verify the business result;
-5. restore original values in `finally` or a fixture finalizer;
-6. verify restored values and row count;
-7. preserve an earlier test failure while attaching cleanup/restoration failure to the report.
+4. execute operations in dependency order and verify each mutation before continuing;
+5. trigger or wait using source-confirmed execution controls, then verify the design-defined business result;
+6. restore every attempted operation in reverse order in `finally` or a fixture finalizer;
+7. verify restored values and row count;
+8. preserve an earlier test failure while attaching cleanup/restoration failure to the report.
 
-Use `controlled_database_state(...)` directly as a `with` context and place the normal business trigger/wait, real observation, and non-tautological final assertion inside its body. Pass the complete object returned by scenario `preflight`; do not pass a selector, expected environment, or row count separately. The helper obtains `target_environment`, `expected_rows`, and `exact_selector` from the validated scenario contract, then passes that exact selector to `snapshot(selector_ref)`, `mutate(selector_ref)`, `restore(original, selector_ref)`, and `verify_restored(original, selector_ref)`. The four roles use distinct named callbacks defined beside the protected operation, consume `selector_ref`, and cannot be called directly. `consumer_source` must resolve to source with database-consumer or scheduled-job semantics, not merely an arbitrary symbol. Mutating and restoration SQL may live only in those registered callbacks and must use a single statically resolved statement whose `WHERE` consists only of parameterized equality predicates joined by `AND`; comments, statement chaining, `OR`, tautologies, fuzzy predicates, subqueries, and selector use only in `SET` are rejected. Snapshot and verification execute real read operations; restoration binds `original` to the update value before the `WHERE` parameters, and verification compares the observed value with `original`. String echo, callback reuse, dead branches, and an empty context body are rejected.
+Use `controlled_database_operations(...)` directly as a `with` context and place the normal business trigger/wait, real observation, and non-tautological final assertion inside its body. Pass the complete object returned by scenario `preflight` plus a literal ordered callback list keyed by contract operation ID. Each operation uses distinct named `snapshot`, `mutate`, `verify`, `restore`, and `verify_restored` callbacks; the helper derives selector and row count from the validated contract, snapshots before mutation, verifies the mutation, and restores attempted operations in reverse order. `consumer_source` must resolve to source with database-consumer or scheduled-job semantics. Mutating and restoration SQL may live only in registered callbacks and must use one statically resolved statement whose `WHERE` consists only of parameterized equality predicates joined by `AND`; comments, chaining, `OR`, tautologies, fuzzy predicates, subqueries, and selector use only in `SET` are rejected. Database writes may prepare or advance state but cannot create the final result asserted by the scenario.
 
 For non-database writes, call `restoration_guard` with the complete `scenario_context`; callers cannot provide resource labels. `restore(resource_ref)` and `verify(resource_ref)` are distinct same-module named functions: restore returns a real mutation result using the resource, while verify returns a non-constant observer result using it. Lambdas, unresolved callbacks, role reuse, and no-op callbacks are rejected. The guard derives the exact restoration resource set from `isolation.owned_resources`, and the runner compares successful restoration events with that set only after the scenario emitted `business_entered`.
 

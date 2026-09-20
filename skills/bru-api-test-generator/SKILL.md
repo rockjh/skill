@@ -1,24 +1,67 @@
 ---
 name: bru-api-test-generator
-description: Generate, materialize, validate, execute, and incrementally maintain auditable Bruno API tests from local OpenAPI, current source, configuration, SQL, tests, and redacted runtime evidence. Use for module-owned HTTP API QA; do not use for browser or cross-service business E2E workflows.
+description: Generate auditable Bruno API tests from reviewed design documents and a local OpenAPI contract. Source code is execution support only; do not use this Skill for browser or cross-service E2E workflows.
 ---
 
 # Bruno API Test Generator
 
-Use the installed `dev-ai api-test` commands for every operation. `dev_ai.domains.api_test.constraints` is the rule authority; never weaken or reinterpret its failures.
+Use `dev-ai api-test` for every operation. The design document is the sole
+authority for business rules, flows, states, business errors, idempotency,
+concurrency, retries, asynchronous outcomes, side effects, and business
+assertions. OpenAPI is the sole authority for HTTP method/path, parameters,
+types, formats, media types, transport status codes, and protocol validation.
+Source and runtime responses are support/evidence only.
 
 ## Workflow
 
-1. Inspect current workspace instructions, build files, source, configuration, migrations, tests, and QA assets.
-2. Use a local OpenAPI file or checked-in contract. Fetch only from an already-running loopback service when no local contract exists.
-3. Run `dev-ai api-test init --qa-root qa`, then generate with the relevant source roots and reviewed module ownership. Generation records detected data sources, DDL/entities, explicit relationships, required fields, and safe environment references without persisting credentials.
-4. Resolve gate failures in source evidence, contracts, cases, fixtures, variables, assertions, or mock-data ownership. Do not invent relationships or delete mandatory rules.
-5. Materialize, check, preflight, and execute only through `dev-ai api-test`. A run analyzes all selected mock-data steps, asks once before the first write, prepares them in dependency order, then runs independent and data-dependent cases as authorized.
-6. After a run creates data, answer the single cleanup decision or retain the run ledger for `dev-ai api-test mock-data-clean`. Treat `qa/results/` reports and mock-data ledgers as authoritative; console output is a redacted summary and pointer.
+1. Read repository instructions and locate reviewed design documents. Discovery
+   checks root `AGENTS.md`/`README`, then `docs/design`, `docs/详细设计`,
+   `design`, and `doc/design`. Use `--design-root` or `--design-file` when
+   discovery is ambiguous. No design source means generation is blocked.
+2. Run `dev-ai api-test init --qa-root qa --design-root docs/design`, then
+   `dev-ai api-test generate --qa-root qa --openapi qa/contracts/openapi.json
+   --design-root docs/design`. Generation builds a bidirectional OpenAPI /
+   design mapping and writes `qa/constraints/design-rules.yaml`.
+3. Resolve mapping drift, conflicting documents, missing rules, and every
+   `manual_confirmation` item before generation can continue. Never repair a design expectation from source
+   or observed behaviour. Auxiliary endpoints may be excluded only through an
+   approved `exclusions.yaml` entry with scope and reason.
+4. Source roots are read in a separate execution-preparation phase only for
+   ports, context paths, environment/header/signing setup, safe fixture values,
+   test data preparation, upload templates, mocks, and local startup. Such
+   values are `support-only` and may populate `value-resolution.yaml`, never
+   `logic.yaml`, business assertions, expected states, or business error codes.
+5. Materialize, preflight, execute, and reconcile through `dev-ai api-test`.
+   Actual responses decide pass/fail and may be recorded in
+   `observed-rules.yaml`, but they must never update design expectations.
+   Ordered multi-request behavior is executable only when the reviewed design
+   declares a `Test Flow` whose steps reference reviewed rule IDs. The runner
+   derives flow evidence from the real Bruno case order and uniquely named
+   `dev-ai:flow:*` reporter events. Async rules additionally require a bounded
+   polling/reconciliation contract; external-failure rules require authorized
+   injection plus restoration evidence, otherwise generation stops with
+   `manual_confirmation`.
 
-Database preparation or verification is allowed only when a public API cannot establish or observe the required state. It must use the current run namespace, narrowly scoped owned data, parameterized and idempotent operations, reverse-order cleanup, and absence verification. Production and protected environments are hard-blocked; flags cannot override them. Non-interactive writes and cleanup require their explicit command flags.
+Database access is a last resort: use namespaced, owned, parameterized data
+with idempotent reverse cleanup and absence verification. Production/protected
+environments are hard-blocked; write and cleanup flags are explicit.
 
-For parallel module work, run `worker-start` before delegation. Each worker owns exactly one module contract, Bruno directory, and module result area; it must not edit shared configuration or another module. The main agent owns shared assets, aggregation, and final reconciliation.
+## Gates
+
+- Every formal OpenAPI endpoint maps to one design section, or to an approved
+  exclusion. Every design `METHOD /path` exists in OpenAPI.
+- `logic.yaml` entries and business cases have `source: design` and cite a
+  design rule ID. OpenAPI-only entries are transport/protocol obligations.
+- Successful cases assert a concrete business result or state change; async
+  cases distinguish acceptance from final outcome. A rule that needs a
+  repeated, concurrent, or acceptance/final multi-request flow is blocked
+  unless that flow is executable; metadata alone never counts as coverage.
+- Concurrent behavior remains blocked unless the runtime can issue genuinely
+  concurrent requests; a sequential `Test Flow` cannot satisfy that rule.
+- Request values carry config/fixture/support-source provenance and remain
+  reproducible, namespaced, cleanable, and recoverable.
+- Incremental generation checks both OpenAPI and design fingerprints. The
+  version lock records summaries for both sources.
 
 ## References
 
@@ -33,4 +76,6 @@ Read only what the current operation needs:
 - [references/parallel-generation.md](references/parallel-generation.md) only for explicitly delegated module work.
 - [references/version-management.md](references/version-management.md) for project lock and source-version handling.
 
-Use `dev-ai schema api-test.<command>` for command fields and schema versions.
+Use `dev-ai schema api-test.<command>` for commands and `dev-ai schema
+api-test.<artifact>` for persisted design, logic, value-resolution, and version
+lock contracts.

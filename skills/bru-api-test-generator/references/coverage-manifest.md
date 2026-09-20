@@ -28,6 +28,7 @@ expected intermediate state, not completion evidence.
 version: 1
 generator_version: 2.0.0
 openapi_sha256: ...
+design_sha256: ...
 last_generated_at: ...
 endpoints: {}
 modules: {}
@@ -128,7 +129,7 @@ When no API can create required prerequisite data or the response omits a state 
 
 ## Module cases.yaml
 
-Cases link back to an endpoint and optionally to source logic. Assertions must include a concrete field or relation beyond status and business code:
+Cases link back to an endpoint and optionally to design logic. Assertions must include a concrete field or relation beyond status and business code:
 
     version: 1
     module: system-user
@@ -226,14 +227,14 @@ instead of repeating it on every case:
         method: POST
         path: /system/user
         scenario_matrix:
-          success: {applicable: true, status: inferred, reason: "reachable operation"}
-          authentication: {applicable: true, status: inferred, reason: "OpenAPI security"}
-          authorization: {applicable: false, status: inferred, reason: "no role/tenant guard"}
+          success: {applicable: true, status: confirmed, reason: "reviewed design success rule"}
+          authentication: {applicable: false, status: confirmed, reason: "no reviewed authentication rule"}
+          authorization: {applicable: false, status: confirmed, reason: "no reviewed authorization rule"}
           validation: {applicable: true, status: inferred, reason: "required request fields"}
-          business_error: {applicable: true, status: confirmed, reason: "source business error"}
-          query: {applicable: false, status: inferred, reason: "not a query operation"}
-          safety: {applicable: false, status: inferred, reason: "no idempotency contract"}
-          file: {applicable: false, status: inferred, reason: "not a file operation"}
+          business_error: {applicable: true, status: confirmed, reason: "reviewed design business error"}
+          query: {applicable: false, status: confirmed, reason: "not a query operation"}
+          safety: {applicable: false, status: confirmed, reason: "no reviewed idempotency rule"}
+          file: {applicable: false, status: confirmed, reason: "not a file operation"}
 ```
 
 Run the coverage checker with `--require-scenarios` at the completion gate;
@@ -241,27 +242,29 @@ it accepts either this endpoint-level form or per-case `scenarios` entries.
 
 ## Module logic.yaml
 
-Contract generation first writes `status: draft` entries for OpenAPI-provable
-success, validation, query, and file behavior. Source enhancement then adds
-reviewable source-backed entries. Every entry must name a real source symbol or
-contract source, describe an observable condition, declare expected HTTP and
-business results when known, and link at least one existing case. Every
-coverage-required source candidate and business error code without a linked
-case is a checker error.
+Contract generation may seed transport/protocol cases from OpenAPI. Business
+logic entries are written only from `design-rules.yaml`; execution-support source
+must never add business rules. Every entry must cite a design rule ID, describe
+an observable condition, declare the documented HTTP/business result when
+known, and link at least one case. Missing design coverage is a blocker.
 
     version: 1
     module: system-user
     logic:
       - id: USER_CREATE_NORMAL_LOGIC
         status: confirmed
-        source_symbol: SysUserService.insertUser
+        source: design
+        design_rule_id: USER_CREATE_NORMAL_LOGIC
+        source_symbol: docs/design/users.md:12
         condition: username is unique and required data is valid
         expected_http_status: 200
         case_ids:
           - USER_CREATE_OK
       - id: USER_CREATE_DUPLICATE_LOGIC
         status: confirmed
-        source_symbol: SysUserService.insertUser
+        source: design
+        design_rule_id: USER_CREATE_DUPLICATE_LOGIC
+        source_symbol: docs/design/users.md:28
         condition: username already exists
         expected_http_status: 200
         expected_business_code: 601
@@ -274,6 +277,8 @@ case is a checker error.
     module: system-user
     flows:
       - id: USER_CRUD_FLOW
+        source: design
+        design_rule_ids: [USER_CREATE, USER_UPDATE, USER_QUERY, USER_DELETE, USER_ABSENT]
         steps:
           - operation: create
             case_id: USER_CREATE_OK
@@ -290,7 +295,7 @@ case is a checker error.
           - operation: query
             case_id: USER_QUERY_AFTER_DELETE
             uses: user_id
-            assert_absent: user_id
+            assert_absent: $.id
 
 The module or endpoint must explicitly declare `flow_required: true` (or a
 non-empty `flow_kind`) before this flow is required. HTTP method alone does not
@@ -303,6 +308,13 @@ An empty `flows.yaml` is only valid for a module with no explicitly
 flow-required endpoint, or with an approved exclusion containing both a reason
 and a cleanup/reset plan. A pending exclusion keeps the manifest reviewable but
 cannot make the completion gate pass.
+
+Generated flows come only from reviewed `Test Flow` declarations. Each step is
+bound to a design-backed case. The runner marks a flow passed only when Bruno
+executed every step in declared order, every step passed, declared captures
+and absence checks emitted passing `dev-ai:flow:*` reporter events, and
+declared uses have matching events after their capture. It never accepts flow
+metadata as execution evidence.
 
 ## Global index.yaml
 
@@ -334,6 +346,6 @@ Generate this file; do not hand-edit it:
         endpoint_count: 12
         case_count: 48
 
-The global checker compares the union of module endpoints with the offline Swagger inventory and verifies that every endpoint, logic path, source candidate, case, and flow is accounted for. JSON request bodies are extracted as complete brace-balanced blocks, parsed with `json.loads()`, and compared structurally; malformed JSON reports its parse location.
+The global checker compares the union of module endpoints with the offline OpenAPI inventory and verifies that every endpoint, design logic path, support finding, case, and flow is accounted for. JSON request bodies are extracted as complete brace-balanced blocks, parsed with `json.loads()`, and compared structurally; malformed JSON reports its parse location.
 
 The checker should also reject duplicate IDs, duplicate case-to-file mappings, unregistered Bruno files, unknown case endpoint references, and missing scenario decisions when strict matrix validation is enabled. Pass the saved offline document explicitly (`--openapi qa/contracts/openapi.json`) so a manifest cannot validate against itself.

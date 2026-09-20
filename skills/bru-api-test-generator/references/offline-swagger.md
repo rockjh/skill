@@ -9,7 +9,7 @@ The generator always parses a local specification. A checked-in file is preferre
 3. If neither exists, let `dev-ai api-test generate` perform its loopback recovery attempt:
 
    ```bash
-   dev-ai api-test generate --qa-root qa
+   dev-ai api-test generate --qa-root qa --design-root docs/design
    ```
 
    The helper detects local TCP listeners and probes only `127.0.0.1`, `localhost`, or `::1`, trying IPv4 before IPv6 on the same port. Use `--base-url http://127.0.0.1:8080` or `--port 8080` when the listener cannot be discovered automatically, and add `--path /your/openapi.json` when the application uses a non-standard documentation path. It tries common JSON/YAML documentation paths, validates the response, and writes the result atomically. Contract identity ignores deployment-only `servers`, Swagger `host`/`schemes`, and collection provenance while retaining paths, components, security, and `basePath`. If different local services still expose different contracts, it blocks instead of silently selecting one; rerun with an explicit base URL/path.
@@ -53,9 +53,9 @@ and response metadata while retaining the original `$ref`. The generated source
 records the document SHA. A loopback-acquired document retains its `provenance`
 block; missing application build metadata is reported as
 `contract_provenance_unverified` and must be resolved before a collection is
-called verified. The parser is an inventory aid. When source is available,
-inspect it for normal and error logic; otherwise use contract-only mode and
-record source-derived logic as unavailable.
+called verified. The parser is an inventory aid. Use reviewed design documents
+for normal and error logic; source inspection is limited to execution
+preparation and request data support.
 
 ## Module Partition
 

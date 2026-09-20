@@ -13,7 +13,14 @@ Pass status requires an executed request, successful request status, no runtime 
 
 Database assertion steps register Bruno `test` observations and fail the owning case on connection, query, expectation, or cleanup errors. Persist only the bounded assertion outcome in Bruno's normalized evidence; do not retain connection strings, credentials, or full database rows/documents.
 
-Normalized evidence contains `executed`, `passed`, and per-case actual HTTP status, redacted response body/shape, and assertion/request failure detail. Successful observations are also written to `observed-rules.yaml` and reused during later generation to improve request values and exact assertions.
+Normalized evidence contains `executed`, `passed`, and per-case actual HTTP status, redacted response body/shape, and assertion/request failure detail. Successful observations may be written to `observed-rules.yaml` for audit only; they are never reused to change design expectations or generated assertions.
+
+For every design-generated `flows.yaml` entry, normalized evidence also records
+ordered step status, capture/use names, absence verification, and cleanup
+verification. Capture/use/absence names come only from passing, uniquely named
+`dev-ai:flow:*` Bruno test observations in the raw reporter output; the
+materialized case contract supplies only the expected names. Missing events,
+duplicate case IDs, failed events, or out-of-order steps fail reconciliation.
 
 ## Result Report
 
@@ -48,11 +55,11 @@ Allowed categories are:
 - `insufficient_source_evidence`
 - `manual_confirmation`
 
-Do not replace these with one generic status. Static coverage, OpenAPI obligations, source mappings, and version warnings are supplemental fields.
+Do not replace these with one generic status. Static coverage, OpenAPI obligations, design traceability, and version warnings are supplemental fields.
 
 ## Module Evidence
 
-Module runs validate `module-lock.yaml`, write only module-owned logs/evidence/results, and never update global locks or completion state. Explained review cases remain visible in `manual_confirmation` but are excluded from module completion requirements; their failure does not downgrade unrelated cases.
+Module runs validate `module-lock.yaml`, write only module-owned logs/evidence/results, and never update global locks or completion state. Generation must reach zero `manual_confirmation` items before a module is runnable; execution reports retain the field only to expose a gate failure, never to waive completion requirements.
 
 The coordinator validates and merges module evidence before the final all-module run.
 

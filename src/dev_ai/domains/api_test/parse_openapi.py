@@ -181,6 +181,34 @@ def extract(path: Path, document: dict[str, Any]) -> dict[str, Any]:
         for item in document.get("tags", [])
         if isinstance(item, dict) and item.get("name") and str(item.get("description", "")).strip()
     }
+    security_schemes = {}
+    components = document.get("components")
+    if isinstance(components, dict):
+        security_schemes = resolve_value(document, components.get("securitySchemes", {})) or {}
+    elif isinstance(document.get("securityDefinitions"), dict):
+        security_schemes = resolve_value(document, document.get("securityDefinitions", {})) or {}
+
+    def security_headers(security: Any) -> list[str]:
+        names: set[str] = set()
+        requirements = security if isinstance(security, list) else []
+        for requirement in requirements:
+            if not isinstance(requirement, dict):
+                continue
+            for scheme_name in requirement:
+                scheme = security_schemes.get(scheme_name) if isinstance(security_schemes, dict) else None
+                if not isinstance(scheme, dict):
+                    continue
+                if str(scheme.get("type", "")).casefold() == "apikey":
+                    location = str(scheme.get("in", "")).casefold()
+                    header = str(scheme.get("name", "")).strip()
+                    if location == "header" and header:
+                        names.add(header)
+                    elif location == "cookie":
+                        names.add("Cookie")
+                elif str(scheme.get("type", "")).casefold() in {"http", "oauth2", "openidconnect"}:
+                    names.add("Authorization")
+        return sorted(names, key=str.casefold)
+
     endpoints: list[dict[str, Any]] = []
     for route, path_item in paths.items():
         if not isinstance(route, str) or not isinstance(path_item, dict):
@@ -221,6 +249,9 @@ def extract(path: Path, document: dict[str, Any]) -> dict[str, Any]:
                     "confidence": "high",
                 },
             }
+            declared_security_headers = security_headers(endpoint["security"])
+            if declared_security_headers:
+                endpoint["security_headers"] = declared_security_headers
             for extension in (
                 "x-permissions", "x-permission", "x-roles", "x-role",
                 "x-idempotent", "x-safety",
@@ -874,15 +905,12 @@ def inferred_scenario_matrix(endpoint: dict[str, Any]) -> dict[str, dict[str, An
         ),
         "authorization": decision(
             bool(permission),
-            "OpenAPI 权限或角色扩展声明了授权要求" if permission else "OpenAPI 未声明权限模型；等待源码或探针确认",
+            "OpenAPI 权限或角色扩展声明了授权要求" if permission else "OpenAPI 未声明权限模型；等待设计文档确认",
         ),
         "validation": decision(validation_applicable, "契约声明了输入校验约束" if validation_applicable else "契约未声明可验证的输入约束"),
-        "business_error": decision(False, "契约阶段未发现源码业务异常；源码增强阶段复核"),
+        "business_error": decision(False, "reviewed design rules have not declared a business error"),
         "query": decision(bool(query), "根据分页、筛选和排序查询参数推导" if query else "接口无查询参数"),
-        "safety": decision(
-            bool(endpoint.get("x-idempotent") or endpoint.get("x-safety")),
-            "契约声明了幂等或安全语义" if endpoint.get("x-idempotent") or endpoint.get("x-safety") else "契约未声明幂等、并发或重复提交语义",
-        ),
+        "safety": decision(False, "reviewed design rules have not declared idempotency or concurrency behavior"),
         "file": decision(file_applicable, "multipart/form-data 或 binary schema" if file_applicable else "接口不是文件上传或下载"),
     }
 
@@ -1025,7 +1053,7 @@ def render_module_overview(
         "- `parameters.yaml`：模块独立的请求参数。",
         "- `definitions.yaml`：模块独立的数据定义。",
         "- `responses.yaml`：模块独立的响应定义。",
-        "- `logic.yaml`：源码正常路径和异常路径。",
+        "- `logic.yaml`：设计文档确认的业务路径和预期。",
         "- `cases.yaml`：自动化用例、预期结果和断言。",
         "- `flows.yaml`：有序业务操作流程。",
         "- `exclusions.yaml`：经审批的排除项及原因。",
@@ -1137,11 +1165,7 @@ def seed_contract_cases(
     endpoint_id = str(endpoint.get("id", "ENDPOINT"))
     responses = endpoint.get("responses", {}) if isinstance(endpoint.get("responses"), dict) else {}
     success_status = next((int(code) for code in responses if str(code).isdigit() and 200 <= int(code) < 300), None)
-    exception_profile = endpoint.get("x-exception-profile", {}) if isinstance(endpoint.get("x-exception-profile"), dict) else {}
-    profile_status = exception_profile.get("http_status")
-    error_status = profile_status if isinstance(profile_status, int) else next(
-        (int(code) for code in responses if str(code) in {"400", "422"}), None,
-    )
+    error_status = next((int(code) for code in responses if str(code) in {"400", "422"}), None)
     obligations = {
         str(item.get("id")): item
         for item in endpoint.get("obligations", constraint_obligations(endpoint))
@@ -1246,13 +1270,7 @@ def seed_contract_cases(
         success_request["body"] = schema_value(body_schema, "body")
 
     success_assertions = exact_response_assertions(endpoint, success_status) if success_status is not None else []
-    profile_codes = exception_profile.get("business_codes", []) if isinstance(exception_profile.get("business_codes"), list) else []
-    profile_code_path = str(exception_profile.get("business_code_path") or "")
-    error_assertions = (
-        [{"path": profile_code_path, "equals": profile_codes[0]}]
-        if error_status is not None and profile_code_path and profile_codes
-        else exact_error_assertions(endpoint, error_status) if error_status is not None else []
-    )
+    error_assertions = exact_error_assertions(endpoint, error_status) if error_status is not None else []
 
     def build(
         suffix: str,
@@ -1295,20 +1313,15 @@ def seed_contract_cases(
             "coverage_ids": list(dict.fromkeys(coverage_ids or [])),
             "assertions": case_assertions,
         }
-        if scenario != "success" and status == profile_status and profile_code_path and profile_codes:
-            built["expected"].update({
-                "business_code": profile_codes[0],
-                "business_code_path": profile_code_path,
-            })
         if fixture_type:
             built["fixture_type"] = fixture_type
         if review_values:
             built["review_reasons"] = {
-                value: "OpenAPI、源码约束库、执行证据和本地环境均未提供可用值"
+                value: "OpenAPI、执行配置和测试 Fixture 均未提供可用请求值"
                 for value in review_values
             }
         elif not exact:
-            built["review_reason"] = "OpenAPI、源码和已有执行证据不足以生成精确响应断言"
+            built["review_reason"] = "OpenAPI 不足以生成精确协议断言"
         if review_required:
             evidence = copy.deepcopy(endpoint.get("evidence")) if isinstance(endpoint.get("evidence"), dict) else {
                 "source_kind": "openapi",
@@ -1320,8 +1333,8 @@ def seed_contract_cases(
             }
             built["manual_confirmation"] = {
                 "automation_blocker": (
-                    "No exact source, SQL, test, configuration, environment, or runtime value was found"
-                    if review_values else "No exact response result could be derived from current evidence"
+                    "No exact config, fixture, or support-source request value was found"
+                    if review_values else "No exact protocol assertion could be derived from OpenAPI"
                 ),
                 "search_records": [evidence],
             }
@@ -1634,11 +1647,6 @@ def seed_contract_cases(
                             fixture_type=fixture_type,
                         ))
 
-        if endpoint.get("x-idempotent") or endpoint.get("x-safety"):
-            seeded.append(build(
-                "SAFETY_REPEAT", "safety", "重复提交",
-                success_status or 200, success_request,
-            ))
     empty_path = response_array_path(endpoint, success_status) if success_status is not None else None
     for case in seeded:
         if case["id"].endswith("QUERY_EMPTY_RESULT") and empty_path:
@@ -1672,6 +1680,7 @@ def write_partitioned(
     seed_cases: bool = False,
     incremental: bool = False,
     coverage_profile: str = "full-matrix",
+    design_sha256: str | None = None,
 ) -> dict[str, Any]:
     contracts_root = output_dir.parent
     qa_root = contracts_root.parent.parent if contracts_root.parent.name == "data" else contracts_root.parent
@@ -1746,6 +1755,7 @@ def write_partitioned(
             incremental
             and previous_state.get("generator_version") == GENERATOR_VERSION
             and previous_state.get("coverage_profile") == coverage_profile
+            and previous_state.get("design_sha256") == design_sha256
             and isinstance(previous_module, dict)
             and previous_module.get("contract_fingerprint") == current_module_fingerprints[module_id]
             and endpoints_path.is_file()
@@ -1872,34 +1882,9 @@ def write_partitioned(
                     }),
                     "manual_review": case.get("manual_review") is True,
                 }
-        logic_path = module_dir / "logic.yaml"
-        logic_document = load_document(logic_path) if logic_path.is_file() else {}
-        logic_items = logic_document.get("logic", []) if isinstance(logic_document, dict) else []
-        logic_items = [item for item in logic_items if isinstance(item, dict)] if isinstance(logic_items, list) else []
-        linked_case_ids = {
-            str(case_id)
-            for item in logic_items
-            for case_id in (item.get("case_ids", []) if isinstance(item.get("case_ids"), list) else [])
-        }
-        for case in cases:
-            case_id = str(case.get("id", ""))
-            if case_id in linked_case_ids or case.get("source") != "openapi" or case.get("scenario") not in {"success", "validation", "query", "file"}:
-                continue
-            expected = case.get("expected", {}) if isinstance(case.get("expected"), dict) else {}
-            logic_items.append({
-                "id": f"{case_id}_CONTRACT_DRAFT",
-                "status": "draft",
-                "source": "openapi",
-                "source_symbol": f"{case.get('endpoint_id')} ({case.get('scenario')})",
-                "condition": str(case.get("description") or case.get("title") or case.get("scenario")),
-                "expected_http_status": expected.get("http_status"),
-                "expected_business_code": expected.get("business_code"),
-                "case_ids": [case_id],
-            })
-        updated_logic = dict(logic_document) if isinstance(logic_document, dict) else {}
-        updated_logic.update({"version": 1, "module": module_id, "swagger_tag": tag, "logic": logic_items})
-        if not module_unchanged:
-            write_if_changed(logic_path, render_manifest(updated_logic, logic_path))
+        # Business logic is populated only from reviewed design rules after
+        # OpenAPI partitioning.  OpenAPI can seed request/transport cases but
+        # must never become a business expectation source.
         index["generated_cases"] += len(cases)
         cases_md = module_dir / "CASES.md"
         existing_cases_md = cases_md.read_text(encoding="utf-8", errors="strict") if cases_md.is_file() else ""
@@ -1976,6 +1961,7 @@ def write_partitioned(
         or summary["manual_review_cases"]
         or previous_state.get("generator_version") != GENERATOR_VERSION
         or previous_state.get("coverage_profile") != coverage_profile
+        or previous_state.get("design_sha256") != design_sha256
     )
     generated_at = (
         datetime.now(timezone.utc).isoformat()
@@ -1987,6 +1973,7 @@ def write_partitioned(
         "generator_version": GENERATOR_VERSION,
         "coverage_profile": coverage_profile,
         "openapi_sha256": manifest.get("source", {}).get("sha256"),
+        "design_sha256": design_sha256,
         "last_generated_at": generated_at,
         "endpoints": {
             endpoint_id: {"fingerprint": fingerprint}

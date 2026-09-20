@@ -1,23 +1,23 @@
 # API Case Matrix
 
-Generate decisions from OpenAPI, source, security configuration, and probe evidence. Every endpoint has all eight categories. Applicable decisions link dedicated cases; confirmed false decisions contain a concrete reason.
+Generate protocol decisions from OpenAPI and business decisions from reviewed design rules. Source and probe evidence can only establish execution support or report implementation drift. Every endpoint has all eight categories. Applicable decisions link dedicated cases; confirmed false decisions contain a concrete reason.
 
 | Category | Evidence | Required coverage |
 | --- | --- | --- |
-| `success` | every reachable operation | at least one distinct success case |
-| `authentication` | OpenAPI security, authentication configuration, probes | missing and invalid credentials with observed status/envelope |
-| `authorization` | `x-permissions`, `x-roles`, source permission annotations, security profile, probes | authenticated but forbidden cases |
+| `success` | reviewed design rule for every reachable operation | at least one distinct success case |
+| `authentication` | reviewed design rule; OpenAPI security only describes request shape | missing and invalid credentials with the design-defined status/envelope |
+| `authorization` | reviewed design permissions and conditions; OpenAPI security is protocol context | authenticated but forbidden cases defined by design |
 | `validation` | required, enum, pattern, min/max, length, format, media type | each declared invalid or boundary class |
-| `query` | pagination, filter, sort parameters | boundaries, filters, sorting, combinations, empty results, invalid page/pageSize |
-| `file` | multipart/binary schema and declared source constraints | missing/empty file, extension, MIME, and size cases where proven |
-| `business_error` | API-reachable exceptions and real error codes | one observable case per reachable business result |
-| `safety` | idempotency, concurrency, repeat-submission evidence | declared safety behavior |
+| `query` | reviewed design behavior plus OpenAPI parameter structure | boundaries, filters, sorting, combinations, empty results, invalid page/pageSize |
+| `file` | multipart/binary schema and explicit contract constraints | missing/empty file, extension, MIME, and size cases where proven |
+| `business_error` | design rules and documented business error semantics | one case per documented business result |
+| `safety` | design rules for idempotency, concurrency, repeat submission | declared design behavior |
 
 ## Coverage Profiles
 
-`contract-draft` generates only cases whose request shape and expected transport behavior are directly provable from OpenAPI plus the project constraint library. Explained data gaps remain case-local manual confirmations and do not prevent unrelated cases from executing.
+`contract-draft` generates only cases whose request shape and expected transport behavior are directly provable from OpenAPI plus the project constraint library. Any `manual_confirmation` is a generation blocker; resolve the design ambiguity instead of executing unrelated business cases from a partial model.
 
-`full-matrix` generates every applicable scenario supported by contract, source, security profile, or probe evidence. It does not invent missing evidence. A true scenario without enough evidence to build a precise case remains a blocking gap.
+`full-matrix` generates every applicable scenario supported by OpenAPI protocol constraints or reviewed design rules. Security configuration prepares requests; probe evidence reports drift. A true scenario without enough design evidence for a precise business case remains a blocking gap.
 
 `verified` is not a generation profile. It is available only after the default all-module scope passes strict reconciliation and execution.
 
@@ -41,17 +41,17 @@ auth-token:
     invalid_token_status: 401
 ```
 
-Run one representative missing-token probe and one invalid-token probe before copying authentication expectations. Preserve the actual HTTP status and response envelope, including applications that return HTTP 200 with a business error code.
+Run one representative missing-token probe and one invalid-token probe only to report implementation drift. Preserve the actual HTTP status and response envelope in evidence; do not copy observed values into expectations unless the reviewed design declares them.
 
-A required application Header is not automatically authentication evidence. Classify it from OpenAPI, source, security configuration, and probes; record confirmed non-applicability for authentication separately.
+A required application Header is not automatically authentication evidence. Use OpenAPI and execution configuration to prepare the request, and use reviewed design rules for authentication behavior; record confirmed non-applicability separately.
 
-Authorization requires at least one of OpenAPI security/permission extensions, `x-permissions`, `x-roles`, source permission annotations, `security-profile.yaml`, or a probe result. Otherwise use a confirmed false decision such as:
+Authorization behavior requires a reviewed design rule. OpenAPI security extensions and `security-profile.yaml` can prepare credentials, while source annotations and probes can report drift. Otherwise use a confirmed false decision such as:
 
 ```yaml
 authorization:
   applicable: false
   status: confirmed
-  reason: OpenAPI 未声明权限模型，源码和探针均未发现权限校验
+  reason: reviewed design declares no authorization branch for this operation
 ```
 
 ## Validation
@@ -68,18 +68,62 @@ For object-valued query parameters, verify framework binding and emit flattened 
 
 ## Query And File Cases
 
-For query endpoints cover page/pageSize boundaries, filter values, sort values, combinations, empty results, and invalid pagination inputs. Use real parameter names from the contract or source; do not fabricate a generic pagination API.
+For query endpoints cover page/pageSize boundaries, filter values, sort values, combinations, empty results, and invalid pagination inputs. Use real parameter names from OpenAPI; do not fabricate a generic pagination API.
 
-For multipart or binary inputs always cover a missing required file. Cover empty files, invalid extension, invalid MIME, and oversized files only when the contract or API-reachable source declares the corresponding constraint. Fixtures belong in the execution environment or fixture directory, not in config.
+For multipart or binary inputs always cover a missing required file. Cover empty files, invalid extension, invalid MIME, and oversized files only when OpenAPI or the reviewed design declares the corresponding constraint. Fixtures belong in the execution environment or fixture directory, not in config.
 
 ## Business Errors And Safety
 
-Generate business errors only from API-reachable implementation evidence. Discover the exception/error-code family from `ControllerAdvice`, constructor types, or one unique name-matched pair; block ambiguous families until explicitly configured.
-
-Scanners exclude tests, architecture checks, Javadoc, error-enum definitions, constant-only classes, build output, and branches that are not reachable from a controller mapping. A candidate that maps to zero or multiple endpoints is a blocker.
+Generate business errors only from reviewed design rules. Source exception handlers and runtime observations may report implementation drift, but they must never create business expectations.
 
 Generate safety cases only where idempotency, concurrency, or duplicate-submission behavior is declared. HTTP method alone is not evidence.
 
+## Design Rule Markers
+
+Each `METHOD /path` section in a reviewed Markdown design document may contain one or more explicit rules. Use one `Rule ID` per rule; repeat the marker block for multiple outcomes on the same endpoint:
+
+```markdown
+## POST /jobs
+Rule ID: JOBS_ACCEPTED
+Scenario: success
+Condition: request is valid
+Request: {body: {jobType: reconcile}}
+Async: true
+HTTP status: 202
+Acceptance status: accepted
+Final status: completed
+State: completed
+Business code: 0
+Assert: $.status = completed
+```
+
+For an ordered multi-request rule, declare the complete executable flow once.
+Each step references a reviewed rule ID; captures map names to response JSON
+paths, and every `uses` name must occur in that rule's request:
+
+```markdown
+Test Flow: {id: JOB_FLOW, steps: [{rule_id: JOB_ACCEPTED, operation: submit, capture: {job_id: "$.jobId"}}, {rule_id: JOB_COMPLETED, operation: poll, uses: [job_id]}]}
+```
+
+Use distinct rule IDs for repeated submissions or retries. A retry step uses
+`operation: retry`. An external-failure rule is blocked unless the project
+supplies an authorized fault-injection operation and a verified
+restoration/cleanup operation. A step named `fault-inject`, `inject-failure`,
+`mock-failure`, or `dependency-failure` is only a design label; it is not
+execution evidence. All referenced operations still require OpenAPI endpoints
+and design rules.
+
+Supported markers are `Rule ID`, `Scenario`, `Condition`, `Request`, `Async`, `HTTP status`, `Business code`, `State`, `State transition`, `Acceptance status`, `Final status`, `Side effect`, `Idempotency`, `Retry`, `Concurrency`, `External failure`, and `Assert`. Marker values use YAML scalar/container types. Every non-success branch and every endpoint with multiple rules needs an explicit one-line `Request: {...}` mapping whose structure agrees with OpenAPI.
+
+An asynchronous rule must declare both acceptance and final status and a
+bounded polling/reconciliation mechanism with an explicit termination policy.
+A sequential submit-plus-single-query flow is not polling evidence and remains
+blocked. Async and safety rules are blocked while they describe only
+single-request metadata. A sequential flow never proves concurrency, and
+cross-module or cross-service flows belong to the E2E domain. The generator
+rejects design HTTP statuses absent from OpenAPI and records ambiguous rules in
+`manual_confirmations` without materializing business tests.
+
 ## Completion
 
-Every case keeps its request, expected HTTP/business result, source evidence, and precise assertions. Explained `review-*` values remain case-local; all other success cases require exact business and result assertions. Every source-backed logic entry links real case IDs, and every declared flow has ordered execution evidence.
+Every case keeps its request, expected HTTP/business result, design or OpenAPI evidence, and precise assertions. `review-*` values and unresolved confirmations block generation. Every success case requires at least one exact business-result or state-change assertion; when a business code is declared, it must be a success value and be accompanied by a concrete result assertion. Every design-backed logic entry links real case IDs, and every declared flow has ordered execution evidence.

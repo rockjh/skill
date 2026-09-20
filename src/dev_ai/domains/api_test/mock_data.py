@@ -96,7 +96,10 @@ def _env_prefix(source_id: str, engine: str) -> str:
 
 
 def _source_evidence(path: Path, line: int, symbol: str) -> dict[str, Any]:
-    return {"file": str(path), "line": line, "symbol": symbol, "source_kind": "database_config"}
+    return {
+        "file": str(path), "line": line, "symbol": symbol,
+        "source_kind": "support-source", "support_only": True,
+    }
 
 
 def _config_entries(path: Path) -> list[tuple[str, str, int]]:
@@ -658,24 +661,15 @@ def _endpoint_parameter(endpoint: dict[str, Any]) -> str | None:
 def _endpoint_entity(
     endpoint: dict[str, Any],
     entities: list[dict[str, Any]],
-    bindings: dict[str, dict[str, Any]],
 ) -> dict[str, Any] | None:
     path_tokens = {_identifier(value) for value in str(endpoint.get("path", "")).split("/") if "{" not in value}
-    binding = bindings.get(str(endpoint.get("operation_id", "")), {})
-    type_tokens = {
-        _identifier(value)
-        for value in [
-            *binding.get("request_types", []),
-            *re.findall(r"[A-Za-z_$][\w$]*", str(binding.get("return_type", ""))),
-        ]
-    }
     matched = []
     for entity in entities:
         aliases = {
             _identifier(entity.get("name")),
             _identifier(entity.get("class_name")),
         } - {""}
-        if aliases & path_tokens or aliases & type_tokens:
+        if aliases & path_tokens:
             matched.append(entity)
     return matched[0] if len(matched) == 1 else None
 
@@ -1234,12 +1228,6 @@ def derive_mock_data_contracts(qa_root: Path) -> list[Path]:
             entity = matches[0]
             entity_by_name.setdefault(alias, entity)
             variable_by_entity.setdefault(alias, variable_by_entity[str(entity["name"])])
-    source_rules_path = qa_root / CONSTRAINTS / "source-rules.yaml"
-    source_rules = load_data(source_rules_path) if source_rules_path.is_file() else {}
-    bindings = {
-        str(value.get("operation_id")): value
-        for value in source_rules.get("controller_bindings", []) if isinstance(value, dict) and value.get("operation_id")
-    }
     changed: list[Path] = []
     required_packages: set[str] = set()
     for directory in _module_directories(qa_root, None):
@@ -1271,7 +1259,7 @@ def derive_mock_data_contracts(qa_root: Path) -> list[Path]:
             for field in ("mock_data_required", "mock_data_step_ids", "mock_data_blocker"):
                 case.pop(field, None)
         endpoint_entities = {
-            str(endpoint.get("id")): _endpoint_entity(endpoint, entities, bindings) for endpoint in endpoints
+            str(endpoint.get("id")): _endpoint_entity(endpoint, entities) for endpoint in endpoints
         }
         steps: list[dict[str, Any]] = []
         database_steps_by_entity: dict[str, dict[str, Any]] = {}

@@ -1,4 +1,4 @@
 interface:
   display_name: "Python E2E Test Generator"
   short_description: "Discover and generate executable cross-service pytest E2E"
-  default_prompt: "Use $python-e2e-test-generator to discover the workspace and runtime configuration, map each scenario's safe controls, then generate, validate, execute, and restore source-tracked Python/pytest E2E scenarios."
+  default_prompt: "Use $python-e2e-test-generator to discover reviewed design documents and formal protocol contracts first, map source-only execution support and safe controls, then generate, validate, execute, and restore traceable cross-service Python/pytest E2E scenarios."

@@ -103,6 +103,7 @@ def expected_lock(contracts_root: Path) -> dict[str, Any]:
     return {
         "version": 1,
         "openapi_sha256": state.get("openapi_sha256"),
+        "design_sha256": state.get("design_sha256"),
         "module_fingerprints": {
             key: value.get("contract_fingerprint")
             for key, value in modules.items()
@@ -175,6 +176,15 @@ def check(contracts_root: Path) -> list[str]:
         if expected.get("openapi_sha256") != digest:
             errors.append(
                 f"OpenAPI SHA mismatch: generation state has {expected.get('openapi_sha256')!r}, file has {digest}"
+            )
+    design_path = contracts_root.parent / "constraints" / "design-rules.yaml"
+    if design_path.is_file():
+        from .design_rules import summary as design_summary
+
+        current_design = design_summary(load_data(design_path))["sha256"]
+        if expected.get("design_sha256") != current_design:
+            errors.append(
+                f"design SHA mismatch: generation state has {expected.get('design_sha256')!r}, file has {current_design}"
             )
     return errors
 

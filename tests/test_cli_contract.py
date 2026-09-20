@@ -35,10 +35,30 @@ class CliContractTests(unittest.TestCase):
         self.assertIn("--run-id", clean["data"]["options"])
         self.assertIn("--allow-cleanup", clean["data"]["options"])
 
+    def test_api_test_persisted_contract_schemas_are_scoped(self) -> None:
+        for scope, source in (
+            ("api-test.design-rules", "design"),
+            ("api-test.logic", None),
+            ("api-test.value-resolution", None),
+            ("api-test.version-lock", None),
+        ):
+            with self.subTest(scope=scope):
+                code, result = self.invoke("schema", scope)
+                self.assertEqual(0, code, result)
+                self.assertEqual(scope, result["data"]["contract"])
+                self.assertIn("document", result["data"])
+                if source:
+                    self.assertEqual(source, result["data"]["document"]["properties"]["source"]["const"])
+
     def test_mock_data_commands_return_public_envelopes_and_semantic_exit_codes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            qa_root = Path(temporary) / "qa"
-            code, initialized = self.invoke("api-test", "init", "--qa-root", str(qa_root))
+            root = Path(temporary)
+            qa_root = root / "qa"
+            design = root / "design.md"
+            design.write_text("# Reviewed design\n", encoding="utf-8")
+            code, initialized = self.invoke(
+                "api-test", "init", "--qa-root", str(qa_root), "--design-file", str(design),
+            )
             self.assertEqual(0, code, initialized)
             code, generated = self.invoke("api-test", "mock-data-generate", "--qa-root", str(qa_root))
             self.assertEqual(0, code, generated)
@@ -70,6 +90,40 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual("workspace_inventory", report["data"]["gate_order"][0])
         self.assertLess(report["data"]["gate_order"].index("static"), report["data"]["gate_order"].index("environment_tests"))
 
+        code, plan = self.invoke("schema", "e2e.scenario-plan")
+        self.assertEqual(0, code)
+        scenario_item = plan["data"]["document"]["properties"]["scenarios"]["items"]
+        self.assertIn("design_rule_ids", scenario_item["properties"])
+        self.assertIn("protocol_refs", scenario_item["properties"])
+
+    def test_e2e_generation_commands_have_scoped_options_and_help(self) -> None:
+        code, generate = self.invoke("schema", "e2e.generate")
+        self.assertEqual(0, code)
+        self.assertIn("--design-file", generate["data"]["options"])
+        self.assertIn("--openapi-file", generate["data"]["options"])
+        code, check = self.invoke("schema", "e2e.check")
+        self.assertEqual(0, code)
+        self.assertNotIn("--design-file", check["data"]["options"])
+
+        from dev_ai.domains.e2e.cli import main as e2e_main
+
+        for command in ("discover", "generate"):
+            stream = io.StringIO()
+            with redirect_stdout(stream), self.assertRaises(SystemExit) as exit_context:
+                e2e_main([command, "--help"])
+            self.assertEqual(0, exit_context.exception.code)
+            self.assertIn("--design-root", stream.getvalue())
+
+    def test_e2e_generate_failure_uses_public_error_envelope(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            code, initialized = self.invoke("e2e", "init", "--project", temporary)
+            self.assertEqual(0, code, initialized)
+            code, failed = self.invoke("e2e", "generate", "--project", temporary)
+            self.assertNotEqual(0, code)
+            self.assertFalse(failed["ok"])
+            self.assertEqual("e2e.generate", failed["command"])
+            self.assertEqual("GATE_FAILED", failed["error"]["code"])
+
     def test_domain_versions_are_separate_from_tool_version(self) -> None:
         code, result = self.invoke("version")
         self.assertEqual(0, code)
@@ -90,8 +144,13 @@ class CliContractTests(unittest.TestCase):
 
     def test_api_init_writes_flat_assets_without_tool_sources(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "qa"
-            code, result = self.invoke("api-test", "init", "--qa-root", str(root))
+            project = Path(temporary)
+            root = project / "qa"
+            design = project / "design.md"
+            design.write_text("# Reviewed design\n", encoding="utf-8")
+            code, result = self.invoke(
+                "api-test", "init", "--qa-root", str(root), "--design-file", str(design),
+            )
             self.assertEqual(0, code, result)
             self.assertEqual(
                 {"bruno", "contracts", "constraints", "execution", "results"},
@@ -108,8 +167,13 @@ class CliContractTests(unittest.TestCase):
 
     def test_api_version_lock_can_complete_through_the_public_cli(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            qa_root = Path(temporary) / "quality-assets"
-            code, result = self.invoke("api-test", "init", "--qa-root", str(qa_root))
+            project = Path(temporary)
+            qa_root = project / "quality-assets"
+            design = project / "design.md"
+            design.write_text("# Reviewed design\n", encoding="utf-8")
+            code, result = self.invoke(
+                "api-test", "init", "--qa-root", str(qa_root), "--design-file", str(design),
+            )
             self.assertEqual(0, code, result)
             self.assertIn("status: draft", (qa_root / "contracts" / "version-lock.yaml").read_text(encoding="utf-8"))
 

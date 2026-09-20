@@ -846,10 +846,24 @@ def _python_errors(path: Path, project_root: Path) -> list[str]:
             status = _call_argument(evidence_call, "status", 4)
             summary = _call_argument(evidence_call, "summary", 5)
             verified = _call_argument(evidence_call, "verified", 6)
+            step_id = _call_argument(evidence_call, "step_id", 7)
+            protocol_ref = _call_argument(evidence_call, "protocol_ref", 8)
+            protocol_path = _call_argument(evidence_call, "protocol_path", 9)
             phase_text = phase.value if isinstance(phase, ast.Constant) and isinstance(phase.value, str) else None
             method_text = method.value.upper() if isinstance(method, ast.Constant) and isinstance(method.value, str) else None
             if phase_text not in {"smoke", "business"} or method_text is None:
                 diagnostic("endpoint-evidence-literal", "接口证据的 phase 和 method 必须是可静态核验的字面量", evidence_call)
+            if phase_text == "business" and not all(
+                isinstance(value, ast.Constant) and isinstance(value.value, str) and value.value.strip()
+                for value in (step_id, protocol_ref)
+            ):
+                diagnostic("endpoint-protocol-trace", "业务接口证据必须使用字面量 step_id 和 protocol_ref", evidence_call)
+            if phase_text == "smoke" and (step_id is not None or protocol_ref is not None or protocol_path is not None):
+                diagnostic("smoke-protocol-trace", "只读冒烟不绑定业务步骤或业务协议引用", evidence_call)
+            if protocol_path is not None and not (
+                isinstance(protocol_path, ast.Constant) and isinstance(protocol_path.value, str) and protocol_path.value.startswith("/")
+            ):
+                diagnostic("endpoint-protocol-path", "正式 HTTP path 必须是以 / 开头的字面量", evidence_call)
             if in_smoke and not (
                 isinstance(scenario_argument, ast.Constant)
                 and isinstance(scenario_argument.value, str)
@@ -918,6 +932,14 @@ def _python_errors(path: Path, project_root: Path) -> list[str]:
             ) else "read"
             if not isinstance(side_effect, ast.Constant) or side_effect.value != actual_side_effect:
                 diagnostic("control-evidence-side-effect", f"控制证据 side_effect 必须与真实操作一致: {actual_side_effect}", evidence_call)
+            if kind_text in {"messages", "scheduled_jobs", "test_or_admin_api"}:
+                protocol_ref = _call_argument(evidence_call, "protocol_ref", 5)
+                step_id = _call_argument(evidence_call, "step_id", 6)
+                if not all(
+                    isinstance(value, ast.Constant) and isinstance(value.value, str) and value.value.strip()
+                    for value in (step_id, protocol_ref)
+                ):
+                    diagnostic("control-protocol-trace", "control evidence must bind literal step_id and protocol_ref", evidence_call)
             if correlation is None or isinstance(correlation, ast.Constant):
                 diagnostic("control-evidence-correlation", "控制证据关联键必须是传给真实操作的运行值，不得使用常量", evidence_call)
             elif not any(_operation_binds_identity(operation, correlation) for operation in matching_operations):
@@ -953,29 +975,54 @@ def _python_errors(path: Path, project_root: Path) -> list[str]:
 
     controlled_calls = [
         node for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and _resolved_call_name(node, import_aliases).rsplit(".", 1)[-1] == "controlled_database_state"
+        if isinstance(node, ast.Call) and _resolved_call_name(node, import_aliases).rsplit(".", 1)[-1]
+        in {"controlled_database_state", "controlled_database_operations"}
     ]
     callback_roles: list[tuple[str, str]] = []
     for call in controlled_calls:
-        for role in ("snapshot", "mutate", "restore", "verify_restored"):
-            value = next((keyword.value for keyword in call.keywords if keyword.arg == role), None)
-            if not isinstance(value, ast.Name):
-                diagnostic("control-sql-callback", f"{role} 必须是当前模块命名回调，禁止 lambda 或动态回调", value or call)
+        call_name = _resolved_call_name(call, import_aliases).rsplit(".", 1)[-1]
+        if call_name == "controlled_database_state":
+            callback_groups = [[
+                (role, next((keyword.value for keyword in call.keywords if keyword.arg == role), None))
+                for role in ("snapshot", "mutate", "restore", "verify_restored")
+            ]]
+        else:
+            operations = next((keyword.value for keyword in call.keywords if keyword.arg == "operations"), None)
+            if not isinstance(operations, (ast.List, ast.Tuple)) or not operations.elts:
+                diagnostic("control-sql-operations", "operations 必须是非空字面量操作列表", operations or call)
+                callback_groups = []
             else:
-                callback_roles.append((value.id, role))
+                callback_groups = []
+                for operation in operations.elts:
+                    if not isinstance(operation, ast.Dict):
+                        diagnostic("control-sql-operations", "每个数据库操作必须是字面量映射", operation)
+                        continue
+                    values = {
+                        str(key.value): value for key, value in zip(operation.keys, operation.values)
+                        if isinstance(key, ast.Constant) and isinstance(key.value, str)
+                    }
+                    callback_groups.append([(role, values.get(role)) for role in (
+                        "snapshot", "mutate", "verify", "restore", "verify_restored",
+                    )])
+        for group in callback_groups:
+            for role, value in group:
+                if not isinstance(value, ast.Name):
+                    diagnostic("control-sql-callback", f"{role} 必须是当前模块命名回调，禁止 lambda 或动态回调", value or call)
+                else:
+                    callback_roles.append((value.id, role))
     function_map = {
         node.name: node for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
     reused_database_callbacks = {
         callback for callback, _ in callback_roles
-        if sum(name == callback for name, _ in callback_roles) > 1
+        if len({role for name, role in callback_roles if name == callback}) > 1
     }
     for callback in sorted(reused_database_callbacks):
-        diagnostic("control-sql-callback-role", f"数据库控制的四个角色必须使用不同回调: {callback}", function_map.get(callback) or tree)
+        diagnostic("control-sql-callback-role", f"数据库控制的各角色必须使用不同回调: {callback}", function_map.get(callback) or tree)
     for callback, role in callback_roles:
         function = function_map.get(callback)
-        expected_args = ["selector_ref"] if role in {"snapshot", "mutate"} else ["original", "selector_ref"]
+        expected_args = ["selector_ref"] if role in {"snapshot", "mutate", "verify"} else ["original", "selector_ref"]
         if function is None or [argument.arg for argument in function.args.args] != expected_args:
             diagnostic("control-sql-callback", f"{role} 回调必须是当前模块中参数为 {expected_args} 的命名函数", function or tree)
             continue
@@ -1007,6 +1054,19 @@ def _python_errors(path: Path, project_root: Path) -> list[str]:
             ]
             if role == "snapshot":
                 valid_observer = any(_return_uses_call(function, inner_call, parents) for inner_call in observer_calls)
+            elif role == "verify":
+                valid_observer = any(
+                    result_names
+                    and any(
+                        isinstance(return_node, ast.Return)
+                        and return_node.value is not None
+                        and _expression_uses_names(return_node.value, result_names)
+                        and not _constant_or_tautology(return_node.value, function, parents)
+                        for return_node in function.body
+                    )
+                    for inner_call in observer_calls
+                    if (result_names := _assigned_names(inner_call, parents))
+                )
             else:
                 valid_observer = False
                 for inner_call in observer_calls:
@@ -1033,14 +1093,14 @@ def _python_errors(path: Path, project_root: Path) -> list[str]:
         while current is not None and not isinstance(current, (ast.With, ast.AsyncWith)):
             current = parents.get(current)
         if not isinstance(current, ast.With) or not any(item.context_expr is call for item in current.items):
-            diagnostic("control-sql-business-body", "controlled_database_state 必须直接作为 with 上下文包围业务触发、观察和断言", call)
+            diagnostic("control-sql-business-body", "数据库控制必须直接作为 with 上下文包围真实业务触发、观察和断言", call)
             continue
         business_calls = [
             child for statement in current.body for child in ast.walk(statement)
             if isinstance(child, ast.Call)
             and _resolved_call_name(child, import_aliases).rsplit(".", 1)[-1]
             not in database_callbacks | {
-                "record_control", "record_endpoint", "record_business_entry", "print", "str", "int", "bool",
+                "record_control", "record_endpoint", "record_business_entry", "record_step", "print", "str", "int", "bool",
                 "dict", "list", "set", "tuple", "len", "isinstance", "getattr",
             }
         ]
@@ -1054,7 +1114,7 @@ def _python_errors(path: Path, project_root: Path) -> list[str]:
             diagnostic("control-sql-business-body", "控制 SQL 变更后必须在 with 正文触发或等待业务逻辑，并基于真实观察结果断言", current)
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {name for name, _ in callback_roles}:
-            diagnostic("control-sql-direct-call", f"控制 SQL 回调只能交给 controlled_database_state，不得直接调用: {node.func.id}", node)
+            diagnostic("control-sql-direct-call", f"控制 SQL 回调只能交给公共数据库控制上下文，不得直接调用: {node.func.id}", node)
     for sql_node in control_sql_nodes:
         current = parents.get(sql_node)
         enclosing_name: str | None = None
@@ -1064,7 +1124,7 @@ def _python_errors(path: Path, project_root: Path) -> list[str]:
                 break
             current = parents.get(current)
         if enclosing_name not in {name for name, _ in callback_roles}:
-            diagnostic("control-sql-guard", "每条控制 SQL 必须位于 controlled_database_state 的 mutate/restore 回调内", sql_node)
+            diagnostic("control-sql-guard", "每条控制 SQL 必须位于公共数据库控制的 mutate/restore 回调内", sql_node)
 
     restoration_calls = [
         node for node in ast.walk(tree)
@@ -1146,7 +1206,7 @@ def _python_errors(path: Path, project_root: Path) -> list[str]:
             _resolved_call_name(call, import_aliases).rsplit(".", 1)[-1]
             for call in ast.walk(tree) if isinstance(call, ast.Call)
         }
-        if runtime_call_leaves & {"controlled_database_state", "record_business_entry"}:
+        if runtime_call_leaves & {"controlled_database_state", "controlled_database_operations", "record_business_entry", "record_step", "step_guard"}:
             errors.append(_error(path, "smoke-control", "只读冒烟不得引用控制 SQL 或业务执行入口"))
         if not any(_resolved_call_name(call, import_aliases).rsplit(".", 1)[-1] == "record_endpoint" for call in evidence_calls):
             errors.append(_error(path, "smoke-evidence", "冒烟测试必须记录脱敏接口调用结果", "def test_"))
@@ -1208,7 +1268,8 @@ def _python_errors(path: Path, project_root: Path) -> list[str]:
                         diagnostic("business-entry-order", "record_business_entry 前不得执行准备、写入或业务调用", call)
             ignored = {
                 "preflight", "record_business_entry", "record_endpoint", "record_control", "Path",
-                "resolve", "restoration_guard", "controlled_database_state", "len", "print", "str", "dict", "list", "set", "tuple",
+                "resolve", "restoration_guard", "controlled_database_state", "controlled_database_operations", "record_step", "step_guard",
+                "len", "print", "str", "dict", "list", "set", "tuple",
             }
             action_names = [name for name in names if name not in ignored and name not in local_functions]
             if not action_names:
@@ -1239,7 +1300,7 @@ def _python_errors(path: Path, project_root: Path) -> list[str]:
                     for statement in node.finalbody for child in ast.walk(statement)
                 )
                 for node in ast.walk(function)
-            ) or any(name in {"addfinalizer", "restoration_guard", "controlled_database_state"} for name in names)
+            ) or any(name in {"addfinalizer", "restoration_guard", "controlled_database_state", "controlled_database_operations"} for name in names)
             if not guaranteed:
                 diagnostic("cleanup-guaranteed", "场景必须通过非空 finally、finalizer 或受控上下文保证清理", function)
     for mapping in (node for node in ast.walk(tree) if isinstance(node, ast.Dict)):
@@ -1433,6 +1494,36 @@ def static_errors(project_root: Path, selected: str | None = None) -> list[str]:
     errors.extend(_asset_errors(project_root))
     for path in _python_paths(project_root):
         errors.extend(_python_errors(path, project_root))
+    for directory, definition in all_scenarios:
+        if "constructability" not in definition:
+            continue
+        recorded: list[str] = []
+        for path in _python_paths(directory):
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            except (OSError, UnicodeError, SyntaxError):
+                continue
+            aliases = _import_aliases(tree)
+            for call in ast.walk(tree):
+                if not isinstance(call, ast.Call) or _resolved_call_name(call, aliases).rsplit(".", 1)[-1] not in {"record_step", "step_guard"}:
+                    continue
+                scenario = _call_argument(call, "scenario", 0)
+                step_id = _call_argument(call, "step_id", 1)
+                if (
+                    isinstance(scenario, ast.Constant) and scenario.value == directory.name
+                    and isinstance(step_id, ast.Constant) and isinstance(step_id.value, str)
+                ):
+                    recorded.append(step_id.value)
+        expected = [
+            str(step.get("id")) for step in definition.get("steps", []) if isinstance(step, dict)
+        ]
+        if sorted(recorded) != sorted(expected) or len(recorded) != len(set(recorded)):
+            errors.append(_error(
+                directory / f"test_{directory.name}.py",
+                "step-evidence-coverage",
+                f"每个步骤必须且只能有一个字面量 record_step/step_guard 证据: expected={expected}, actual={recorded}",
+                "step_guard",
+            ))
     yaml_paths = [project_root / "discovery" / "workspace.yaml", project_root / "config" / "config.yaml"]
     yaml_paths.extend((project_root / "config" / "environments").glob("*.yaml") if (project_root / "config" / "environments").is_dir() else [])
     yaml_paths.extend(directory / "场景定义.yaml" for directory, _ in all_scenarios)

@@ -1,20 +1,26 @@
 # Python E2E Workflow Contract
 
+Generation authority is ordered: reviewed design documents define business
+expectations; OpenAPI or another formal protocol defines transport shape;
+source/configuration only supplies execution support; runtime results only
+decide pass or fail. Missing or conflicting design/protocol evidence blocks
+generation. A source or observed rule must never be promoted into `logic.yaml`.
+
 The unit of scenario planning, generation, and maintenance is one scenario directory. `discovery/workspace.yaml` owns workspace facts, and `E2E_PLAN.md` may explain project-wide strategy and commands; neither is a global scenario manifest.
 
 ## Contract trace
 
-Before generating assertions, maintain a temporary source-backed trace:
+Before generating assertions, maintain a temporary authority-separated trace:
 
 ```text
-用户预期 -> 公共入口 -> 请求/响应或消息模型 -> 状态变化 -> 关联键 -> 可观测证据 -> 控制方式 -> 清理/恢复
+设计规则 -> 正式协议入口与模型 -> 设计状态变化/结果 -> 设计关联键 -> 支持性观察方式 -> 控制方式 -> 清理/恢复
 ```
 
-Every action, assertion, control, and cleanup must be justified by this trace. Keep only concise source anchors in the durable scenario contract. Do not change user expectations to match current source.
+Every business action and assertion must cite a design rule, and every call must cite a formal protocol operation. Source anchors justify only controls, configuration, observation, fixtures, cleanup, and restoration. Do not change design expectations to match current source or runtime behavior.
 
 ## Scenario definition
 
-Each `scenarios/<中文业务名称>/场景定义.yaml` is authoritative for that scenario. Use exactly these top-level sections: `meta`, `generation`, `readiness`, `preconditions`, `integrations`, `controls`, `isolation`, `steps`, `cleanup`, and `source`.
+Each `scenarios/<中文业务名称>/场景定义.yaml` is authoritative for that scenario. Use exactly these top-level sections: `meta`, `generation`, `readiness`, `preconditions`, `constructability`, `integrations`, `controls`, `isolation`, `steps`, `cleanup`, and `source`.
 
 The following is a schema-shaped example. Values in angle brackets are metavariables and must be replaced with discovered values rather than copied:
 
@@ -24,6 +30,7 @@ meta:
   id: <STABLE_SCENARIO_ID>
   name: <中文业务名称>
   status: pending_environment
+  participants: [<participant-service-a>, <participant-service-b>]
   actor: <业务参与者>
 
 # 生成职责：多场景时每个场景必须有独立 delegated owner；降级时如实记录原因。
@@ -45,7 +52,18 @@ readiness:
 
 # 业务前置：只写可验证条件，不写连接信息。
 preconditions:
-  - <source-confirmed-precondition>
+  - <design-defined-precondition>
+
+# 可构造性：每个前置和步骤都完整评估八类候选路径。
+constructability:
+  preconditions:
+    - id: <design-defined-precondition>
+      data_ownership: <test_owned|environment_owned|not_data>
+      constructible: true
+      candidates: <eight-candidate-matrix-from-dev-ai-schema>
+  steps:
+    - step_id: <step-id>
+      candidates: <eight-candidate-matrix-from-dev-ai-schema>
 
 # 运行依赖：类型和 ID 均来自工作区发现，不限定具体技术。
 integrations:
@@ -112,7 +130,7 @@ controls:
     planned_use:
       - <business-evidence-symbol>
     correlation_keys:
-      - <source-confirmed-correlation-symbol>
+      - <design-defined-correlation-symbol>
     business_evidence:
       - <observable-outcome-symbol>
     recovery:
@@ -141,9 +159,16 @@ steps:
     action: <business-action-symbol>
     control: public_api
     side_effect: write
+    design_rule_id: <DESIGN_RULE_ID>
+    protocol_ref: <FORMAL_PROTOCOL_OPERATION_ID>
+    phase: final_business
     data_ref: 业务数据.json#/<json-pointer>
     expect:
       - <business-outcome-symbol>
+    status: executable
+    status_reason: <design-and-execution-support-backed-reason>
+    evidence:
+      - <repository-id>#<source-symbol>
 
 # 清理恢复：动作必须来源明确、幂等且按资源创建顺序立即注册。
 cleanup:
@@ -167,13 +192,14 @@ Schema rules:
 - `meta` contains non-empty `id`, `name`, `status`, and `actor`. `id` matches `[A-Z][A-Z0-9_]+`; `status` is `ready`, `pending_environment`, or `contract_blocked`.
 - `generation` contains `mode`, `owner`, `write_scope`, and nullable `degradation_reason`, following the delegation rules in [discovery-and-control-policy.md](discovery-and-control-policy.md).
 - `readiness.source_contract` and `readiness.safe_control` are `confirmed` or `blocked`; `runtime_configuration` and `test_data` are `confirmed` or `missing`. `blockers` is a unique list of non-sensitive references. Pending blockers use exact canonical `config:`, `credential:`, `connection:`, or `business_data:` environment-variable references derived from the active configuration path and must equal the real missing set; authorization is forbidden here. Contract blockers use source-bound `control:<category>` or `contract:<repository>#<anchor>` values.
-- `preconditions` is a non-empty unique list of source-confirmed statements.
+- `preconditions` is a non-empty unique list of design-defined statements. `constructability` maps every precondition and step in order and evaluates exactly `public_api`, `test_or_admin_api`, `database_control`, `messages`, `scheduled_jobs`, `mocks_and_faults`, `dynamic_configuration`, and `existing_test_data`. Each candidate records status, component, consumer source, control, side effect, real trigger, observation, isolation, cleanup, and source/runtime evidence. Candidate status is `usable`, `unusable`, or `not_found`; `not_applicable` cannot close the analysis.
+- A constructible `test_owned` precondition has a usable controlled construction path and cannot be reported as missing environment data. Every usable write candidate maps to declared isolation and cleanup/restoration symbols.
 - `integrations.services` is a unique list of discovery service IDs. `components` contains unique `id`, discovered `type`, and boolean `required`; every item resolves to `discovery/workspace.yaml`.
-- `controls` contains exactly the categories defined by the discovery policy plus `decision`. Capability entries have exact non-empty `assessment`, `status`, `evidence`, and `planned_use`; source evidence must match the control's semantic category. `observability` also has `correlation_keys`, `business_evidence`, and `recovery`, which exactly equal the isolation keys, all step expectations, and all cleanup actions/verifications. `database_control.safety` is null when unused and otherwise contains exactly `authorization_required`, `target_environment`, `purpose`, `consumer_source`, `exact_selector`, `expected_rows`, `snapshot`, `mutation`, `trigger`, `verification`, `restoration`, and `restoration_verification`; `purpose` is one of the four allowed preparation/advancement purposes and `expected_rows` is exactly `1`.
+- `controls` contains exactly the categories defined by the discovery policy plus `decision`. Capability entries have exact non-empty `assessment`, `status`, `evidence`, and `planned_use`; source evidence must match the control's semantic category. `observability` also has `correlation_keys`, `business_evidence`, and `recovery`, which exactly equal the isolation keys, all step expectations, and all cleanup actions/verifications. `database_control.safety` is null when unused and otherwise retains the single-operation summary fields and adds a non-empty ordered `operations` list. Every operation has a unique ID, backward-only dependencies, source consumer, owned exact selector, `expected_rows: 1`, snapshot, mutation verification, restoration, and restoration verification symbols.
 - `isolation` contains exactly `namespace`, `correlation_keys`, `owned_resources`, `mutable_controls`, and `serial_lock`, which must be null. Every owned resource contains exact `kind`, `identity`, `cleanup`, `restore`, and `verify` symbols, all mapped into the cleanup contract. Every mutable control is also an owned resource identity. A write scenario has at least one owned resource, and every cross-scenario collision fails.
-- Steps have exact `id`, `action`, `control`, `side_effect`, `expect`, and optional `data_ref`. IDs are unique; `control` names a usable matrix category; `side_effect` is `none`, `read`, or `write`. Test/admin, mock/fault, dynamic-configuration, scheduled-job, message, and database controls are inherently writing and cannot claim `read` or `none`.
+- Steps have exact `id`, `action`, `control`, `side_effect`, `expect`, `status`, `status_reason`, `evidence`, `design_rule_id`, optional `protocol_ref`, optional async `phase`, and optional `data_ref`. Every business expectation traces to `design_rule_id`; every HTTP/RPC/message/task call traces to `protocol_ref`. IDs are unique; `side_effect` is `none`, `read`, or `write`. Static statuses are `executable`, `environment_missing`, `authorization_missing`, `control_gap`, or `product_gap`; `runtime_failure` is emitted only as runtime evidence. Executable/environment/authorization states require a source-confirmed usable execution candidate. Control/product gaps require all eight candidates to be closed by evidence.
 - `data_ref`, when present, has exact form `业务数据.json#/<pointer>` and resolves by RFC 6901 only after selecting the active environment.
-- Every resolved `data_ref` subtree includes at least one source-valid non-placeholder literal. Environment placeholders are limited to pre-existing environment-owned data; scenario-owned unique strings are generated at runtime with `secrets` or `uuid` under source-confirmed format constraints.
+- Every resolved `data_ref` subtree includes at least one protocol-valid non-placeholder literal. Environment placeholders are limited to pre-existing environment-owned data; scenario-owned unique strings are generated at runtime with `secrets` or `uuid` under protocol-defined format constraints.
 - `cleanup` contains non-empty `strategy`, unique `actions`, and unique `verifies`. Cleanup is source-confirmed, idempotent, and guaranteed by `finally`, a finalizer, `ExitStack`, or a context manager.
 - `source` is a non-empty list with exact `repo`, 40-character `commit`, and non-empty unique `anchors`. Every commit equals its discovery inventory snapshot, every relevant topology repository is covered, and every anchor resolves at that commit.
 - Stable scenario ID appears outside its definition only in exactly one pytest marker. Actions, expectations, controls, and cleanup use stable business symbols, not endpoint paths, table names, topic names, copied SQL, URLs, or narrative prose.
@@ -184,7 +210,7 @@ Schema rules:
 
 - `ready`: all four readiness fields are `confirmed`, blockers are empty, `safe_control_path` is true, observability and recovery are usable, required service/component mappings exist, active-environment business data exists, and every exact placeholder used by this scenario currently resolves.
 - `pending_environment`: source contract and safe control are `confirmed`; only runtime configuration or test data is `missing`; blockers exactly equal the missing active-environment placeholders/mappings or test-data placeholders. Per-run SQL/control authorization is not a status input.
-- `contract_blocked`: source contract or safe control is `blocked`, `safe_control_path` is false, readiness and decision blockers match, every blocker resolves to unavailable control evidence or a scenario source anchor, and every candidate API/configuration/job/message/database control is source-backed `unusable` or `not_found`; `not_applicable` cannot close the matrix.
+- `contract_blocked`: source contract or safe control is `blocked`, `safe_control_path` is false, readiness and decision blockers match, every blocker resolves to unavailable control evidence or a scenario source anchor, and every candidate path for every precondition and step is source-backed `unusable` or `not_found`; `not_applicable` cannot close the matrix.
 
 The checker fails a mismatched declared status. A missing HTTP interface alone cannot produce `contract_blocked`. A runtime failure after preflight never changes the static status and must remain a failed execution result.
 
@@ -196,22 +222,22 @@ Keep business inputs in strict JSON, keyed first by environment:
 {
   "<selected-test-environment>": {
     "<step-data-key>": {
-      "<source-literal-field>": "<source-valid-synthetic-value>",
+      "<protocol-field>": "<protocol-valid-synthetic-value>",
       "<environment-owned-field>": "${<SELECTED_ENVIRONMENT_VALUE_REFERENCE>}"
     }
   },
   "<named-test-environment>": {
     "<step-data-key>": {
-      "<source-literal-field>": "<source-valid-synthetic-value>",
+      "<protocol-field>": "<protocol-valid-synthetic-value>",
       "<environment-owned-field>": "${TEST_ENV_SCENARIO_VALUE}"
     }
   }
 }
 ```
 
-The placeholder names and angle-bracket literals shown are metavariables. Inspect source DTOs, validators, enums, and downstream correlation rules, then replace them with source-valid values. All environment objects in one file expose the same logical paths. Never merge or fall back across environments. A missing active root is `pending_environment` during preflight.
+The placeholder names and angle-bracket literals shown are metavariables. Inspect the formal protocol fields, validators, enums, and design-defined correlation rules, then replace them with protocol-valid values. Source may supply support-only fixture candidates but cannot override the contract. All environment objects in one file expose the same logical paths. Never merge or fall back across environments. A missing active root is `pending_environment` during preflight.
 
-Do not turn every business field into an environment variable. Keep deterministic values that the test can safely construct as literals. Generate scenario-owned unique strings at runtime with `secrets` or `uuid` according to source-confirmed length/alphabet/format rules. Exact placeholders are only for pre-existing environment-owned values that cannot safely be constructed. Every subtree named by `data_ref` contains at least one non-placeholder literal; the checker rejects all-placeholder injection.
+Do not turn every business field into an environment variable. Keep deterministic values that the test can safely construct as literals. Generate scenario-owned unique strings at runtime with `secrets` or `uuid` according to protocol-defined length/alphabet/format rules. Exact placeholders are only for pre-existing environment-owned values that cannot safely be constructed. Every subtree named by `data_ref` contains at least one non-placeholder literal; the checker rejects all-placeholder injection.
 
 Do not store credentials, endpoints, generated identifiers, mutable results, SQL, or configuration-center values here. Standard JSON comments and synthetic comment fields are forbidden. Builders explicitly map every source DTO or schema field rather than passing through an entire loaded object.
 
@@ -236,7 +262,7 @@ The main agent and generated checker enforce this order:
 3. `static`: full asset, AST, script, control-SQL, and diagram checks pass before any project test is imported; project `conftest.py` and alternate pytest configuration are forbidden. Then environment-independent shared-logic tests and source-version checks pass.
 4. `collect`: `python -m pytest --collect-only` succeeds with unresolved runtime placeholders inert.
 5. `smoke`: read-only calls run only when runtime access exists and emit one valid endpoint event per selected scenario.
-6. `business`: preflight authorizes scenario side effects and real scenario execution.
+6. `business`: preflight authorizes executable side effects and runs every independently safe step. Each step emits exactly one status event; a blocked later step does not suppress earlier safe work and the scenario still fails rather than passing partially.
 7. `restore`: every declared owned resource is restored and verified.
 
 No later gate runs after an earlier failure. Each smoke/business subprocess must produce JUnit containing at least one executed test and zero skipped, xfailed, failed, or errored tests. Missing runtime values may leave `smoke`, `business`, and `restore` as `N/A`, but cannot weaken collection or static gates. Runtime smoke failure is reported as failure, not as static success.
@@ -249,6 +275,7 @@ Extend the generated project's single `dev-ai e2e check`; do not create overlapp
 - the complete scenario schema, status derivation, ownership, exact write scope, and unique multi-scenario delegated owners;
 - environment-file selection and no cross-environment configuration or business-data fallback;
 - control-matrix use, source evidence, write-step preconditions, correlation, cleanup, restoration, and database-control safeguards;
+- complete per-precondition/per-step constructability, test-owned data classification, step evidence, partial-success rejection, and business-failure classification;
 - cross-scenario collision checks for correlation sources, namespaces, generated IDs, mutable settings, consumer/client IDs, owned records, and cleanup selectors;
 - sibling scenario artifacts, stable IDs, source anchors, all Mermaid diagrams, the shared-CLI launchers, and source-version entries;
 - Python AST validity, import resolution without connecting externally, Chinese docstrings, and guaranteed cleanup;
@@ -271,5 +298,7 @@ The main agent reports, separately and without inferred success:
 - scenarios that stopped at static generation versus those that entered real business steps;
 - database, configuration, cache, message-client, and test-data restoration status;
 - environment-independent tests, `pytest --collect-only`, static validation, source synchronization, read-only smoke, real execution, business-step entry rate, semantic coverage, business correctness, and optional code coverage.
+
+Each scenario report includes `step_results`, `execution_rate`, `coverage_rate`, `business_correctness`, and one classification: `static_complete`, `executed`, `partially_covered`, `business_failure`, or `blocked`. A successful transport with an incorrect business result is `business_failure`; a report containing any unavailable step is never `executed` or successful.
 
 Use `N/A` for every check not executed. Collection, generated code, diagrams, or static validation never substitute for requirement coverage or business correctness.

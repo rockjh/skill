@@ -330,7 +330,16 @@ def post_response_script(case: dict[str, Any], assertions: list[dict[str, Any]])
             continue
         expression = assertion_expression({"path": capture.get("path", "$")})
         if expression:
+            lines.append(
+                f"  if ({expression} === undefined || {expression} === null || {expression} === '') "
+                f"throw new Error({json.dumps('missing flow capture ' + str(capture['name']))});"
+            )
             lines.append(f"  bru.setVar({json.dumps(str(capture['name']))}, {expression});")
+            lines.extend([
+                f"  test({json.dumps('dev-ai:flow:capture:' + str(capture['name']))}, function () {{",
+                "    expect(true).to.equal(true);",
+                "  });",
+            ])
     for assertion in assertions:
         expression = assertion_expression(assertion)
         capture_name = assertion.get("capture_as") or assertion.get("capture")
@@ -351,6 +360,23 @@ def post_response_script(case: dict[str, Any], assertions: list[dict[str, Any]])
                 f"  test({label}, function () {{",
                 f"    expect({expression}).to.be.an('array');",
                 f"    {expression}.forEach(item => expect(typeof item).to.equal('{js_type}'));",
+                "  });",
+            ])
+    for name in case.get("flow_uses", []) if isinstance(case.get("flow_uses"), list) else []:
+        if not str(name).strip():
+            continue
+        lines.extend([
+            f"  test({json.dumps('dev-ai:flow:use:' + str(name))}, function () {{",
+            f"    expect(bru.getVar({json.dumps(str(name))})).to.not.equal(undefined);",
+            "  });",
+        ])
+    absent_path = str(case.get("flow_assert_absent", "")).strip()
+    if absent_path:
+        expression = assertion_expression({"path": absent_path})
+        if expression:
+            lines.extend([
+                f"  test({json.dumps('dev-ai:flow:absence:' + absent_path)}, function () {{",
+                f"    expect({expression}).to.equal(null);",
                 "  });",
             ])
         if expression and str(assertion.get("type", "")).lower() == "integer":
@@ -386,6 +412,13 @@ def pre_request_script(case: dict[str, Any]) -> str:
             f'  if (!bru.getEnvVar("{ready_env}")) {{',
             '    throw new Error("mock data prerequisite was not authorized or could not be prepared");',
             "  }",
+        ])
+    for name in case.get("flow_uses", []) if isinstance(case.get("flow_uses"), list) else []:
+        if not str(name).strip():
+            continue
+        lines.extend([
+            f"  if (bru.getVar({json.dumps(str(name))}) === undefined) "
+            f"throw new Error({json.dumps('missing flow use ' + str(name))});",
         ])
     return "\n".join(["script:pre-request {", *lines, "}"]) if lines else ""
 

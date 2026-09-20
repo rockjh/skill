@@ -316,11 +316,19 @@ def success_assertion_errors(case: dict[str, Any]) -> list[str]:
     if business_value is not None:
         business_assertions.append({"path": business_path, "equals": business_value})
     success_values = {0, "0", 200, "200", True, "true", "ok", "success", "SUCCESS", "OK"}
-    if not business_assertions or any(
-        item.get("equals", item.get("eq")) not in success_values
+    def is_success_value(value: Any) -> bool:
+        return value in success_values or (
+            isinstance(value, int) and not isinstance(value, bool) and 200 <= value < 300
+        ) or (isinstance(value, str) and value.isdigit() and 200 <= int(value) < 300)
+
+    exact_assertions = [item for item in assertions if _assertion_is_exact(item)]
+    if business_assertions and any(
+        not is_success_value(item.get("equals", item.get("eq")))
         for item in business_assertions
     ):
         return [f"success case {case_id} has no exact business-success assertion"]
+    if not business_assertions and not exact_assertions:
+        return [f"success case {case_id} has no exact business result or state assertion"]
     business_paths = {str(item.get("path")) for item in business_assertions}
     has_database_assertion = any(
         step.get("phase") == "assertion"
@@ -328,7 +336,7 @@ def success_assertion_errors(case: dict[str, Any]) -> list[str]:
         and bool(step["expected"])
         for step in database_steps(case)
     )
-    if not has_database_assertion and not any(
+    if business_assertions and not has_database_assertion and not any(
         _assertion_is_exact(item) and str(item.get("path")) not in business_paths
         for item in assertions
     ):
@@ -410,7 +418,9 @@ def case_covers_scenario(case: dict[str, Any], category: str) -> bool:
 
 
 def exclusion_status(item: dict[str, Any]) -> str:
-    return str(item.get("status", "approved")).strip().lower() or "approved"
+    if "approved" in item:
+        return "approved" if item.get("approved") is True else "pending"
+    return str(item.get("status", "")).strip().lower() or "pending"
 
 
 def is_approved_exclusion(item: dict[str, Any]) -> bool:
@@ -1632,6 +1642,8 @@ def check_module(
             errors.append(f"logic {logic.get('id')} has no linked case_ids")
         if not str(logic.get("source_symbol") or logic.get("source") or "").strip():
             errors.append(f"logic {logic.get('id')} has no source_symbol")
+        if logic.get("source") != "design" or not logic.get("design_rule_id"):
+            errors.append(f"logic {logic.get('id')} must trace to a design rule")
         if not str(logic.get("condition", "")).strip():
             errors.append(f"logic {logic.get('id')} has no observable condition")
         for case_id in logic.get("case_ids", []):
@@ -1666,6 +1678,9 @@ def check_module(
     for flow in flow_items:
         captures: set[str] = set()
         seen_steps: set[str] = set()
+        design_rule_ids = [str(value) for value in flow.get("design_rule_ids", [])]
+        if flow.get("source") != "design" or not design_rule_ids:
+            errors.append(f"flow {flow.get('id')} must trace to reviewed design rules")
         for index, step in enumerate(flow.get("steps", []), start=1):
             case_id = step.get("case_id")
             if case_id in seen_steps:
@@ -1673,12 +1688,32 @@ def check_module(
             seen_steps.add(str(case_id))
             if case_id not in case_ids:
                 errors.append(f"flow {flow.get('id')} step {index} references unknown case {case_id}")
+            case = cases_by_id.get(str(case_id), {})
+            case_rules = {str(value) for value in case.get("design_rule_ids", [])}
+            if case_rules.isdisjoint(design_rule_ids):
+                errors.append(
+                    f"flow {flow.get('id')} step {index} case {case_id} is not backed by a declared design rule"
+                )
             uses = [step["uses"]] if isinstance(step.get("uses"), str) else step.get("uses", [])
             for used in uses:
                 if used not in captures:
                     errors.append(f"flow {flow.get('id')} step {index} uses uncaptured value {used}")
+                if used not in _variables({"request": case.get("request"), "assertions": case.get("assertions")}):
+                    errors.append(f"flow {flow.get('id')} step {index} case {case_id} does not use {used}")
             captured = step.get("capture")
-            captures.update([captured] if isinstance(captured, str) else [str(item) for item in captured or []])
+            captured_names = {captured} if isinstance(captured, str) else {str(item) for item in captured or []}
+            case_captures = case.get("captures", {})
+            declared_case_captures = (
+                {str(name) for name in case_captures}
+                if isinstance(case_captures, dict)
+                else {
+                    str(item.get("name")) for item in case_captures
+                    if isinstance(item, dict) and item.get("name")
+                } if isinstance(case_captures, list) else set()
+            )
+            for name in sorted(captured_names - declared_case_captures):
+                errors.append(f"flow {flow.get('id')} step {index} case {case_id} does not capture {name}")
+            captures.update(captured_names)
 
     for exclusion in exclusions:
         endpoint_id = exclusion.get("endpoint_id")
@@ -1997,7 +2032,6 @@ def main() -> int:
     selected_case_ids_by_module: dict[str, set[str]] = {}
     all_flow_ids: dict[str, str] = {}
     all_logic_ids: dict[str, str] = {}
-    source_candidate_links: set[str] = set()
     offline_inventory_count: int | None = None
     contract_provenance_unverified = False
     global_captured_variables: set[str] = set()
@@ -2140,29 +2174,9 @@ def main() -> int:
                     errors.append(f"logic id {logic_id} is duplicated in modules {all_logic_ids[logic_id]} and {module_id}")
                 if logic_id:
                     all_logic_ids[logic_id] = module_id
-                if logic.get("source_candidate_id"):
-                    source_candidate_links.add(str(logic["source_candidate_id"]))
 
     if not args.module:
         errors.extend(validate_cross_module_flows(args.contracts_root, all_case_ids))
-        candidates_path = args.contracts_root / "source-logic-candidates.yaml"
-        if candidates_path.is_file():
-            candidate_document = load_data(candidates_path)
-            candidates = first_list(candidate_document, "candidates")
-            if isinstance(candidate_document, dict):
-                errors.extend(
-                    f"source scan failed: {error}"
-                    for error in candidate_document.get("errors", [])
-                    if str(error).strip()
-                )
-                java = candidate_document.get("java", {}) if isinstance(candidate_document.get("java"), dict) else {}
-                if java.get("mapping_annotation_count", 0) and not java.get("entrypoint_count", 0):
-                    errors.append("source contains Mapping annotations but the scanner recognized 0 entrypoints")
-            for candidate in candidates:
-                if candidate.get("coverage_required") is True and str(candidate.get("id")) not in source_candidate_links:
-                    errors.append(
-                        f"source logic candidate {candidate.get('id')} has no logic.yaml entry or linked case"
-                    )
 
     endpoint_ids = [str(endpoint.get("id", "")) for _, endpoint in endpoint_records]
     duplicate_endpoint_ids = sorted({item for item in endpoint_ids if item and endpoint_ids.count(item) > 1})

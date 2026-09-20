@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import shutil
 import subprocess
@@ -17,7 +16,7 @@ sys.dont_write_bytecode = True
 
 from ...core.redaction import redact
 from .execution_config import initialize_execution_layout
-from .analyze_source_logic import apply_candidates, scan as scan_source_logic
+from .design_rules import apply_to_contracts, build_rules, discover, summary as design_summary
 from .materialize_missing_bru import materialize
 from .mock_data import command as mock_data_operation
 from .mock_data import derive_mock_data_contracts, write_discovery
@@ -47,13 +46,9 @@ from .constraints import (
     worker_snapshot_path,
     write_worker_snapshot,
 )
-from .source_constraints import (
-    apply_constraints_to_manifest,
+from .value_resolution import (
     apply_environment_values,
-    apply_observed_constraints,
-    scope_source_constraints,
     write_value_resolutions,
-    write_source_constraints,
 )
 
 
@@ -121,18 +116,35 @@ def is_loopback_openapi(document: dict[str, object]) -> bool:
 def init_command(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="dev-ai api-test init")
     qa_root_argument(parser)
+    parser.add_argument("--design-root", action="append", type=Path, default=[])
+    parser.add_argument("--design-file", action="append", type=Path, default=[])
     args = parser.parse_args(argv)
     qa_root = args.qa_root.resolve()
+    design = discover(qa_root.parent, design_roots=args.design_root, design_files=args.design_file)
+    candidates = "\n".join(f"  - {path}" for path in design.candidates) or "  (none)"
+    if not design.files:
+        print(
+            "ERROR: design documents are required; provide --design-root/--design-file. Candidates:\n" + candidates,
+            file=sys.stderr,
+        )
+        return 2
+    if not args.design_root and not args.design_file and len(design.candidates) > 1:
+        print("ERROR: multiple design roots found; choose one with --design-root:\n" + candidates, file=sys.stderr)
+        return 2
     changed = initialize_execution_layout(qa_root, local_scripts=False)
     ensure_rule_library(qa_root)
     (qa_root / CONTRACTS / "modules").mkdir(parents=True, exist_ok=True)
     initial_artifacts = {
-        qa_root / CONSTRAINTS / "source-rules.yaml": {
-            "version": 1, "source_roots": [], "source_inventory": {}, "field_rules": [],
-            "error_codes": [], "response_rules": [], "endpoint_response_rules": [], "controller_bindings": [],
-        },
         qa_root / CONSTRAINTS / "observed-rules.yaml": {"version": 1, "observations": []},
-        qa_root / CONTRACTS / "exception-profile.yaml": {"version": 1, "handlers": []},
+        qa_root / CONSTRAINTS / "design-rules.yaml": {
+            "version": 1,
+            "source": "design",
+            "documents": [],
+            "rules": [],
+            "exclusions": [],
+            "manual_confirmations": [],
+            "coverage": {"openapi_endpoints": 0, "documented_endpoints": 0, "excluded_endpoints": 0},
+        },
         qa_root / CONTRACTS / "fixtures" / "generated" / "manifest.yaml": {"version": 1, "fixtures": []},
     }
     for path, document in initial_artifacts.items():
@@ -162,8 +174,8 @@ def generate_command(argv: list[str]) -> int:
     parser.add_argument("--incremental", action="store_true")
     parser.add_argument("--no-seed-cases", action="store_true")
     parser.add_argument("--source-root", action="append", type=Path, default=[])
-    parser.add_argument("--exception-type")
-    parser.add_argument("--error-code-type")
+    parser.add_argument("--design-root", action="append", type=Path, default=[])
+    parser.add_argument("--design-file", action="append", type=Path, default=[])
     parser.add_argument("--coverage-profile", choices=("contract-draft", "full-matrix"))
     parser.add_argument("--base-url", action="append", default=[])
     parser.add_argument("--port", action="append", type=int, default=[])
@@ -171,6 +183,18 @@ def generate_command(argv: list[str]) -> int:
     parser.add_argument("--timeout", type=float, default=2.0)
     args = parser.parse_args(argv)
     qa_root = args.qa_root.resolve()
+    design = discover(qa_root.parent, design_roots=args.design_root, design_files=args.design_file)
+    if not design.files:
+        candidates = "\n".join(f"  - {path}" for path in design.candidates) or "  (none)"
+        print(
+            "ERROR: design documents are required; provide --design-root/--design-file. Candidates:\n" + candidates,
+            file=sys.stderr,
+        )
+        return 2
+    if not args.design_root and not args.design_file and len(design.candidates) > 1:
+        candidates = "\n".join(f"  - {path}" for path in design.candidates)
+        print("ERROR: multiple design roots found; choose one with --design-root:\n" + candidates, file=sys.stderr)
+        return 2
     initialize_execution_layout(qa_root, local_scripts=False)
     ensure_rule_library(qa_root)
     if (qa_root / ".dev-ai.lock.json").is_file():
@@ -212,69 +236,32 @@ def generate_command(argv: list[str]) -> int:
         shutil.copy2(source_spec, saved_spec)
     source_document = load_document(saved_spec)
     manifest = extract(saved_spec, source_document)
-    source_constraints_path = qa_root / CONSTRAINTS / "source-rules.yaml"
+    design_rules, design_errors = build_rules(
+        qa_root.parent,
+        design.files,
+        manifest,
+        qa_root=qa_root,
+    )
+    design_path = qa_root / CONSTRAINTS / "design-rules.yaml"
+    design_path.parent.mkdir(parents=True, exist_ok=True)
+    design_path.write_text(render_manifest(design_rules, design_path), encoding="utf-8")
+    if design_errors:
+        for error in design_errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+        return 2
     if args.source_root:
         missing = [str(path) for path in args.source_root if not path.is_dir()]
         if missing:
             parser.error("source root(s) do not exist: " + ", ".join(missing))
-        source_constraints = write_source_constraints(qa_root, args.source_root, manifest)
+        # Source discovery is execution preparation only.  It is never applied
+        # to endpoint schemas, expected results, or business logic.
         write_discovery(qa_root, args.source_root)
-        apply_constraints_to_manifest(manifest, source_constraints)
-    elif source_constraints_path.is_file():
-        source_constraints = scope_source_constraints(load_document(source_constraints_path), manifest)
-        source_constraints_path.write_text(render_manifest(source_constraints, source_constraints_path), encoding="utf-8")
-        apply_constraints_to_manifest(manifest, source_constraints)
-    else:
-        source_constraints = {
-            "version": 1,
-            "generated_at": datetime.now().isoformat(),
-            "source_roots": [],
-            "source_inventory": {},
-            "field_rules": [],
-            "error_codes": [],
-            "response_rules": [],
-            "endpoint_response_rules": [],
-            "controller_bindings": [],
-        }
-        source_constraints_path.parent.mkdir(parents=True, exist_ok=True)
-        source_constraints_path.write_text(render_manifest(source_constraints, source_constraints_path), encoding="utf-8")
-    observed_paths = [qa_root / CONSTRAINTS / "observed-rules.yaml"]
-    observed_paths.extend((contracts / "modules").glob("*/observed-rules.yaml"))
-    for observed_path in observed_paths:
-        if observed_path.is_file():
-            observed = load_document(observed_path)
-            apply_observed_constraints(manifest, observed)
     environment_path = environment_file(qa_root / EXECUTION / "config.yaml", execution_config)
     if environment_path.is_file():
         apply_environment_values(manifest, load_bruno_environment(environment_path))
     for endpoint in manifest.get("endpoints", []):
         if isinstance(endpoint, dict):
             endpoint["obligations"] = constraint_obligations(endpoint)
-    source_candidates: dict[str, object] | None = None
-    if args.source_root:
-        source_candidates = scan_source_logic(args.source_root, None, args.exception_type, args.error_code_type)
-        if source_candidates.get("errors"):
-            for error in source_candidates["errors"]:
-                print(f"ERROR: {error}", file=sys.stderr)
-            return 2
-        profile = source_candidates.get("java", {}).get("exception_profile", {}) if isinstance(source_candidates.get("java"), dict) else {}
-        handlers = profile.get("handlers", []) if isinstance(profile, dict) else []
-        for endpoint in manifest.get("endpoints", []):
-            if not isinstance(endpoint, dict):
-                continue
-            endpoint_key = f"{str(endpoint.get('method', '')).upper()} {endpoint.get('path')}"
-            handler = next((
-                item for item in handlers
-                if isinstance(item, dict)
-                and endpoint_key in {
-                    str(value) for value in (
-                        item.get("evidence", {}).get("endpoint_scope", [])
-                        if isinstance(item.get("evidence"), dict) else []
-                    )
-                }
-            ), None)
-            if handler:
-                endpoint["x-exception-profile"] = copy.deepcopy(handler)
     module_map = args.module_map.resolve() if args.module_map else contracts / "module-map.yaml"
     if not module_map.is_file():
         module_map.parent.mkdir(parents=True, exist_ok=True)
@@ -287,30 +274,29 @@ def generate_command(argv: list[str]) -> int:
         seed_cases=not args.no_seed_cases,
         incremental=args.incremental,
         coverage_profile=coverage_profile,
+        design_sha256=design_summary(design_rules)["sha256"],
     )
-    if source_candidates is not None:
-        unresolved = apply_candidates(source_candidates, contracts)
-        if unresolved:
-            for candidate_id in unresolved:
-                print(
-                    f"ERROR: source candidate {candidate_id} cannot be uniquely mapped to an endpoint",
-                    file=sys.stderr,
-                )
-            return 2
+    apply_to_contracts(contracts, design_rules)
+    if (contracts / "generation-state.yaml").is_file():
         refresh_generation_state_cases(contracts)
-    exception_profile = contracts / "exception-profile.yaml"
-    if not exception_profile.is_file():
-        exception_profile.write_text(
-            render_manifest({"version": 1, "handlers": []}, exception_profile),
-            encoding="utf-8",
-        )
     derive_mock_data_contracts(qa_root)
     if (contracts / "generation-state.yaml").is_file():
         refresh_generation_state_cases(contracts)
-    write_value_resolutions(qa_root, source_constraints)
+    write_value_resolutions(qa_root)
     materialize(contracts, qa_root / BRUNO, execution_config_path=qa_root / EXECUTION / "config.yaml")
-    write_value_resolutions(qa_root, source_constraints)
+    write_value_resolutions(qa_root)
     write_qa_lock(contracts)
+    version_lock = contracts / "version-lock.yaml"
+    if version_lock.is_file():
+        lock = load_document(version_lock)
+        if isinstance(lock, dict):
+            lock = dict(lock)
+            lock["openapi"] = {
+                "file": str(saved_spec.relative_to(contracts)),
+                "sha256": manifest.get("source", {}).get("sha256"),
+            }
+            lock["design"] = design_summary(design_rules)
+            version_lock.write_text(render_manifest(lock, version_lock), encoding="utf-8")
     constraint_errors = [
         *validate_stage(qa_root, "generation"),
         *validate_stage(qa_root, "materialization"),

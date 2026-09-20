@@ -49,19 +49,17 @@ EVIDENCE_FIELDS = ("source_kind", "file", "symbol", "line", "endpoint_scope", "c
 
 MANDATORY_RULES: tuple[dict[str, Any], ...] = (
     {"id": "SRC-001", "stages": list(ALL_STAGES), "required": True},
-    {"id": "SRC-002", "stages": ["generation", "materialization"], "required": True},
     {"id": "RES-001", "stages": list(ALL_STAGES), "required": True},
     {"id": "MAN-001", "stages": list(ALL_STAGES), "required": True},
     {"id": "MAN-002", "stages": list(ALL_STAGES), "required": True},
     {"id": "SCN-001", "stages": list(ALL_STAGES), "required": True},
     {"id": "FILE-001", "stages": ["materialization", "pre-execution", "run"], "required": True},
-    {"id": "FILE-002", "stages": ["generation", "materialization"], "required": True},
-    {"id": "ERR-001", "stages": list(ALL_STAGES), "required": True},
     {"id": "LOGIC-001", "stages": ["generation", "materialization"], "required": True},
     {"id": "ASSERT-001", "stages": list(ALL_STAGES), "required": True},
     {"id": "MAT-001", "stages": ["materialization", "pre-execution", "run"], "required": True},
     {"id": "RUN-001", "stages": ["pre-execution", "run"], "required": True},
     {"id": "OBS-001", "stages": ["post-execution"], "required": True},
+    {"id": "DESIGN-001", "stages": list(ALL_STAGES), "required": True},
 )
 
 
@@ -78,12 +76,11 @@ DEFAULT_RULES: tuple[dict[str, Any], ...] = (*MANDATORY_RULES,
     {"id": "module-worker-boundary", "stages": ["generation", "materialization", "pre-execution", "post-execution"], "required": True},
     {"id": "business-code-immutable", "stages": ["generation", "materialization", "pre-execution", "post-execution"], "required": True},
     {"id": "qa-assets-secret-free", "stages": ["generation", "materialization", "pre-execution", "post-execution"], "required": True},
-    {"id": "source-domain-rules", "stages": ["generation", "materialization", "pre-execution", "post-execution"], "required": True},
 )
 
 DEFAULT_MANUAL_CONFIRMATION = {
-    "max_count": 20,
-    "max_ratio": 0.02,
+    "max_count": 0,
+    "max_ratio": 0.0,
     "available_evidence_count": 0,
 }
 
@@ -298,7 +295,7 @@ def rule_library_errors(path: Path) -> list[str]:
     manual = document.get("manual_confirmation", {}) if isinstance(document, dict) else {}
     if manual != DEFAULT_MANUAL_CONFIRMATION:
         errors.append(
-            "manual_confirmation budget must be max_count=20, max_ratio=0.02, "
+            "manual_confirmation budget must be max_count=0, max_ratio=0.0, "
             "available_evidence_count=0"
         )
     return errors
@@ -393,25 +390,6 @@ def _review_authorization_errors(
     records: list[tuple[str, Path, dict[str, Any], dict[str, Any]]],
 ) -> list[str]:
     available: dict[str, list[tuple[set[str], str]]] = {}
-    source_paths = [qa_root / CONSTRAINTS / "source-rules.yaml"]
-    source_paths.extend(directory / "source-rules.yaml" for _, directory, _, _ in records)
-    for path in source_paths:
-        document = load_data(path) if path.is_file() else {}
-        for rule in document.get("field_rules", []) if isinstance(document, dict) else []:
-            if not isinstance(rule, dict):
-                continue
-            constraints = rule.get("constraints", {}) if isinstance(rule.get("constraints"), dict) else {}
-            reusable = (
-                rule.get("example") is not None
-                or constraints.get("default") is not None
-                or bool(constraints.get("enum"))
-            )
-            if reusable:
-                for name in rule.get("field_names", []):
-                    available.setdefault(_normalized_field(str(name)), []).append((
-                        _scope_values(rule.get("endpoint_scope")),
-                        f"source rule {rule.get('id', '<unknown>')}",
-                    ))
     config_path = qa_root / "execution" / "config.yaml"
     if config_path.is_file():
         try:
@@ -534,56 +512,144 @@ def _source_provenance_errors(qa_root: Path) -> list[str]:
     return errors
 
 
-def _source_scope_errors(
+def _design_rule_errors(
     qa_root: Path,
     records: list[tuple[str, Path, dict[str, Any], dict[str, Any]]],
 ) -> list[str]:
-    paths = [qa_root / CONSTRAINTS / "source-rules.yaml"]
-    paths.extend(directory / "source-rules.yaml" for _, directory, _, _ in records)
-    errors: list[str] = []
-    if records and not paths[0].is_file():
-        errors.append(_rule_error("SRC-002", f"source rule library is missing: {paths[0]}"))
+    path = qa_root / CONSTRAINTS / "design-rules.yaml"
+    retired = [
+        root / name
+        for root in [
+            qa_root / CONSTRAINTS,
+            *(directory for _, directory, _, _ in records),
+        ]
+        for name in ("source-rules.yaml", "source-rules.yml", "source-rules.json")
+        if (root / name).is_file()
+    ]
+    retired_errors = [
+        _rule_error("DESIGN-001", f"{item.name} is retired; business rules must come from design-rules.yaml")
+        for item in retired
+    ]
+    if not path.is_file():
+        return [*retired_errors, _rule_error("DESIGN-001", f"design-rules.yaml is missing: {path}")]
+    document = load_data(path)
+    if not isinstance(document, dict) or document.get("source") != "design":
+        return [*retired_errors, _rule_error("DESIGN-001", "design-rules.yaml must declare source: design")]
+    rules = [item for item in document.get("rules", []) if isinstance(item, dict)]
+    rules_by_id = {str(item.get("id")): item for item in rules if item.get("id")}
+    covered = {str(item.get("endpoint_id")) for item in rules if item.get("endpoint_id")}
+    exclusions = [item for item in document.get("exclusions", []) if isinstance(item, dict)]
+    def approved_exclusion(item: dict[str, Any]) -> bool:
+        if "approved" in item:
+            return item.get("approved") is True
+        return str(item.get("status", "")).strip().casefold() == "approved"
+
+    approved = {
+        str(endpoint_id)
+        for item in exclusions if approved_exclusion(item)
+        for endpoint_id in (
+            item.get("endpoint_ids", [])
+            if isinstance(item.get("endpoint_ids"), list)
+            else [item.get("endpoint_id")]
+        )
+        if endpoint_id
+    }
+    errors: list[str] = list(retired_errors)
+    rule_ids = [str(item.get("id")) for item in rules if item.get("id")]
+    for rule_id in sorted({item for item in rule_ids if rule_ids.count(item) > 1}):
+        errors.append(_rule_error("DESIGN-001", f"design rule ID is duplicated: {rule_id}"))
+    flows = [item for item in document.get("flows", []) if isinstance(item, dict)]
+    flow_ids = [str(item.get("id")) for item in flows if item.get("id")]
+    for flow_id in sorted({item for item in flow_ids if flow_ids.count(item) > 1}):
+        errors.append(_rule_error("DESIGN-001", f"design flow ID is duplicated: {flow_id}"))
+    flows_by_rule: dict[str, list[dict[str, Any]]] = {}
+    for flow in flows:
+        flow_id = str(flow.get("id", "<unknown>"))
+        steps = flow.get("steps", []) if isinstance(flow.get("steps"), list) else []
+        if flow.get("mode") != "sequential" or len(steps) < 2:
+            errors.append(_rule_error("DESIGN-001", f"design flow {flow_id} is not an executable sequential flow"))
+        for step in steps:
+            if not isinstance(step, dict):
+                errors.append(_rule_error("DESIGN-001", f"design flow {flow_id} contains an invalid step"))
+                continue
+            rule_id = str(step.get("rule_id", ""))
+            if rule_id not in rules_by_id:
+                errors.append(_rule_error("DESIGN-001", f"design flow {flow_id} references unknown rule {rule_id}"))
+            else:
+                flows_by_rule.setdefault(rule_id, []).append(flow)
+    for rule in rules:
+        rule_id = str(rule.get("id", "<unknown>"))
+        if rule.get("manual_confirmation"):
+            errors.append(_rule_error("DESIGN-001", f"design rule {rule_id} still requires manual confirmation"))
+        for message in evidence_errors(rule.get("evidence"), f"design rule {rule_id}"):
+            errors.append(_rule_error("DESIGN-001", message))
+        if (
+            rule.get("async") is True
+            or rule.get("scenario") == "safety"
+            or bool(rule.get("idempotency"))
+            or bool(rule.get("retries"))
+            or bool(rule.get("external_failures"))
+        ) and rule_id not in flows_by_rule:
+            errors.append(_rule_error("DESIGN-001", f"design rule {rule_id} has no executable design flow"))
+        if rule.get("concurrency"):
+            errors.append(_rule_error(
+                "DESIGN-001",
+                f"design rule {rule_id} requires real concurrent execution and cannot use a sequential flow",
+            ))
+    # Only request-shape and multipart constraints are independently provable
+    # from OpenAPI.  Query/auth/authz outcomes require reviewed design rules.
+    openapi_scenarios = {"validation", "file"}
     endpoint_ids = {
         str(endpoint.get("id"))
         for _, _, endpoint_doc, _ in records
         for endpoint in first_list(endpoint_doc, "endpoints")
         if endpoint.get("id")
     }
-    endpoint_keys = {
-        f"{str(endpoint.get('method', '')).upper()} {endpoint.get('path')}"
-        for _, _, endpoint_doc, _ in records
-        for endpoint in first_list(endpoint_doc, "endpoints")
-    }
-    for path in dict.fromkeys(paths):
-        if not path.is_file():
-            continue
-        document = load_data(path)
-        for rule in document.get("field_rules", []) if isinstance(document, dict) else []:
-            if not isinstance(rule, dict):
+    for endpoint_id in sorted(endpoint_ids - covered - approved):
+        errors.append(_rule_error("DESIGN-001", f"endpoint {endpoint_id} has no design rule or approved exclusion"))
+    for _, directory, _, case_doc in records:
+        for case in first_list(case_doc, "cases"):
+            if str(case.get("endpoint_id")) in approved:
                 continue
-            label = f"source rule {rule.get('id', '<unknown>')}"
-            scope = _scope_values(rule.get("endpoint_scope"))
-            operation = str(rule.get("operation", "")).strip()
-            call_chain = rule.get("call_chain")
-            if not scope and not operation and not (isinstance(call_chain, list) and call_chain):
-                errors.append(_rule_error("SRC-002", f"{label} is not bound to an endpoint, operation, or call chain"))
-            unknown = scope - endpoint_ids - endpoint_keys
-            if unknown:
-                errors.append(_rule_error("SRC-002", f"{label} has unknown endpoint scope: {', '.join(sorted(unknown))}"))
-            evidence = rule.get("evidence", [])
-            if not isinstance(evidence, list) or not evidence:
-                errors.append(_rule_error("SRC-002", f"{label} has no source evidence"))
-            for index, item in enumerate(evidence if isinstance(evidence, list) else []):
-                errors.extend(
-                    _rule_error("SRC-002", message)
-                    for message in evidence_errors(item, f"{label}[{index}]")
-                )
-        for collection_name in ("error_codes", "response_rules", "endpoint_response_rules", "controller_bindings"):
-            for index, item in enumerate(document.get(collection_name, []) if isinstance(document, dict) else []):
-                if not isinstance(item, dict) or "evidence" not in item:
-                    continue
-                for message in evidence_errors(item.get("evidence"), f"{collection_name}[{index}]"):
-                    errors.append(_rule_error("SRC-002", message))
+            if str(case.get("scenario")) in openapi_scenarios:
+                if case.get("source") != "openapi" or not case.get("openapi_trace"):
+                    errors.append(_rule_error("DESIGN-001", f"protocol case {case.get('id')} has no OpenAPI traceability"))
+            elif case.get("source") != "design" or not case.get("design_rule_ids"):
+                errors.append(_rule_error("DESIGN-001", f"business case {case.get('id')} has no design traceability"))
+            else:
+                for rule_id in case.get("design_rule_ids", []):
+                    rule = rules_by_id.get(str(rule_id))
+                    if rule is None:
+                        errors.append(_rule_error(
+                            "DESIGN-001", f"business case {case.get('id')} references unknown design rule {rule_id}",
+                        ))
+                    elif str(rule.get("endpoint_id")) != str(case.get("endpoint_id")):
+                        errors.append(_rule_error(
+                            "DESIGN-001",
+                            f"business case {case.get('id')} references design rule {rule_id} for another endpoint",
+                        ))
+        logic_doc = load_data(directory / "logic.yaml") if (directory / "logic.yaml").is_file() else {}
+        for logic in first_list(logic_doc, "logic"):
+            if logic.get("source") != "design" or not logic.get("design_rule_id"):
+                errors.append(_rule_error("DESIGN-001", f"logic {logic.get('id')} must come from design"))
+            elif str(logic.get("design_rule_id")) not in rules_by_id:
+                errors.append(_rule_error(
+                    "DESIGN-001",
+                    f"logic {logic.get('id')} references unknown design rule {logic.get('design_rule_id')}",
+                ))
+            if logic.get("source_candidate_id") or logic.get("observed_rule_id"):
+                errors.append(_rule_error("DESIGN-001", f"logic {logic.get('id')} references non-design evidence"))
+            evidence = logic.get("evidence", []) if isinstance(logic.get("evidence"), list) else []
+            if any(isinstance(item, dict) and item.get("source_kind") != "design" for item in evidence):
+                errors.append(_rule_error("DESIGN-001", f"logic {logic.get('id')} contains non-design evidence"))
+            if logic.get("async") is True and (
+                not str(logic.get("acceptance_status", "")).strip()
+                or not str(logic.get("final_status", "")).strip()
+            ):
+                errors.append(_rule_error(
+                    "DESIGN-001",
+                    f"async logic {logic.get('id')} must distinguish acceptance_status and final_status",
+                ))
     return errors
 
 
@@ -637,12 +703,23 @@ def _manual_budget_errors(
 
 def _scenario_errors(records: list[tuple[str, Path, dict[str, Any], dict[str, Any]]]) -> list[str]:
     errors: list[str] = []
-    for _, _, endpoint_doc, case_doc in records:
+    for _, directory, endpoint_doc, case_doc in records:
+        exclusions_path = directory / "exclusions.yaml"
+        exclusions_doc = load_data(exclusions_path) if exclusions_path.is_file() else {}
+        excluded_endpoint_ids = {
+            str(item.get("endpoint_id"))
+            for item in first_list(exclusions_doc, "exclusions")
+            if item.get("endpoint_id")
+            and str(item.get("status", "")).strip().casefold() == "approved"
+            and str(item.get("reason", "")).strip()
+        }
         cases_by_endpoint: dict[str, list[dict[str, Any]]] = {}
         for case in first_list(case_doc, "cases"):
             cases_by_endpoint.setdefault(str(case.get("endpoint_id", "")), []).append(case)
         for endpoint in first_list(endpoint_doc, "endpoints"):
             endpoint_id = str(endpoint.get("id", "<unknown>"))
+            if endpoint_id in excluded_endpoint_ids:
+                continue
             matrix = endpoint.get("scenario_matrix", {}) if isinstance(endpoint.get("scenario_matrix"), dict) else {}
             endpoint_cases = cases_by_endpoint.get(endpoint_id, [])
             for scenario, decision in matrix.items():
@@ -777,92 +854,24 @@ def _file_fixture_errors(
     return errors
 
 
-def _file_exception_errors(
-    qa_root: Path,
-    records: list[tuple[str, Path, dict[str, Any], dict[str, Any]]],
-) -> list[str]:
-    _, fixture_document = _fixture_document(qa_root)
-    fixtures = [item for item in fixture_document.get("fixtures", []) if isinstance(item, dict)]
-    errors: list[str] = []
-    for _, directory, _, case_doc in records:
-        cases = first_list(case_doc, "cases")
-        logic_doc = load_data(directory / "logic.yaml") if (directory / "logic.yaml").is_file() else {}
-        for logic in first_list(logic_doc, "logic"):
-            fixture_type = str(logic.get("fixture_type", ""))
-            if not fixture_type:
-                continue
-            endpoint_id = str(logic.get("endpoint_id", ""))
-            case_ids = {str(value) for value in logic.get("case_ids", [])}
-            if not any(str(case.get("id")) in case_ids and str(case.get("scenario")) == "file" for case in cases):
-                errors.append(_rule_error("FILE-002", f"source file exception {logic.get('id')} has no file case"))
-            if not any(
-                item.get("type") == fixture_type
-                and endpoint_id in _scope_values(item.get("endpoint_scope"))
-                for item in fixtures
-            ):
-                errors.append(_rule_error("FILE-002", f"source file exception {logic.get('id')} has no {fixture_type} fixture"))
-    return errors
-
-
-def _exception_profile_errors(
-    qa_root: Path,
-    records: list[tuple[str, Path, dict[str, Any], dict[str, Any]]],
-) -> list[str]:
-    path = qa_root / CONTRACTS / "exception-profile.yaml"
-    if records and not path.is_file():
-        return [_rule_error("ERR-001", f"exception profile is missing: {path}")]
-    document = load_data(path) if path.is_file() else {}
-    handlers = [item for item in document.get("handlers", []) if isinstance(item, dict)] if isinstance(document, dict) else []
-    errors: list[str] = []
-    for index, handler in enumerate(handlers):
-        for message in evidence_errors(handler.get("evidence"), f"exception handler[{index}]"):
-            errors.append(_rule_error("ERR-001", message))
-    for _, _, _, case_doc in records:
-        for case in first_list(case_doc, "cases"):
-            if str(case.get("scenario")) not in {"validation", "business_error"}:
-                continue
-            expected = case.get("expected", {}) if isinstance(case.get("expected"), dict) else {}
-            business_code = expected.get("business_code")
-            matching = [
-                item for item in handlers
-                if business_code is None
-                or not item.get("business_codes")
-                or str(business_code) in {str(value) for value in item.get("business_codes", [])}
-            ]
-            if not matching:
-                continue
-            handler = matching[0]
-            if expected.get("http_status") != handler.get("http_status"):
-                errors.append(_rule_error(
-                    "ERR-001",
-                    f"case {case.get('id')} HTTP status {expected.get('http_status')} does not match ControllerAdvice {handler.get('http_status')}",
-                ))
-            path_value = str(handler.get("business_code_path", ""))
-            assertions = case.get("assertions", []) if isinstance(case.get("assertions"), list) else []
-            if path_value and business_code is not None and not any(
-                isinstance(item, dict)
-                and str(item.get("path")) == path_value
-                and str(item.get("equals", item.get("eq"))) == str(business_code)
-                for item in assertions
-            ):
-                errors.append(_rule_error("ERR-001", f"case {case.get('id')} does not assert {path_value} exactly"))
-    return errors
-
-
 def _logic_errors(records: list[tuple[str, Path, dict[str, Any], dict[str, Any]]]) -> list[str]:
     errors: list[str] = []
     for _, directory, _, case_doc in records:
         cases = {str(case.get("id")): case for case in first_list(case_doc, "cases") if case.get("id")}
         logic_doc = load_data(directory / "logic.yaml") if (directory / "logic.yaml").is_file() else {}
         for logic in first_list(logic_doc, "logic"):
-            if logic.get("reachable", True) is False or not logic.get("source_candidate_id"):
-                continue
-            for message in evidence_errors(logic.get("evidence"), f"logic {logic.get('id', '<unknown>')}"):
-                errors.append(_rule_error("LOGIC-001", message))
+            evidence = logic.get("evidence", []) if isinstance(logic.get("evidence"), list) else []
+            if not evidence:
+                errors.append(_rule_error("LOGIC-001", f"logic {logic.get('id', '<unknown>')} has no design evidence"))
+            for index, item in enumerate(evidence):
+                for message in evidence_errors(item, f"logic {logic.get('id', '<unknown>')} evidence[{index}]"):
+                    errors.append(_rule_error("LOGIC-001", message))
             linked = [cases.get(str(case_id)) for case_id in logic.get("case_ids", [])]
+            if not linked or any(case is None for case in linked):
+                errors.append(_rule_error("LOGIC-001", f"logic {logic.get('id')} has unknown or missing case IDs"))
             executable = [case for case in linked if case and not needs_manual_confirmation(case)]
             if not executable:
-                errors.append(_rule_error("LOGIC-001", f"reachable source branch {logic.get('id')} has no executable case"))
+                errors.append(_rule_error("LOGIC-001", f"design logic {logic.get('id')} has no executable case"))
     return errors
 
 
@@ -910,6 +919,11 @@ def _value_resolution_errors(records: list[tuple[str, Path, dict[str, Any], dict
                 continue
             for message in evidence_errors(item.get("evidence"), f"value resolution {item.get('field_path', '<unknown>')}"):
                 errors.append(_rule_error("RES-001", message))
+            if item.get("value_source") not in {"config", "fixture", "support-source"}:
+                errors.append(_rule_error(
+                    "RES-001",
+                    f"value resolution {item.get('field_path', '<unknown>')} has forbidden source {item.get('value_source')}",
+                ))
             if item.get("status") == "resolved" and str(item.get("value", "")).startswith("review-"):
                 errors.append(_rule_error("RES-001", f"resolved field {item.get('field_path')} still uses review placeholder"))
     return errors
@@ -1082,159 +1096,6 @@ def _registered_bru_errors(qa_root: Path, records: list[tuple[str, Path, dict[st
     return errors
 
 
-def _field_values(value: Any, found: dict[str, list[Any]]) -> None:
-    if isinstance(value, dict):
-        for key, child in value.items():
-            found.setdefault(str(key).casefold(), []).append(child)
-            _field_values(child, found)
-    elif isinstance(value, list):
-        for child in value:
-            _field_values(child, found)
-
-
-def _rule_ids(value: Any) -> set[str]:
-    if isinstance(value, dict):
-        current = {str(value["x-qa-rule-id"])} if value.get("x-qa-rule-id") else set()
-        return current.union(*(_rule_ids(child) for child in value.values()), set())
-    if isinstance(value, list):
-        return set().union(*(_rule_ids(child) for child in value), set())
-    return set()
-
-
-def _request_rule_ids(endpoint: dict[str, Any]) -> set[str]:
-    return _rule_ids({
-        "parameters": endpoint.get("parameters", []),
-        "request_body": endpoint.get("request_body", {}),
-    })
-
-
-def _concrete(value: Any) -> bool:
-    return not isinstance(value, (dict, list)) and not (
-        isinstance(value, str) and ("{{" in value or REVIEW_RE.search(value))
-    )
-
-
-def _value_constraint_errors(case_id: str, field: str, value: Any, constraints: dict[str, Any]) -> list[str]:
-    if isinstance(value, str) and ("{{" in value or REVIEW_RE.search(value)):
-        return []
-    errors: list[str] = []
-    expected_type = constraints.get("type")
-    type_matches = {
-        "string": isinstance(value, str),
-        "integer": isinstance(value, int) and not isinstance(value, bool),
-        "number": isinstance(value, (int, float)) and not isinstance(value, bool),
-        "boolean": isinstance(value, bool),
-        "array": isinstance(value, list),
-        "object": isinstance(value, dict),
-    }
-    if expected_type in type_matches and not type_matches[expected_type]:
-        errors.append(f"case {case_id} field {field} violates source type {expected_type}")
-        return errors
-    if isinstance(value, str):
-        if constraints.get("minLength") is not None and len(value) < int(constraints["minLength"]):
-            errors.append(f"case {case_id} field {field} is shorter than source minLength {constraints['minLength']}")
-        if constraints.get("maxLength") is not None and len(value) > int(constraints["maxLength"]):
-            errors.append(f"case {case_id} field {field} is longer than source maxLength {constraints['maxLength']}")
-        if constraints.get("pattern"):
-            try:
-                if re.fullmatch(str(constraints["pattern"]), value) is None:
-                    errors.append(f"case {case_id} field {field} violates source pattern")
-            except re.error as exc:
-                errors.append(f"source constraint pattern for {field} is invalid: {exc}")
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        if constraints.get("minimum") is not None and value < constraints["minimum"]:
-            errors.append(f"case {case_id} field {field} is below source minimum {constraints['minimum']}")
-        if constraints.get("maximum") is not None and value > constraints["maximum"]:
-            errors.append(f"case {case_id} field {field} is above source maximum {constraints['maximum']}")
-    if isinstance(constraints.get("enum"), list) and value not in constraints["enum"]:
-        errors.append(f"case {case_id} field {field} is outside source enum")
-    return errors
-
-
-def _source_rule_errors(qa_root: Path, records: list[tuple[str, Path, dict[str, Any], dict[str, Any]]]) -> list[str]:
-    documents: list[dict[str, Any]] = []
-    global_path = qa_root / CONSTRAINTS / "source-rules.yaml"
-    if global_path.is_file():
-        loaded = load_data(global_path)
-        if isinstance(loaded, dict):
-            documents.append(loaded)
-    for _, directory, _, _ in records:
-        path = directory / "source-rules.yaml"
-        if path.is_file():
-            loaded = load_data(path)
-            if isinstance(loaded, dict):
-                documents.append(loaded)
-    rules_by_id = {
-        str(item.get("id")): item
-        for document in documents
-        for item in document.get("field_rules", [])
-        if isinstance(item, dict) and item.get("id") and isinstance(item.get("constraints"), dict)
-    }
-    errors: list[str] = []
-    unique_values: dict[tuple[str, str], dict[str, str]] = {}
-    for _, _, endpoint_doc, case_doc in records:
-        endpoints = {
-            str(endpoint.get("id")): endpoint
-            for endpoint in first_list(endpoint_doc, "endpoints")
-            if isinstance(endpoint, dict) and endpoint.get("id")
-        }
-        for case in first_list(case_doc, "cases"):
-            if str(case.get("scenario", "")).lower() != "success":
-                continue
-            endpoint_id = str(case.get("endpoint_id", ""))
-            endpoint = endpoints.get(endpoint_id, {})
-            active_rules = {
-                rule_id: rules_by_id[rule_id]
-                for rule_id in _request_rule_ids(endpoint)
-                if rule_id in rules_by_id
-            }
-            values: dict[str, list[Any]] = {}
-            _field_values(case.get("request", {}), values)
-            for rule_id, rule in active_rules.items():
-                constraints = rule.get("constraints", {})
-                names = [str(name).casefold() for name in rule.get("field_names", [])]
-                matched = [(name, value) for name in names for value in values.get(name, [])]
-                case_id = str(case.get("id", "<unknown>"))
-                field = str(rule.get("field") or next(iter(names), rule_id))
-                if constraints.get("required") is True and not matched:
-                    errors.append(f"case {case_id} is missing source-required field {field}")
-                for _, value in matched:
-                    errors.extend(_value_constraint_errors(case_id, field, value, constraints))
-                    if (
-                        constraints.get("unique") is True
-                        and str(endpoint.get("method", "GET")).upper() not in {"GET", "HEAD", "OPTIONS"}
-                        and _concrete(value)
-                    ):
-                        key = (endpoint_id, rule_id)
-                        rendered = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
-                        previous = unique_values.setdefault(key, {}).get(rendered)
-                        if previous and previous != case_id:
-                            errors.append(
-                                f"success cases {previous} and {case_id} reuse source-unique field {field}"
-                            )
-                        unique_values[key][rendered] = case_id
-    return errors
-
-
-def _schema_value_errors(case_id: str, path: str, value: Any, schema: Any) -> list[str]:
-    if not isinstance(schema, dict):
-        return []
-    errors = _value_constraint_errors(case_id, path, value, schema)
-    if isinstance(value, dict):
-        properties = schema.get("properties", {}) if isinstance(schema.get("properties"), dict) else {}
-        required = schema.get("required", []) if isinstance(schema.get("required"), list) else []
-        for name in required:
-            if name not in value:
-                errors.append(f"case {case_id} response {path} is missing source-required field {name}")
-        for name, child in properties.items():
-            if name in value:
-                errors.extend(_schema_value_errors(case_id, f"{path}.{name}", value[name], child))
-    elif isinstance(value, list) and isinstance(schema.get("items"), dict):
-        for index, child in enumerate(value):
-            errors.extend(_schema_value_errors(case_id, f"{path}[{index}]", child, schema["items"]))
-    return errors
-
-
 def _latest_evidence_documents(
     qa_root: Path,
     records: list[tuple[str, Path, dict[str, Any], dict[str, Any]]],
@@ -1254,45 +1115,6 @@ def _latest_evidence_documents(
             if isinstance(loaded, dict):
                 documents.append(loaded)
     return documents
-
-
-def _source_response_errors(
-    qa_root: Path,
-    records: list[tuple[str, Path, dict[str, Any], dict[str, Any]]],
-    module_scoped: bool = False,
-) -> list[str]:
-    endpoints: dict[str, dict[str, Any]] = {}
-    cases: dict[str, dict[str, Any]] = {}
-    for _, _, endpoint_doc, case_doc in records:
-        endpoints.update({
-            str(endpoint.get("id")): endpoint
-            for endpoint in first_list(endpoint_doc, "endpoints")
-            if isinstance(endpoint, dict) and endpoint.get("id")
-        })
-        cases.update({
-            str(case.get("id")): case
-            for case in first_list(case_doc, "cases")
-            if isinstance(case, dict) and case.get("id")
-        })
-    errors: list[str] = []
-    for evidence in _latest_evidence_documents(qa_root, records, module_scoped):
-        passed = set(evidence.get("passed", []))
-        observations = evidence.get("cases", {}) if isinstance(evidence.get("cases"), dict) else {}
-        for case_id in passed:
-            case = cases.get(str(case_id), {})
-            endpoint = endpoints.get(str(case.get("endpoint_id", "")), {})
-            observation = observations.get(case_id, {}) if isinstance(observations.get(case_id), dict) else {}
-            actual = observation.get("actual", {}) if isinstance(observation.get("actual"), dict) else {}
-            status = actual.get("http_status")
-            body = actual.get("body")
-            responses = endpoint.get("responses", {}) if isinstance(endpoint.get("responses"), dict) else {}
-            response = responses.get(str(status), responses.get(status, {}))
-            content = response.get("content", {}) if isinstance(response, dict) and isinstance(response.get("content"), dict) else {}
-            media = next((item for item in content.values() if isinstance(item, dict)), None)
-            schema = media.get("schema") if isinstance(media, dict) else None
-            if isinstance(schema, dict) and (_rule_ids(schema) or schema.get("x-source-evidence")):
-                errors.extend(_schema_value_errors(str(case_id), "$", body, schema))
-    return errors
 
 
 def _path_marker(path: Path) -> str:
@@ -1444,8 +1266,6 @@ def validate_stage(
     budget = document.get("manual_confirmation", {}) if isinstance(document, dict) else {}
     if "SRC-001" in active:
         errors.extend(_source_provenance_errors(qa_root))
-    if "SRC-002" in active:
-        errors.extend(_source_scope_errors(qa_root, records))
     if "MAN-001" in active:
         errors.extend(_manual_confirmation_errors(records))
     if "MAN-002" in active:
@@ -1457,10 +1277,6 @@ def validate_stage(
         errors.extend(_value_resolution_errors(records))
     if "FILE-001" in active:
         errors.extend(_file_fixture_errors(qa_root, records, include_consistency=False))
-    if "FILE-002" in active:
-        errors.extend(_file_exception_errors(qa_root, records))
-    if "ERR-001" in active:
-        errors.extend(_exception_profile_errors(qa_root, records))
     if "LOGIC-001" in active:
         errors.extend(_logic_errors(records))
     if "ASSERT-001" in active:
@@ -1503,10 +1319,8 @@ def validate_stage(
         errors.extend(_review_authorization_errors(qa_root, records))
     if "bru-registered" in active:
         errors.extend(_registered_bru_errors(qa_root, records))
-    if "source-domain-rules" in active:
-        errors.extend(_source_rule_errors(qa_root, records))
-        if stage == "post-execution":
-            errors.extend(_source_response_errors(qa_root, records, module_scoped=module is not None))
+    if "DESIGN-001" in active:
+        errors.extend(_design_rule_errors(qa_root, records))
     if "MAT-001" in active:
         errors.extend(_materialization_consistency_errors(qa_root, records))
     if "OBS-001" in active:

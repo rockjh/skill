@@ -68,12 +68,16 @@ def normalized_case_results(raw: Any) -> dict[str, dict[str, Any]]:
         if isinstance(item, dict)
     ]
     results: dict[str, dict[str, Any]] = {}
+    duplicates: list[str] = []
+    passed = set(execution_evidence(raw).get("passed", []))
     for item in items:
         test = item.get("test") if isinstance(item.get("test"), dict) else {}
         filename = str(test.get("filename", ""))
         name = str(item.get("name") or (Path(filename).stem if filename else ""))
         if not name:
             continue
+        if name in results:
+            duplicates.append(name)
         response = item.get("response") if isinstance(item.get("response"), dict) else {}
         body = response.get("data", response.get("body"))
         failures: list[str] = []
@@ -85,15 +89,30 @@ def normalized_case_results(raw: Any) -> dict[str, dict[str, Any]]:
                 failures.append(str(detail)[:500])
         if item.get("error"):
             failures.append(str(item["error"])[:500])
+        flow_events = {"capture": [], "use": [], "absence": []}
+        for key in ("assertionResults", "testResults"):
+            observations = item.get(key) if isinstance(item.get(key), list) else []
+            for observation in observations:
+                if not isinstance(observation, dict):
+                    continue
+                status = str(observation.get("status", "")).lower()
+                label = str(observation.get("name") or observation.get("title") or observation.get("description") or "")
+                if status not in {"pass", "passed", "success"} or not label.startswith("dev-ai:flow:"):
+                    continue
+                kind, _, value = label[len("dev-ai:flow:"):].partition(":")
+                if kind in flow_events and value:
+                    flow_events[kind].append(value)
         results[name] = {
-            "status": "passed" if name in execution_evidence(raw).get("passed", []) else "failed",
+            "status": "passed" if name in passed else "failed",
             "actual": {
                 "http_status": response.get("status", response.get("statusCode")),
                 "body": safe_value(body),
                 "response_shape": response_shape(body),
             },
             "failure_reason": "; ".join(dict.fromkeys(failures)) or None,
+            "flow_events": {key: list(dict.fromkeys(value)) for key, value in flow_events.items() if value},
         }
+    normalized_case_results.duplicates = sorted(set(duplicates))
     return results
 
 
@@ -109,11 +128,16 @@ def main() -> int:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         parser.error(f"cannot read Bruno report: {exc}")
     evidence = execution_evidence(raw)
+    normalized_cases = normalized_case_results(raw)
+    duplicates = getattr(normalized_case_results, "duplicates", [])
+    if duplicates:
+        print("duplicate Bruno case IDs in reporter output: " + ", ".join(duplicates), file=sys.stderr)
+        return 1
     normalized: dict[str, Any] = {
         "version": 1,
         "executed": evidence.get("executed", []),
         "passed": evidence.get("passed", []),
-        "cases": normalized_case_results(raw),
+        "cases": normalized_cases,
     }
     if isinstance(raw, dict) and isinstance(raw.get("flows"), dict):
         flows: dict[str, Any] = {}

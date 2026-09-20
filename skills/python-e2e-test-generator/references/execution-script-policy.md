@@ -13,7 +13,7 @@ dev-ai e2e run --project . --scenario <scenario-name>
 dev-ai e2e run --project . --static-only
 ```
 
-The engine owns the fixed stage order, content-addressed seals, one-hour session boundary, source checks, collection, read-only smoke, business execution, JUnit validation, restoration, and final report. Caller pytest arguments are accepted only for the final business invocation and cannot change selection or success semantics.
+The engine owns the fixed stage order, content-addressed seals, one-hour session boundary, an active read-only local environment probe for every run request, source checks, collection, read-only smoke, business execution, JUnit validation, restoration, and final report. Caller pytest arguments are accepted only for the final business invocation and cannot change selection or success semantics.
 
 `dev-ai e2e run` removes inherited pytest plugin and option injection, invokes subprocesses without a shell, and writes the authoritative redacted report to `artifacts/e2e-run.json`. Console output contains only a bounded summary and report pointer unless `--full` is explicit.
 

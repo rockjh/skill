@@ -15,6 +15,7 @@ from dev_ai import __version__
 from dev_ai.core.artifacts import write_lock
 from dev_ai.core.schema import E2E_GATE_SCHEMA_VERSION
 from dev_ai.domains.e2e.assets import initialize
+from dev_ai.domains.e2e.contracts import generate_artifacts
 
 
 def _dev_ai(project: Path, command: str, *arguments: str) -> list[str]:
@@ -93,6 +94,19 @@ class ForwardProjectTests(unittest.TestCase):
                 encoding="utf-8",
             )
             initialize(project)
+            design = project / "reviewed-design.md"
+            design.write_text(
+                "# 读取证据\n规则 ID：READ_EVIDENCE\n参与方：repo:app\n参与方：evidence-store\n"
+                "GET /evidence\n业务流程：跨组件读取关联证据\n断言：observe_outcome\n",
+                encoding="utf-8",
+            )
+            protocol = project / "openapi.json"
+            protocol.write_text(json.dumps({
+                "openapi": "3.0.0",
+                "paths": {"/evidence": {"get": {"operationId": "readEvidence", "responses": {"200": {"description": "ok"}}}}},
+            }), encoding="utf-8")
+            _, generation_errors = generate_artifacts(project, design_files=[design], openapi_files=[protocol])
+            self.assertEqual([], generation_errors)
             write_lock(project, tool_version=__version__, domain="e2e", schema_version=E2E_GATE_SCHEMA_VERSION)
 
             missing_environment = os.environ.copy()
@@ -134,6 +148,12 @@ class ForwardProjectTests(unittest.TestCase):
             self.assertEqual("passed", report["stages"]["summary"]["status"])
             self.assertEqual({"database_read", "observability"}, set(report["scenarios"][0]["planned_controls"]))
             self.assertEqual("database_read", report["scenarios"][0]["used_controls"][0]["control_kind"])
+            self.assertEqual("executable", report["scenarios"][0]["step_results"][0]["status"])
+            self.assertEqual(1, report["scenarios"][0]["execution_rate"])
+            self.assertEqual(1, report["scenarios"][0]["coverage_rate"])
+            self.assertEqual("passed", report["scenarios"][0]["business_correctness"])
+            self.assertEqual("executed", report["scenarios"][0]["classification"])
+            self.assertEqual("completed", report["discovery"]["active_runtime_probe"]["outcome"])
 
     @staticmethod
     def _workspace_yaml(commit: str) -> str:
@@ -154,7 +174,7 @@ class ForwardProjectTests(unittest.TestCase):
                   modules:
                     - id: app
                       path: .
-                      kind: application
+                      kind: library
               existing_e2e: []
             # 依赖拓扑：当前场景只涉及单一模块。
             topology:
@@ -215,15 +235,22 @@ class ForwardProjectTests(unittest.TestCase):
                     source_key: SourceAnchor.connection
               middleware: []
               controls: []
-            # 运行探测：本次合成验证未声明应用已启动。
+            # 运行探测：无可运行应用节点，但已只读确认当前组件配置来源。
             runtime_probe:
-              requested: false
-              outcome: not_requested
+              requested: true
+              outcome: completed
               blockers: []
               listeners: []
               processes: []
               associations: []
               read_only_smoke: []
+              configuration_checks:
+                - id: evidence-store
+                  node: repo:app
+                  profile: null
+                  sources: [source-file]
+                  effective: confirmed
+                  evidence: [runtime-environment-reference-resolved]
             # 阶段门禁：发现事实已完整复核。
             gates:
               inventory_complete: true
@@ -288,6 +315,26 @@ class ForwardProjectTests(unittest.TestCase):
                 f"  {name}:\n    status: not_applicable\n    assessment: 当前场景不需要该能力\n    evidence: []\n    planned_use: []{extra}"
             )
         unused_controls = "\n".join(entries)
+        candidates = []
+        for kind in (
+            "public_api", "test_or_admin_api", "database_control", "messages",
+            "scheduled_jobs", "mocks_and_faults", "dynamic_configuration", "existing_test_data",
+        ):
+            status = "usable" if kind == "existing_test_data" else "not_found"
+            candidates.append(
+                f"        - kind: {kind}\n"
+                f"          status: {status}\n"
+                "          component: evidence-store\n"
+                "          consumer_source: repo#SourceAnchor\n"
+                "          control: query-evidence-setup\n"
+                "          side_effect: read\n"
+                "          trigger: query_evidence\n"
+                "          observation: observe_outcome\n"
+                "          isolation: query-key\n"
+                "          cleanup: verify-no-mutation\n"
+                "          evidence: [repo#SourceAnchor]"
+            )
+        candidate_matrix = "\n".join(candidates)
         template = textwrap.dedent(
             f"""\
             # 用途：定义只读证据场景；禁止保存凭据或连接值。
@@ -296,6 +343,7 @@ class ForwardProjectTests(unittest.TestCase):
               id: READ_EVIDENCE
               name: 读取证据
               status: ready
+              participants: [repo:app, evidence-store]
               actor: 查询方
             # 生成职责：单场景由主代理负责。
             generation:
@@ -312,6 +360,17 @@ class ForwardProjectTests(unittest.TestCase):
               blockers: []
             # 业务前置：查询键属于当前环境测试数据。
             preconditions: [测试查询键已配置]
+            # 可构造性：前置和步骤均已穷尽八类候选路径。
+            constructability:
+              preconditions:
+                - id: 测试查询键已配置
+                  data_ownership: environment_owned
+                  constructible: false
+                  candidates: &candidate_matrix
+            __CANDIDATE_MATRIX__
+              steps:
+                - step_id: observe
+                  candidates: *candidate_matrix
             # 运行依赖：只使用发现的数据源组件。
             integrations:
               services: []
@@ -351,8 +410,14 @@ class ForwardProjectTests(unittest.TestCase):
                 action: query_evidence
                 control: database_read
                 side_effect: read
+                design_rule_id: READ_EVIDENCE
+                protocol_ref: readEvidence
+                phase: final_business
                 data_ref: 业务数据.json#/query
                 expect: [observe_outcome]
+                status: executable
+                status_reason: 源码确认参数化只读查询可执行
+                evidence: [repo#SourceAnchor]
             # 清理恢复：验证场景未产生可变状态。
             cleanup:
               strategy: fixture
@@ -365,7 +430,7 @@ class ForwardProjectTests(unittest.TestCase):
                 anchors: [SourceAnchor]
             """
         )
-        return template.replace("__UNUSED_CONTROLS__", unused_controls)
+        return template.replace("__UNUSED_CONTROLS__", unused_controls).replace("__CANDIDATE_MATRIX__", candidate_matrix)
 
     @staticmethod
     def _scenario_test() -> str:
@@ -379,7 +444,7 @@ class ForwardProjectTests(unittest.TestCase):
 
             import pytest
 
-            from dev_ai.domains.e2e.runtime import preflight, record_business_entry
+            from dev_ai.domains.e2e.runtime import preflight, record_business_entry, step_guard
             from scenarios.读取证据.步骤 import observe_evidence, verify_no_mutation
 
 
@@ -391,7 +456,8 @@ class ForwardProjectTests(unittest.TestCase):
                 context = preflight(Path(__file__).resolve().parents[2], "读取证据")
                 record_business_entry("读取证据")
                 try:
-                    assert observe_evidence(context)["observed"] is True
+                    with step_guard("读取证据", step_id="observe", evidence=["repo#SourceAnchor"]):
+                        assert observe_evidence(context)["observed"] is True
                 finally:
                     verify_no_mutation()
             '''

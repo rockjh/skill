@@ -223,6 +223,98 @@ def scope_cases(contracts_root: Path, module: str | None) -> list[dict[str, Any]
     return cases
 
 
+def _names(value: Any) -> set[str]:
+    if isinstance(value, str):
+        return {value}
+    if isinstance(value, list):
+        return {str(item) for item in value if str(item)}
+    return set()
+
+
+def flow_execution_evidence(
+    contracts_root: Path,
+    cases: list[dict[str, Any]],
+    evidence: dict[str, Any],
+    module: str | None,
+) -> dict[str, Any]:
+    """Bind declared flow steps to the actual ordered Bruno case results."""
+
+    modules_root = contracts_root / "modules"
+    directories = [modules_root / module] if module else sorted(
+        (path for path in modules_root.iterdir() if path.is_dir()),
+    ) if modules_root.is_dir() else []
+    declared = [
+        flow
+        for directory in directories
+        if (directory / "flows.yaml").is_file()
+        for flow in first_list(load_data(directory / "flows.yaml"), "flows")
+    ]
+    executed = [str(value) for value in evidence.get("executed", [])]
+    passed = {str(value) for value in evidence.get("passed", [])}
+    duplicate_executed = {case_id for case_id in executed if executed.count(case_id) > 1}
+    positions = {case_id: index for index, case_id in enumerate(executed)}
+    result: dict[str, Any] = {}
+    for flow in declared:
+        flow_id = str(flow.get("id", ""))
+        expected_steps = [step for step in flow.get("steps", []) if isinstance(step, dict)]
+        actual_steps: list[dict[str, Any]] = []
+        expected_ids = [str(step.get("case_id", "")) for step in expected_steps]
+        ordered = all(
+            case_id in positions for case_id in expected_ids
+        ) and [positions[case_id] for case_id in expected_ids] == sorted(
+            positions[case_id] for case_id in expected_ids
+        )
+        for step, case_id in zip(expected_steps, expected_ids):
+            status = "passed" if case_id in passed else "failed" if case_id in positions else "not_executed"
+            case_evidence = evidence.get("cases", {}).get(case_id, {}) if isinstance(evidence.get("cases"), dict) else {}
+            flow_events = case_evidence.get("flow_events", {}) if isinstance(case_evidence, dict) else {}
+            captures = _names(flow_events.get("capture")) if status == "passed" else set()
+            requested_uses = _names(step.get("uses"))
+            used = requested_uses & _names(flow_events.get("use")) if status == "passed" else set()
+            absent_path = str(step.get("assert_absent", ""))
+            asserted_absent = bool(
+                absent_path and absent_path in _names(flow_events.get("absence"))
+            ) if status == "passed" else False
+            actual_steps.append({
+                "case_id": case_id,
+                "status": status,
+                "captures": sorted(captures),
+                "used_captures": sorted(used),
+                "asserted_absent": asserted_absent,
+            })
+        delete_positions = [
+            index for index, step in enumerate(expected_steps)
+            if str(step.get("operation", "")).casefold() in {"delete", "cleanup"}
+        ]
+        absence_positions = [
+            index for index, step in enumerate(expected_steps)
+            if str(step.get("operation", "")).casefold() in {"query", "read", "get"}
+            and step.get("assert_absent")
+        ]
+        cleanup_verified = bool(
+            delete_positions
+            and any(index > delete_positions[0] for index in absence_positions)
+            and all(step["status"] == "passed" for step in actual_steps)
+        )
+        result[flow_id] = {
+            "status": "passed" if not duplicate_executed and ordered and actual_steps and all(
+                step["status"] == "passed" for step in actual_steps
+            ) and all(
+                not _names(step.get("capture")) or _names(step.get("capture")) <= set(actual["captures"])
+                for step, actual in zip(expected_steps, actual_steps)
+            ) and all(
+                not _names(step.get("uses")) or _names(step.get("uses")) <= set(actual["used_captures"])
+                for step, actual in zip(expected_steps, actual_steps)
+            ) and all(
+                not step.get("assert_absent") or actual["asserted_absent"]
+                for step, actual in zip(expected_steps, actual_steps)
+            ) else "failed",
+            "cleanup_verified": cleanup_verified,
+            "steps": actual_steps,
+        }
+    return result
+
+
 def requires_developer_sandbox(cases: list[dict[str, Any]]) -> bool:
     return any(database_steps(case) for case in cases)
 
@@ -536,6 +628,7 @@ def aggregate_module_results(qa_root: Path) -> tuple[Path, Path, dict[str, Any]]
         "executed": [],
         "passed": [],
         "cases": {},
+        "flows": {},
         "module_evidence": [],
     }
     for module_id, module_cases in sorted(by_module.items()):
@@ -587,6 +680,13 @@ def aggregate_module_results(qa_root: Path) -> tuple[Path, Path, dict[str, Any]]
                         "module evidence repeats case ids: " + ", ".join(sorted(overlap))
                     )
                 merged_evidence["cases"].update(copy.deepcopy(evidence["cases"]))
+            if isinstance(evidence.get("flows"), dict):
+                overlap = set(merged_evidence["flows"]) & set(evidence["flows"])
+                if overlap:
+                    reconciliation_errors.append(
+                        "module evidence repeats flow ids: " + ", ".join(sorted(overlap))
+                    )
+                merged_evidence["flows"].update(copy.deepcopy(evidence["flows"]))
             merged_evidence["module_evidence"].append(evidence_path.relative_to(qa_root).as_posix())
         elif any(row.get("status") != "not_executed" for row in module_rows.values()):
             reconciliation_errors.append(f"module {module_id} report has no readable execution evidence")
@@ -1150,7 +1250,10 @@ def execute(args: argparse.Namespace, qa_root: Path, execution_log: Path) -> int
             for case_id in mock_blocked_case_ids:
                 if isinstance(evidence.get("cases"), dict):
                     evidence["cases"].pop(case_id, None)
-            evidence_path.write_text(json.dumps(evidence, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+        evidence["flows"] = flow_execution_evidence(
+            contracts_root, cases, evidence, selected_directory,
+        )
+        evidence_path.write_text(json.dumps(evidence, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
         print("Case results:")
         total_cases, executed_cases, passed_cases, failed_cases, not_executed = render_case_summary(cases, evidence)
 

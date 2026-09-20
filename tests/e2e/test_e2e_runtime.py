@@ -85,6 +85,46 @@ class RuntimeTests(unittest.TestCase):
             context = RUNTIME.preflight(root, "读取场景", environ={"USED_URL": "http://example.invalid"})
             self.assertEqual({"used"}, set(context["configuration"]["services"]))
 
+    def test_preflight_keeps_later_missing_values_inert_for_partial_execution(self) -> None:
+        """后续步骤缺配置时，已声明 executable 的前置步骤仍可进入运行。"""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scenario = root / "scenarios" / "部分场景"
+            environment = root / "config" / "environments"
+            scenario.mkdir(parents=True)
+            environment.mkdir(parents=True)
+            self._write_yaml(root / "config" / "config.yaml", {
+                "active_environment": "test",
+                "defaults": {"safety": {
+                    "database_control_enabled": False,
+                    "mutable_configuration_enabled": False,
+                    "message_publish_enabled": False,
+                }},
+            })
+            self._write_yaml(environment / "test.yaml", {
+                "services": {}, "components": {},
+                "safety": {"test_environment": True, "side_effects_allowed": False, "protected": False},
+            })
+            self._write_yaml(scenario / "场景定义.yaml", {
+                "meta": {"status": "pending_environment"},
+                "steps": [
+                    {"id": "first", "status": "executable", "control": "database_read", "side_effect": "read"},
+                    {"id": "later", "status": "environment_missing", "control": "public_api", "side_effect": "read"},
+                ],
+                "controls": {},
+                "integrations": {"services": [], "components": []},
+                "isolation": {"namespace": "partial"},
+            })
+            (scenario / "业务数据.json").write_text(
+                '{"test":{"first":"literal","later":"${MISSING_LATER_VALUE}"}}', encoding="utf-8"
+            )
+
+            context = RUNTIME.preflight(root, "部分场景", environ={})
+            self.assertTrue(context["partial"])
+            self.assertEqual(["first"], context["executable_steps"])
+            self.assertEqual("${MISSING_LATER_VALUE}", context["business_data"]["later"])
+
     def test_preflight_requires_per_run_message_authorization(self) -> None:
         """消息发布控制必须针对精确测试环境获得本次运行授权。"""
 
@@ -225,6 +265,59 @@ class RuntimeTests(unittest.TestCase):
             ):
                 pass
 
+    def test_database_operations_restore_attempted_changes_in_reverse_order(self) -> None:
+        """多操作准备失败时必须恢复当前及此前操作，并保持逆序。"""
+
+        context = {
+            "active_environment": "test",
+            "definition": {"controls": {"database_control": {
+                "status": "usable",
+                "safety": {
+                    "target_environment": "test",
+                    "operations": [
+                        {"id": "parent", "depends_on": [], "exact_selector": "parent-key", "expected_rows": 1},
+                        {"id": "child", "depends_on": ["parent"], "exact_selector": "child-key", "expected_rows": 1},
+                    ],
+                },
+            }}},
+        }
+        restored: list[str] = []
+
+        def callbacks(operation_id: str, rows: int) -> dict[str, object]:
+            """返回记录恢复顺序的合成数据库回调。"""
+
+            return {
+                "id": operation_id,
+                "snapshot": lambda selector: {"selector": selector},
+                "mutate": lambda selector: rows,
+                "verify": lambda selector: True,
+                "restore": lambda original, selector: restored.append(selector) or 1,
+                "verify_restored": lambda original, selector: True,
+            }
+
+        environment = {
+            "E2E_ENABLE_DATABASE_CONTROL": "true",
+            "E2E_CONTROL_AUTHORIZATION_REF": "approval-reference",
+            "E2E_CONTROL_ENVIRONMENT": "test",
+        }
+        with patch.dict(os.environ, environment, clear=False), self.assertRaisesRegex(AssertionError, "child"):
+            with RUNTIME.controlled_database_operations(
+                "场景",
+                scenario_context=context,
+                operations=[callbacks("parent", 1), callbacks("child", 2)],
+            ):
+                pass
+        self.assertEqual(["child-key", "parent-key"], restored)
+
+    def test_step_guard_records_runtime_failure_before_reraising(self) -> None:
+        """业务断言失败必须留下 runtime_failure 证据而非环境阻塞。"""
+
+        with patch.object(RUNTIME, "_emit_event") as emit, self.assertRaisesRegex(AssertionError, "business"):
+            with RUNTIME.step_guard("场景", step_id="verify", evidence=["repo#anchor"]):
+                raise AssertionError("business mismatch")
+        self.assertEqual("step", emit.call_args.args[0])
+        self.assertEqual("runtime_failure", emit.call_args.kwargs["status"])
+
     def test_poll_until_uses_bounded_deadline(self) -> None:
         """有限轮询必须在单调截止时间结束并报告最后状态。"""
 
@@ -283,7 +376,23 @@ class RuntimeTests(unittest.TestCase):
                     status=status,
                     summary={"status": status},
                     verified=True,
+                    step_id="CREATE",
+                    protocol_ref="createOrder",
                 )
+
+    def test_protocol_control_records_step_and_formal_operation(self) -> None:
+        with patch.object(RUNTIME, "_emit_event") as emit:
+            RUNTIME.record_control(
+                "order", kind="messages", action="publish", correlation_ref="owned-key",
+                side_effect="write", step_id="PUBLISH", protocol_ref="publishOrder",
+            )
+        self.assertEqual("publishOrder", emit.call_args.kwargs["protocol_ref"])
+        self.assertEqual("PUBLISH", emit.call_args.kwargs["step_id"])
+        with self.assertRaises(RUNTIME.PreflightError):
+            RUNTIME.record_control(
+                "order", kind="messages", action="publish", correlation_ref="owned-key",
+                side_effect="write", step_id="PUBLISH",
+            )
 
     def test_preflight_rejects_production_name_even_when_flags_claim_test(self) -> None:
         """生产惯用环境名不得通过自报测试安全标记绕过。"""

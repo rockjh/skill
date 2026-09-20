@@ -359,6 +359,58 @@ class StaticGuardTests(unittest.TestCase):
         errors = GUARD._control_errors(Path("scenario.yaml"), controls, steps, {"repo#anchor"})
         self.assertTrue(any("control-plan-mapping" in error and "public_api" in error for error in errors))
 
+    def test_constructability_requires_all_paths_and_rejects_constructible_environment_data(self) -> None:
+        """候选路径不可缺项，可构造测试数据也不能伪装成环境预置。"""
+
+        def candidate(kind: str) -> dict[str, object]:
+            """生成绑定同一源码锚点的候选控制结论。"""
+
+            usable = kind == "public_api"
+            return {
+                "kind": kind,
+                "status": "usable" if usable else "not_found",
+                "component": "service",
+                "consumer_source": "repo#anchor",
+                "control": "prepare",
+                "side_effect": "write" if usable else "none",
+                "trigger": "trigger",
+                "observation": "observe",
+                "isolation": "owned-key",
+                "cleanup": "cleanup-owned",
+                "evidence": ["repo#anchor"],
+            }
+
+        candidates = [candidate(kind) for kind in GUARD.CANDIDATE_KINDS]
+        value = {
+            "preconditions": [{
+                "id": "owned prerequisite",
+                "data_ownership": "test_owned",
+                "constructible": True,
+                "candidates": candidates,
+            }],
+            "steps": [{"step_id": "execute", "candidates": candidates}],
+        }
+        steps = [{
+            "id": "execute", "status": "executable", "status_reason": "source confirmed",
+            "evidence": ["repo#anchor"],
+        }]
+        errors = GUARD._constructability_errors(
+            Path("scenario.yaml"), value, ["owned prerequisite"], steps, {"repo#anchor"}, set(),
+            {"test_data": "missing", "blockers": ["business_data:owned"]}, "pending_environment",
+            {"correlation_keys": ["owned-key"], "owned_resources": [], "mutable_controls": []},
+            {"actions": ["cleanup-owned"], "verifies": []},
+        )
+        self.assertTrue(any("constructability-not-environment" in error for error in errors))
+
+        value["steps"][0]["candidates"] = candidates[:-1]
+        errors = GUARD._constructability_errors(
+            Path("scenario.yaml"), value, ["owned prerequisite"], steps, {"repo#anchor"}, set(),
+            {"test_data": "confirmed", "blockers": []}, "ready",
+            {"correlation_keys": ["owned-key"], "owned_resources": [], "mutable_controls": []},
+            {"actions": ["cleanup-owned"], "verifies": []},
+        )
+        self.assertTrue(any("constructability-complete" in error for error in errors))
+
     def test_write_isolation_requires_owned_resource(self) -> None:
         """写场景不能通过空拥有资源列表绕过跨场景隔离。"""
 
@@ -1073,6 +1125,53 @@ class StaticGuardTests(unittest.TestCase):
             errors = GUARD._runtime_probe_live_errors(Path("workspace.yaml"), probe)
         self.assertTrue(any("runtime-smoke-live-result" in error for error in errors))
 
+    def test_active_probe_discovers_local_service_without_e2e_environment_variables(self) -> None:
+        """执行探测应从有效源码配置发现本地进程，而非依赖 E2E 专用变量。"""
+
+        class Response:
+            status = 200
+
+            def read(self, amount: int) -> bytes:
+                return b"{}"
+
+        class Connection:
+            def request(self, method: str, target: str) -> None:
+                self.requested = (method, target)
+
+            def getresponse(self) -> Response:
+                return Response()
+
+            def close(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "discovery").mkdir()
+            (root / "discovery" / "workspace.yaml").write_text(GUARD.yaml.safe_dump({
+                "configuration": {
+                    "sources": [{"id": "file", "profile": "local"}],
+                    "precedence": ["file"],
+                    "services": [{
+                        "id": "service", "owner": "repo:app",
+                        "port": {"value": 8080}, "health": {"value": "/health"},
+                        "openapi": {"value": "/openapi"},
+                    }],
+                    "data_sources": [], "middleware": [], "controls": [],
+                },
+            }), encoding="utf-8")
+            with (
+                patch.object(DISCOVERY, "_listener_owner_pids", return_value={123}),
+                patch.object(DISCOVERY, "_observed_process_command", return_value="java --spring.profiles.active=local app.jar"),
+                patch.object(DISCOVERY, "_observed_process_working_directory", return_value=str(root)),
+                patch.object(DISCOVERY.http.client, "HTTPConnection", return_value=Connection()),
+            ):
+                probe = DISCOVERY.read_only_environment_probe(root)
+        self.assertEqual("completed", probe["outcome"])
+        self.assertEqual("local", probe["processes"][0]["profile"])
+        self.assertEqual({"/health", "/openapi"}, {
+            GUARD.urllib.parse.urlsplit(item["target_ref"]).path for item in probe["read_only_smoke"]
+        })
+
     def test_business_ast_rejects_trivial_success_and_empty_cleanup(self) -> None:
         """assert True 与 finally pass 不能冒充真实业务和恢复。"""
 
@@ -1296,8 +1395,8 @@ class StaticGuardTests(unittest.TestCase):
             report = GUARD._load_json(root / "artifacts" / "e2e-run.json", [])
             self.assertEqual("failed", report["stages"]["restoration"]["status"])
 
-    def test_runner_rejects_mixed_ready_and_non_ready_scope(self) -> None:
-        """默认全场景运行不得执行 ready 子集并静默忽略其他场景。"""
+    def test_runner_attempts_ready_subset_and_reports_non_ready_scope(self) -> None:
+        """默认全场景运行应尝试安全子集，同时让未执行场景保持失败结论。"""
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1314,14 +1413,42 @@ class StaticGuardTests(unittest.TestCase):
                 patch.object(RUNNER, "_run", return_value=0) as run,
                 patch.object(RUNNER, "source_version_results", return_value=([], [])),
                 patch.object(RUNNER, "contract_errors", return_value=contract_result),
+                patch.object(RUNTIME, "preflight", return_value={}),
             ):
                 result = RUNNER.run_ordered(root, None, [], static_only=False)
 
-            self.assertEqual(8, result)
-            self.assertEqual(12, run.call_count)
+            self.assertEqual(1, result)
+            self.assertEqual(13, run.call_count)
             report = GUARD._load_json(root / "artifacts" / "e2e-run.json", [])
-            self.assertEqual("N/A", report["stages"]["business"]["status"])
+            self.assertEqual("failed", report["stages"]["business"]["status"])
             self.assertEqual("failed", report["stages"]["summary"]["status"])
+
+    def test_report_separates_partial_execution_coverage_and_correctness(self) -> None:
+        """报告不得把已执行前缀与完整需求覆盖或业务成功混为一谈。"""
+
+        definition = {
+            "meta": {"status": "pending_environment"},
+            "generation": {"owner": "agent", "mode": "main_agent", "degradation_reason": None},
+            "controls": {},
+            "steps": [
+                {"id": "first", "status": "executable", "status_reason": "ready", "evidence": ["repo#first"]},
+                {"id": "later", "status": "environment_missing", "status_reason": "missing", "evidence": ["repo#later"]},
+            ],
+        }
+        events = [{
+            "kind": "step", "scenario": "场景",
+            "details": {"step_id": "first", "status": "executable", "reason": "passed", "evidence": ["repo#first"]},
+        }]
+        report = RUNNER._report_scenarios(
+            [(Path("scenarios/场景"), definition)],
+            events,
+            {"场景": {"status": "failed", "exit_code": 1, "reason": "场景仅部分执行"}},
+            "N/A",
+        )[0]
+        self.assertEqual(0.5, report["execution_rate"])
+        self.assertEqual(0.5, report["coverage_rate"])
+        self.assertEqual("unknown", report["business_correctness"])
+        self.assertEqual("partially_covered", report["classification"])
 
     def test_runner_keeps_restoration_na_when_preflight_fails(self) -> None:
         """写场景未进入业务步骤时不应伪报恢复失败。"""
@@ -1895,6 +2022,20 @@ class StaticGuardTests(unittest.TestCase):
         )
         self.assertTrue(any("database-control-safety" in item for item in errors))
 
+        controls["database_control"]["safety"]["expected_rows"] = 1
+        controls["database_control"]["safety"]["operations"] = [{
+            "id": "prepare-parent", "depends_on": [], "consumer_source": "repo#DatabaseConsumer",
+            "exact_selector": "owned-parent", "expected_rows": 2, "snapshot": "snapshot-parent",
+            "mutation": "prepare-parent", "verification": "verify-parent", "restoration": "restore-parent",
+            "restoration_verification": "restored-parent",
+        }]
+        errors = GUARD._control_errors(
+            Path("scenario.yaml"), controls,
+            [{"action": "advance", "control": "database_control", "side_effect": "write", "expect": ["prepared"]}],
+            {"repo#DatabaseConsumer"},
+        )
+        self.assertTrue(any("database-operation-rows" in item for item in errors))
+
     def test_consumer_source_requires_database_or_job_semantics(self) -> None:
         """普通同名函数不能冒充会消费控制字段的数据库或任务源码锚点。"""
 
@@ -1969,7 +2110,7 @@ class StaticGuardTests(unittest.TestCase):
                     return subprocess.CompletedProcess(arguments, 0, "", "")
 
                 with (
-                    patch.object(SOURCE_VERSIONS, "contract_errors", return_value=([], [(scenario, definition)], discovery)),
+                    patch.object(CONTRACTS, "contract_errors", return_value=([], [(scenario, definition)], discovery)),
                     patch.object(SOURCE_VERSIONS, "_git", side_effect=fake_git),
                 ):
                     errors, results = SOURCE_VERSIONS.source_version_results(root)

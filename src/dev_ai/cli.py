@@ -17,7 +17,12 @@ from .core.doctor import diagnose
 from .core.envelope import failure, render, success
 from .core.errors import DevAIError, ExitCode, classify_failure
 from .core.redaction import redact
-from .core.schema import API_TEST_SCHEMA_VERSION, E2E_GATE_SCHEMA_VERSION, get_schema
+from .core.schema import (
+    API_TEST_SCHEMA_VERSION,
+    BUSINESS_FLOW_SCHEMA_VERSION,
+    E2E_GATE_SCHEMA_VERSION,
+    get_schema,
+)
 
 
 DOMAINS: dict[str, Callable[[list[str]], int]] = {}
@@ -26,9 +31,10 @@ DOMAINS: dict[str, Callable[[list[str]], int]] = {}
 def _domains() -> dict[str, Callable[[list[str]], int]]:
     if not DOMAINS:
         from .domains.api_test.cli import main as api_test_main
+        from .domains.business_flow.cli import main as business_flow_main
         from .domains.e2e.cli import main as e2e_main
 
-        DOMAINS.update({"api-test": api_test_main, "e2e": e2e_main})
+        DOMAINS.update({"api-test": api_test_main, "business-flow": business_flow_main, "e2e": e2e_main})
     return DOMAINS
 
 
@@ -41,10 +47,26 @@ def _option_path(arguments: list[str], name: str, default: str) -> Path:
     return Path(default).resolve()
 
 
+def _project_relative_path(arguments: list[str], name: str, project: Path, default: str) -> Path:
+    for index, value in enumerate(arguments):
+        if value == name and index + 1 < len(arguments):
+            candidate = Path(arguments[index + 1])
+            break
+        if value.startswith(name + "="):
+            candidate = Path(value.split("=", 1)[1])
+            break
+    else:
+        candidate = Path(default)
+    return (candidate if candidate.is_absolute() else project / candidate).resolve()
+
+
 def _prepare_lock(domain: str, command: str, arguments: list[str]) -> tuple[Path | None, str]:
     if domain == "api-test":
         root = _option_path(arguments, "--qa-root", "qa")
         schema_version = API_TEST_SCHEMA_VERSION
+    elif domain == "business-flow":
+        root = _option_path(arguments, "--project", ".")
+        schema_version = BUSINESS_FLOW_SCHEMA_VERSION
     else:
         root = _option_path(arguments, "--project", ".")
         schema_version = E2E_GATE_SCHEMA_VERSION
@@ -74,6 +96,17 @@ def _summary(stdout: str, stderr: str, *, full: bool) -> dict[str, object]:
 def _artifact_path(domain: str, command: str, arguments: list[str], stdout: str) -> str:
     if domain == "e2e" and command == "run":
         path = _option_path(arguments, "--project", ".") / "artifacts" / "e2e-run.json"
+        return str(path) if path.is_file() else ""
+    if domain == "e2e" and command in {"generate", "discover"}:
+        path = _option_path(arguments, "--project", ".") / "discovery" / (
+            "design-rules.yaml" if command == "generate" else "discovery.json"
+        )
+        return str(path) if path.is_file() else ""
+    if domain == "business-flow" and command in {"discover", "generate", "update"}:
+        project = _option_path(arguments, "--project", ".")
+        docs_root = _project_relative_path(arguments, "--docs-root", project, "docs/business-flow")
+        filename = "business-flow-discovery.json" if command == "discover" else "business-flow-report.json"
+        path = docs_root / filename
         return str(path) if path.is_file() else ""
     for line in reversed(stdout.splitlines()):
         if " ledger=" in line:
@@ -121,12 +154,17 @@ def _run_domain(domain: str, arguments: list[str], *, full: bool) -> tuple[dict[
             data = json.loads(output.splitlines()[-1])
         except json.JSONDecodeError:
             pass
+    if domain == "business-flow" and command == "check" and output.strip():
+        try:
+            data = json.loads(output.splitlines()[-1])
+        except json.JSONDecodeError:
+            pass
     return success(f"{domain}.{command}", data, artifact), int(ExitCode.OK)
 
 
 def _help_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="dev-ai", description="Shared runtime for development AI skills")
-    parser.add_argument("command", nargs="?", choices=("version", "doctor", "schema", "api-test", "e2e"))
+    parser.add_argument("command", nargs="?", choices=("version", "doctor", "schema", "api-test", "business-flow", "e2e"))
     parser.epilog = "Use 'dev-ai schema' to list domain commands and 'dev-ai schema <domain.command>' for one contract."
     return parser
 
@@ -161,6 +199,7 @@ def console_main(argv: list[str] | None = None) -> int:
             document = success("version", {
                 "version": __version__,
                 "api_test_schema": API_TEST_SCHEMA_VERSION,
+                "business_flow_schema": BUSINESS_FLOW_SCHEMA_VERSION,
                 "e2e_gate_schema": E2E_GATE_SCHEMA_VERSION,
             })
             code = ExitCode.OK

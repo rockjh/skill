@@ -1,4 +1,4 @@
 interface:
   display_name: "bru-api-test-generator"
   short_description: "Generate modular Bruno HTTP tests from offline Swagger"
-  default_prompt: "Use $bru-api-test-generator to derive modular Bruno tests and source-backed mock data from local OpenAPI and project source, require one run-level write authorization, clean only run-owned data with verification, enforce the shared machine constraint library, retain redacted evidence, and produce a result-first failure report."
+  default_prompt: "Use $bru-api-test-generator to derive modular Bruno tests from reviewed design documents and local OpenAPI, use source only for execution support and test data, require one run-level write authorization, clean only run-owned data with verification, retain redacted evidence, and never adapt design expectations to source or observed behavior."

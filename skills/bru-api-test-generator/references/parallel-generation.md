@@ -15,19 +15,19 @@ dev-ai api-test worker-start --module <module>
 | Coordinator | Global contracts, locks, constraint merges, execution configuration, collection files, cross-module flows, and final reports |
 | Module worker | Its `contracts/modules/<directory>/`, `bruno/<directory>/`, `results/modules/<id>/`, `results/modules/evidence/<id>/`, and `results/logs/modules/<id>/` only |
 
-Workers may read shared contracts, configuration, prior evidence, and business source. They must not write business code, another module, `index.yaml`, `generation-state.yaml`, `qa-lock.yaml`, `version-lock.yaml`, `collection.bru`, shared environments, or cross-module flows.
+Workers may read shared contracts, configuration, prior evidence, and execution-support source. Source inspection is limited to runtime configuration, authentication/header setup, fixtures, test-data preparation, and mock toggles; it must not supply business rules or expected results. They must not write business code, another module, `index.yaml`, `generation-state.yaml`, `qa-lock.yaml`, `version-lock.yaml`, `collection.bru`, shared environments, or cross-module flows.
 
 The coordinator records each assignment and gives the constraint validator the worker role, assigned module, and changed paths. `module-worker-boundary` and `business-code-immutable` fail any path outside the table above.
 
 ## Worker Sequence
 
 1. Read the assigned module contracts and the shared machine rules.
-2. Inspect its reachable Controller, Application, Domain Service, DTO/Output, Entity, Repository, exception/error-code, configuration, Flyway, and test evidence.
-3. Write module `source-rules.yaml`, `logic.yaml`, `cases.yaml`, and explicit flows/exclusions when applicable.
+2. Inspect runtime configuration, authentication/signature/header setup, fixtures, database test-data preparation, upload templates, and external-service mock toggles needed to execute the assigned cases.
+3. Read the assigned reviewed design rules and OpenAPI contract, then write module design references, `logic.yaml`, `cases.yaml`, and explicit flows/exclusions when applicable. Source discovery remains execution support only and cannot create business cases or expected values.
 4. Run module materialization. It writes only the module Bruno directory, `materialization-state.yaml`, `module-lock.yaml`, and module documentation.
 5. Run `dev-ai api-test run --module <module>`. It validates the module lock and writes module-local evidence, results, and logs.
 6. Run `dev-ai api-test worker-check --module <module> --stage post-execution`. Changed paths are calculated from the recorded snapshot.
-7. Return rule/case/logic/flow IDs, result/evidence paths, failures by category, and manual confirmations.
+7. Return rule/case/logic/flow IDs, result/evidence paths, failures by category, and any blocking manual confirmations.
 
 A worker failure affects only that module. Other workers continue.
 
@@ -42,7 +42,7 @@ Parallel execution additionally requires isolated accounts, tenants, records, an
 After workers finish, the coordinator:
 
 1. validates each worker snapshot boundary and module lock;
-2. merges source and observed rules into the global constraint library;
+2. validates shared design rules and aggregates observed evidence for audit only;
 3. regenerates `index.yaml` and `generation-state.yaml` without resetting unchanged successful cases;
 4. materializes globally and refreshes `qa-lock.yaml`;
 5. validates cross-module flows;

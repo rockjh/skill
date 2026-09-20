@@ -20,6 +20,10 @@ dev-ai api-test scripts
 
 Use `--qa-root qa` when the QA root is not the default. `dev-ai schema api-test.<command>` is the source of truth for options. Pipeline output is a JSON envelope; an interactive terminal receives Markdown. Progress is written to stderr. Add `--full` only when complete diagnostics are needed.
 
+`init` and `generate` accept repeated `--design-root` and `--design-file`
+selectors. Generation is blocked until one unambiguous reviewed design set is
+selected and every OpenAPI operation is mapped or explicitly excluded.
+
 `init` writes `.dev-ai.lock.json`. Every later command rejects a different installed tool version. The API contract schema version in that lock is independent from the dev-ai release version.
 
 `scripts` does not synchronize project-local code. It reports the shared runtime

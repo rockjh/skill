@@ -3,17 +3,18 @@
 Run:
 
 ```bash
-dev-ai api-test generate --openapi qa/contracts/openapi.json --incremental
+dev-ai api-test generate --openapi qa/contracts/openapi.json --design-root docs/design --incremental
 ```
 
-`qa/contracts/generation-state.yaml` records the OpenAPI SHA, stable endpoint
+`qa/contracts/generation-state.yaml` records the OpenAPI and design-document SHAs, stable endpoint
 IDs, endpoint fingerprints, module contract fingerprints, case structural
 fingerprints, last generation time, generator version, deleted endpoints, and
 manual-review cases. `qa-lock.yaml` independently seals the current state.
 
 The generator follows these rules:
 
-- An unchanged OpenAPI/module/endpoint is not rewritten.
+- A module is unchanged only when both its OpenAPI contract and the selected
+  design-document digest are unchanged.
 - A new endpoint adds only its module contract and draft cases.
 - A deleted endpoint is retained as an explicit cleanup notice; remove its
   registered `.bru` only after review.
@@ -28,6 +29,6 @@ titles and filenames are presentation. A title change must reconcile
 changing the stable ID.
 
 Do not clear `manual_review` automatically. A human must compare the changed
-contract/source evidence, update the request and assertions, execute the
+contract/design evidence, update the request and assertions, execute the
 affected module, and then confirm the case. Successful unchanged cases retain
 their execution evidence and are not reset.

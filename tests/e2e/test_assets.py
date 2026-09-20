@@ -13,6 +13,8 @@ DOMAIN_ROOT = Path(__file__).resolve().parents[2] / "src" / "dev_ai" / "domains"
 class AssetTests(unittest.TestCase):
     def test_guard_implementation_is_partitioned_by_domain_responsibility(self) -> None:
         self.assertFalse((DOMAIN_ROOT / "_engine.py").exists())
+        self.assertFalse((DOMAIN_ROOT / "design.py").exists())
+        self.assertFalse((DOMAIN_ROOT / "generation.py").exists())
         expected = {
             "discovery.py": "def discovery_errors(",
             "contracts.py": "def contract_errors(",

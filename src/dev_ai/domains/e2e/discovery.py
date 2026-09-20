@@ -15,13 +15,198 @@ import tomllib
 import urllib.parse
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 
+DESIGN_DIR_NAMES = (
+    ("docs", "design"),
+    ("docs", "详细设计"),
+    ("docs", "business-flow"),
+    ("docs", "业务流程"),
+    ("docs", "architecture"),
+    ("docs", "架构设计"),
+    ("docs", "interface-design"),
+    ("docs", "接口设计"),
+    ("design",),
+    ("doc", "design"),
+)
+DESIGN_SUFFIXES = {".md", ".markdown", ".txt"}
+PROTOCOL_DIR_NAMES = (
+    ("openapi",),
+    ("contracts",),
+    ("api",),
+    ("docs", "api"),
+    ("docs", "contracts"),
+    ("docs", "interface"),
+    ("docs", "接口设计"),
+)
+PROTOCOL_SUFFIXES = {".json", ".yaml", ".yml", ".proto", ".graphql", ".graphqls"}
+INSTRUCTION_NAMES = ("AGENTS.md", "README.md", "README", "README.txt", "E2E_PLAN.md")
+
+
+@dataclass(frozen=True)
+class DocumentDiscovery:
+    """A deterministic set of selected documents and candidate roots."""
+
+    files: tuple[Path, ...]
+    candidates: tuple[Path, ...]
+    hints: tuple[Path, ...] = ()
+
+
+def _document_files(root: Path, suffixes: set[str]) -> list[Path]:
+    """Return supported documents below one declared root."""
+
+    if not root.is_dir():
+        return []
+    return sorted(
+        path.resolve()
+        for path in root.rglob("*")
+        if path.is_file() and path.suffix.casefold() in suffixes and ".git" not in path.parts
+    )
+
+
+def _workspace_repository_roots(project_root: Path) -> list[Path]:
+    """Resolve participating repository roots from workspace discovery."""
+
+    workspace = project_root / "discovery" / "workspace.yaml"
+    try:
+        document = yaml.safe_load(workspace.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError):
+        return []
+    repositories = document.get("inventory", {}).get("repositories", []) if isinstance(document, dict) else []
+    roots: list[Path] = []
+    for repository in repositories if isinstance(repositories, list) else []:
+        if not isinstance(repository, dict) or not repository.get("root"):
+            continue
+        root = Path(str(repository["root"]))
+        roots.append((root if root.is_absolute() else project_root / root).resolve())
+    return list(dict.fromkeys(roots))
+
+
+def _instruction_hints(roots: Iterable[Path], suffixes: set[str]) -> tuple[list[Path], list[Path]]:
+    """Read repository instructions for explicitly mentioned document paths."""
+
+    selected: list[Path] = []
+    candidates: list[Path] = []
+    path_pattern = re.compile(
+        r"(?im)(?:^|[`\s])((?:docs|doc|design|openapi|contracts|api)[/\\][^\s`),;]+)"
+    )
+    for root in roots:
+        for name in INSTRUCTION_NAMES:
+            instruction = root / name
+            if not instruction.is_file():
+                continue
+            try:
+                text = instruction.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                continue
+            for raw in path_pattern.findall(text):
+                candidate = (root / raw.replace("\\", "/")).resolve()
+                if candidate.is_file() and candidate.suffix.casefold() in suffixes:
+                    selected.append(candidate)
+                    candidates.append(candidate.parent)
+                elif candidate.is_dir():
+                    files = _document_files(candidate, suffixes)
+                    if files:
+                        selected.extend(files)
+                        candidates.append(candidate)
+    return list(dict.fromkeys(selected)), list(dict.fromkeys(candidates))
+
+
+def _discover_documents(
+    project_root: Path,
+    *,
+    roots: Iterable[Path],
+    files: Iterable[Path],
+    directory_names: tuple[tuple[str, ...], ...],
+    suffixes: set[str],
+) -> DocumentDiscovery:
+    """Implement explicit, instruction-hinted, then conventional discovery."""
+
+    project_root = project_root.resolve()
+    explicit_files = [path.resolve() for path in files]
+    explicit_roots = [path.resolve() for path in roots]
+    if explicit_files or explicit_roots:
+        selected = [path for path in explicit_files if path.is_file() and path.suffix.casefold() in suffixes]
+        selected.extend(path for root in explicit_roots for path in _document_files(root, suffixes))
+        return DocumentDiscovery(tuple(dict.fromkeys(selected)), tuple(dict.fromkeys(explicit_roots)))
+
+    search_roots = [project_root, *_workspace_repository_roots(project_root)]
+    hinted, hinted_roots = _instruction_hints(search_roots, suffixes)
+    if hinted:
+        return DocumentDiscovery(tuple(hinted), tuple(hinted_roots), tuple(hinted))
+
+    candidates = [root.joinpath(*parts) for root in search_roots for parts in directory_names]
+    existing = [root.resolve() for root in candidates if _document_files(root, suffixes)]
+    selected = [path for root in existing for path in _document_files(root, suffixes)]
+    return DocumentDiscovery(tuple(dict.fromkeys(selected)), tuple(dict.fromkeys(existing)))
+
+
+def discover_documents(
+    project_root: Path,
+    *,
+    roots: Iterable[Path] = (),
+    files: Iterable[Path] = (),
+) -> DocumentDiscovery:
+    """Discover reviewed business-design documents in the required order."""
+
+    return _discover_documents(
+        project_root,
+        roots=roots,
+        files=files,
+        directory_names=DESIGN_DIR_NAMES,
+        suffixes=DESIGN_SUFFIXES,
+    )
+
+
+def discover_protocols(
+    project_root: Path,
+    *,
+    roots: Iterable[Path] = (),
+    files: Iterable[Path] = (),
+) -> DocumentDiscovery:
+    """Discover OpenAPI, AsyncAPI, Proto, or GraphQL contracts."""
+
+    discovery = _discover_documents(
+        project_root,
+        roots=roots,
+        files=files,
+        directory_names=PROTOCOL_DIR_NAMES,
+        suffixes=PROTOCOL_SUFFIXES,
+    )
+    if roots or files:
+        return discovery
+
+    workspace = project_root.resolve() / "discovery" / "workspace.yaml"
+    try:
+        document = yaml.safe_load(workspace.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError):
+        return discovery
+    services = document.get("configuration", {}).get("services", []) if isinstance(document, dict) else []
+    configured: list[Path] = []
+    for service in services if isinstance(services, list) else []:
+        value = service.get("openapi", {}).get("value") if isinstance(service, dict) and isinstance(service.get("openapi"), dict) else None
+        if not isinstance(value, str) or not value or re.match(r"https?://", value, re.I):
+            continue
+        path = Path(value)
+        path = path if path.is_absolute() else project_root / path
+        if path.is_file() and path.suffix.casefold() in PROTOCOL_SUFFIXES:
+            configured.append(path.resolve())
+    if not configured:
+        return discovery
+    return DocumentDiscovery(
+        tuple(dict.fromkeys([*discovery.files, *configured])),
+        tuple(dict.fromkeys([*discovery.candidates, *(path.parent for path in configured)])),
+        discovery.hints,
+    )
+
+
 DISCOVERY_KEYS = {"schema_version", "inventory", "topology", "configuration", "runtime_probe", "gates"}
+DISCOVERY_OPTIONAL_KEYS = {"design", "protocol"}
 
 
 SEARCH_CATEGORIES = {"http_rpc", "messages", "database", "cache", "jobs", "configuration"}
@@ -924,12 +1109,15 @@ def _runtime_probe_errors(
     probe: Any,
     node_ids: set[str],
     runnable_nodes: set[str] | None = None,
+    configuration_source_ids: set[str] | None = None,
 ) -> list[str]:
     """校验只读运行探测状态和证据。"""
 
     errors: list[str] = []
-    expected = {"requested", "outcome", "blockers", "listeners", "processes", "associations", "read_only_smoke"}
-    if not _exact_keys(path, probe, expected, "runtime-probe-schema", errors):
+    required = {"requested", "outcome", "blockers", "listeners", "processes", "associations", "read_only_smoke"}
+    allowed = required | {"configuration_checks"}
+    if not isinstance(probe, dict) or not required.issubset(set(probe)) or set(probe) - allowed:
+        errors.append(_error(path, "runtime-probe-schema", f"运行探测字段必须包含 {sorted(required)}，可选 configuration_checks", "runtime_probe:"))
         return errors
     requested = probe.get("requested")
     outcome = probe.get("outcome")
@@ -947,7 +1135,8 @@ def _runtime_probe_errors(
     for name in ("listeners", "processes", "associations", "read_only_smoke"):
         if not isinstance(probe.get(name), list):
             errors.append(_error(path, "runtime-probe-list", f"{name} 必须是列表", name))
-    if outcome == "completed":
+    required_runtime_nodes = node_ids if runnable_nodes is None else runnable_nodes
+    if outcome == "completed" and required_runtime_nodes:
         for name in ("listeners", "processes", "associations", "read_only_smoke"):
             if not probe.get(name):
                 errors.append(_error(path, "runtime-probe-complete", f"已完成探测必须包含非空 {name}", name))
@@ -956,12 +1145,17 @@ def _runtime_probe_errors(
     for item in processes:
         if (
             not isinstance(item, dict)
-            or set(item) != {"id", "pid", "command_reference", "evidence"}
+            or not {"id", "pid", "command_reference", "evidence"}.issubset(set(item))
+            or bool(set(item) - {"id", "pid", "command_reference", "startup_arguments", "working_directory", "profile", "evidence"})
             or not isinstance(item.get("pid"), int)
             or item["pid"] < 1
             or not isinstance(item.get("command_reference"), str)
             or not item["command_reference"].strip()
             or not _strings(item.get("evidence"))
+            or ("startup_arguments" in item and not _strings(item.get("startup_arguments"), nonempty=False))
+            or ("working_directory" in item and (not isinstance(item.get("working_directory"), str) or not item["working_directory"].strip()))
+            or ("profile" in item and item.get("profile") is not None and (not isinstance(item.get("profile"), str) or not item["profile"].strip()))
+            or outcome == "completed" and not {"startup_arguments", "working_directory", "profile"}.issubset(set(item))
         ):
             errors.append(_error(path, "runtime-process-schema", "进程探测条目结构无效", "processes"))
             continue
@@ -1010,7 +1204,6 @@ def _runtime_probe_errors(
         str(item.get("node")) for item in probe.get("associations", [])
         if isinstance(item, dict) and item.get("node") in node_ids
     }
-    required_runtime_nodes = runnable_nodes or set()
     if outcome == "completed" and not required_runtime_nodes.issubset(associated_nodes):
         errors.append(_error(
             path,
@@ -1037,6 +1230,29 @@ def _runtime_probe_errors(
             f"只读冒烟未覆盖全部相关应用节点: {sorted(required_runtime_nodes - smoke_nodes)}",
             "read_only_smoke",
         ))
+    configuration_checks = probe.get("configuration_checks", [])
+    if not isinstance(configuration_checks, list):
+        errors.append(_error(path, "runtime-configuration-checks", "configuration_checks 必须是列表", "configuration_checks:"))
+    else:
+        source_ids = configuration_source_ids or set()
+        check_ids: set[str] = set()
+        for item in configuration_checks:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"id", "node", "profile", "sources", "effective", "evidence"}
+                or not isinstance(item.get("id"), str)
+                or not item["id"].strip()
+                or item["id"] in check_ids
+                or item.get("node") not in node_ids
+                or item.get("profile") is not None and (not isinstance(item.get("profile"), str) or not item["profile"].strip())
+                or not _strings(item.get("sources"))
+                or bool(source_ids) and not set(item.get("sources", [])).issubset(source_ids)
+                or item.get("effective") not in {"confirmed", "unconfirmed"}
+                or not _strings(item.get("evidence"))
+            ):
+                errors.append(_error(path, "runtime-configuration-check", "运行时有效配置检查条目无效", "configuration_checks:"))
+                continue
+            check_ids.add(item["id"])
     return errors
 
 
@@ -1069,6 +1285,17 @@ def _observed_process_command(pid: int) -> str | None:
             errors="replace",
         )
         return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else None
+    except OSError:
+        return None
+
+
+def _observed_process_working_directory(pid: int) -> str | None:
+    """在平台可用时只读获取进程工作目录。"""
+
+    if os.name == "nt":
+        return None
+    try:
+        return str((Path("/proc") / str(pid) / "cwd").resolve(strict=True))
     except OSError:
         return None
 
@@ -1151,6 +1378,143 @@ def _listener_owner_pids(port: int) -> set[int]:
         return set()
 
 
+def read_only_environment_probe(project_root: Path) -> dict[str, Any]:
+    """主动读取本机监听、进程元数据和已配置的无副作用 HTTP 入口。"""
+
+    project_root = project_root.resolve()
+    workspace_path = project_root / "discovery" / "workspace.yaml"
+    try:
+        workspace = yaml.safe_load(workspace_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError):
+        workspace = {}
+    configuration = workspace.get("configuration", {}) if isinstance(workspace, dict) else {}
+    services = configuration.get("services", []) if isinstance(configuration, dict) else []
+    listeners: list[dict[str, Any]] = []
+    processes: list[dict[str, Any]] = []
+    associations: list[dict[str, Any]] = []
+    read_only_smoke: list[dict[str, Any]] = []
+    configuration_checks: list[dict[str, Any]] = []
+    seen_pids: set[int] = set()
+    for service in services if isinstance(services, list) else []:
+        if not isinstance(service, dict):
+            continue
+        port_value = service.get("port", {}).get("value") if isinstance(service.get("port"), dict) else None
+        try:
+            port = int(port_value)
+        except (TypeError, ValueError):
+            continue
+        if not 1 <= port <= 65535:
+            continue
+        pids = _listener_owner_pids(port)
+        for pid in sorted(pids):
+            command = _observed_process_command(pid)
+            if command is None:
+                continue
+            process_id = f"pid-{pid}"
+            if pid not in seen_pids:
+                seen_pids.add(pid)
+                raw_args = command.split()[1:] if command.split() else []
+                safe_args: list[str] = []
+                redact_next = False
+                for argument in raw_args:
+                    if redact_next:
+                        redact_next = False
+                        continue
+                    if re.search(r"password|secret|token|auth|key|credential|dsn|cookie", argument, re.IGNORECASE):
+                        if "=" not in argument:
+                            safe_args.append(argument)
+                            redact_next = True
+                        continue
+                    safe_args.append(argument)
+                working_directory = _observed_process_working_directory(pid)
+                processes.append({
+                    "id": process_id,
+                    "pid": pid,
+                    "command_reference": command.split()[0] if command.split() else "process",
+                    "startup_arguments": safe_args,
+                    "working_directory": working_directory or "unconfirmed",
+                    "profile": (
+                        profile.group(1) if (profile := re.search(
+                            r"(?:--profile(?:=|\s+)|--spring\.profiles\.active=|-Dspring\.profiles\.active=)([^\s]+)",
+                            command,
+                        )) else None
+                    ),
+                    "evidence": [f"listener:{port}", f"pid:{pid}", "working-directory:observed" if working_directory else "working-directory:unconfirmed"],
+                })
+            listener_id = f"tcp-{port}"
+            if not any(item.get("id") == listener_id for item in listeners):
+                listeners.append({
+                    "id": listener_id,
+                    "host": "127.0.0.1",
+                    "port": port,
+                    "protocol": "http",
+                    "evidence": [f"listener:{port}"],
+                })
+            node = str(service.get("owner", service.get("id", "service")))
+            associations.append({"process": process_id, "listener": listener_id, "node": node})
+            for endpoint_name in ("health", "openapi"):
+                endpoint = service.get(endpoint_name, {}).get("value") if isinstance(service.get(endpoint_name), dict) else None
+                if not isinstance(endpoint, str) or not endpoint.startswith("/"):
+                    continue
+                target = f"http://127.0.0.1:{port}{endpoint}"
+                try:
+                    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2.0)
+                    connection.request("HEAD", endpoint)
+                    response = connection.getresponse()
+                    response.read(256)
+                    connection.close()
+                    result = f"status:{response.status}"
+                except (OSError, http.client.HTTPException) as exc:
+                    result = f"error:{type(exc).__name__}"
+                read_only_smoke.append({"node": node, "method": "HEAD", "target_ref": target, "result": result})
+    sources = configuration.get("sources", []) if isinstance(configuration, dict) else []
+    source_ids = {str(item.get("id")) for item in sources if isinstance(item, dict) and item.get("id")}
+    precedence = [
+        str(item) for item in configuration.get("precedence", [])
+        if isinstance(configuration, dict) and str(item) in source_ids
+    ]
+    for collection in ("services", "data_sources", "middleware", "controls"):
+        items = configuration.get(collection, []) if isinstance(configuration, dict) else []
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict) or not item.get("id") or not item.get("owner"):
+                continue
+            values = [child for child in item.values() if isinstance(child, dict) and "resolution" in child]
+            effective_sources = [
+                str(child.get("effective_source")) for child in values
+                if str(child.get("effective_source")) in source_ids
+            ]
+            resolved = all(
+                child.get("resolution") == "resolved"
+                or (
+                    isinstance(child.get("reference"), str)
+                    and (match := re.fullmatch(r"\$\{([A-Z][A-Z0-9_]*)\}", child["reference"])) is not None
+                    and bool(os.environ.get(match.group(1), "").strip())
+                )
+                for child in values
+            )
+            item_sources = list(dict.fromkeys(effective_sources or precedence[-1:]))
+            if not item_sources:
+                continue
+            configuration_checks.append({
+                "id": str(item["id"]),
+                "node": str(item["owner"]),
+                "profile": next((source.get("profile") for source in sources if isinstance(source, dict) and source.get("id") == item_sources[-1]), None),
+                "sources": item_sources,
+                "effective": "confirmed" if resolved else "unconfirmed",
+                "evidence": [f"runtime-source:{source_id}" for source_id in item_sources],
+            })
+    return {
+        "requested": True,
+        "outcome": "completed",
+        "blockers": [],
+        "listeners": listeners,
+        "processes": processes,
+        "associations": associations,
+        "read_only_smoke": read_only_smoke,
+        "configuration_checks": configuration_checks,
+    }
+
+
 def _runtime_probe_live_errors(path: Path, probe: Any) -> list[str]:
     """在有序运行探测阶段重新核验进程、监听和本地 HTTP 结果。"""
 
@@ -1162,7 +1526,11 @@ def _runtime_probe_live_errors(path: Path, probe: Any) -> list[str]:
             continue
         observed = _observed_process_command(process["pid"])
         reference = str(process.get("command_reference", ""))
-        if observed is None or reference not in observed:
+        startup_arguments = process.get("startup_arguments", [])
+        arguments_match = isinstance(startup_arguments, list) and all(
+            isinstance(argument, str) and argument in observed for argument in startup_arguments
+        ) if observed is not None else False
+        if observed is None or reference not in observed or not arguments_match:
             errors.append(_error(
                 path,
                 "runtime-process-live",
@@ -1276,7 +1644,11 @@ def discovery_errors(project_root: Path) -> tuple[list[str], dict[str, Any]]:
     document = _load_yaml(path, errors)
     if not document:
         return errors, {}
-    _exact_keys(path, document, DISCOVERY_KEYS, "discovery-schema", errors)
+    if not isinstance(document, dict) or not DISCOVERY_KEYS.issubset(document) or set(document) - DISCOVERY_KEYS - DISCOVERY_OPTIONAL_KEYS:
+        errors.append(_error(path, "discovery-schema", "workspace.yaml 字段集合无效", "schema_version"))
+    for kind in DISCOVERY_OPTIONAL_KEYS:
+        if kind in document and not isinstance(document.get(kind), dict):
+            errors.append(_error(path, "discovery-source-schema", f"{kind} discovery must be a mapping", kind))
     if document.get("schema_version") != 1:
         errors.append(_error(path, "discovery-version", "schema_version 必须为 1", "schema_version"))
 
@@ -1583,7 +1955,18 @@ def discovery_errors(project_root: Path) -> tuple[list[str], dict[str, Any]]:
         confirmed_capabilities,
         module_roots,
     ))
-    errors.extend(_runtime_probe_errors(path, document.get("runtime_probe"), module_ids, application_nodes & relevant_nodes))
+    configuration = document.get("configuration", {})
+    source_ids = {
+        str(item.get("id")) for item in configuration.get("sources", [])
+        if isinstance(configuration, dict) and isinstance(item, dict)
+    }
+    errors.extend(_runtime_probe_errors(
+        path,
+        document.get("runtime_probe"),
+        module_ids,
+        application_nodes & relevant_nodes,
+        source_ids,
+    ))
     gates = document.get("gates")
     expected_gates = {"inventory_complete", "topology_complete", "configuration_complete", "runtime_probe_complete"}
     if _exact_keys(path, gates, expected_gates, "discovery-gates", errors):

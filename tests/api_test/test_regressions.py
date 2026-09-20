@@ -95,6 +95,27 @@ def execution_fixture(
     return config, env_file
 
 
+def design_gate_fixture(qa_root: Path, endpoint_id: str, rule_id: str = "DESIGN_RULE") -> None:
+    constraints = qa_root / "constraints"
+    constraints.mkdir(parents=True, exist_ok=True)
+    evidence = {
+        "source_kind": "design",
+        "file": "docs/design/test.md",
+        "symbol": rule_id,
+        "line": 1,
+        "endpoint_scope": [endpoint_id],
+        "confidence": "high",
+    }
+    (constraints / "design-rules.yaml").write_text(yaml.safe_dump({
+        "version": 1,
+        "source": "design",
+        "documents": [{"path": evidence["file"], "sha256": "0" * 64, "sections": 1}],
+        "rules": [{"id": rule_id, "endpoint_id": endpoint_id, "evidence": evidence}],
+        "exclusions": [],
+        "manual_confirmations": [],
+    }, sort_keys=False), encoding="utf-8")
+
+
 def mock_data_fixture(root: Path, modules: tuple[str, ...] = ("orders", "users")) -> Path:
     qa_root = root / "qa"
     load_script("execution_config").initialize_execution_layout(qa_root)
@@ -812,6 +833,21 @@ class RegressionTests(unittest.TestCase):
         case["assertions"][1]["equals"] = 0
         self.assertEqual(coverage.success_assertion_errors(case), [])
 
+    def test_success_can_be_proven_by_result_or_state_without_business_code(self):
+        coverage = load_script("check_api_coverage")
+        self.assertEqual(coverage.success_assertion_errors({
+            "id": "THING_CREATE_SUCCESS",
+            "scenario": "success",
+            "expected": {"http_status": 201},
+            "assertions": [{"path": "$.data.id", "equals": "thing-1"}],
+        }), [])
+        self.assertEqual(coverage.success_assertion_errors({
+            "id": "JOB_ACCEPTED",
+            "scenario": "success",
+            "expected": {"http_status": 202},
+            "assertions": [{"path": "$.state", "equals": "accepted"}],
+        }), [])
+
     def test_exists_assertion_is_draft_only_even_with_an_exact_assertion(self):
         coverage = load_script("check_api_coverage")
         errors = coverage.case_completion_errors({
@@ -1248,6 +1284,8 @@ class RegressionTests(unittest.TestCase):
                     "description": "验证能够查询事物列表。",
                     "endpoint_id": "LISTTHINGS_GET_THINGS",
                     "scenario": "success",
+                    "source": "design",
+                    "design_rule_ids": ["LIST_THINGS_OK"],
                     "expected": {"http_status": 200, "business_code": 0},
                     "assertions": [
                         {"path": "$.code", "equals": 0},
@@ -1272,9 +1310,7 @@ class RegressionTests(unittest.TestCase):
             )
             constraints = load_script("qa_constraints")
             constraints.ensure_rule_library(root)
-            (root / "constraints" / "source-rules.yaml").write_text(
-                yaml.safe_dump({"version": 1, "field_rules": []}), encoding="utf-8",
-            )
+            design_gate_fixture(root, "LISTTHINGS_GET_THINGS", "LIST_THINGS_OK")
             (root / "contracts" / "exception-profile.yaml").write_text(
                 yaml.safe_dump({"version": 1, "handlers": []}), encoding="utf-8",
             )
@@ -1885,6 +1921,7 @@ class RegressionTests(unittest.TestCase):
         rendered = materializer.render_case(
             {
                 "id": "THING_LIST",
+                "captures": {"thing_id": "$.id"},
                 "assertions": [{
                     "path": "$.data",
                     "type": "array",
@@ -1900,7 +1937,35 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("res.body.data: isArray", rendered)
         self.assertIn("res.body.data: length 2", rendered)
         self.assertIn('bru.setVar("things", res.body.data)', rendered)
+        self.assertIn("missing flow capture thing_id", rendered)
+        self.assertIn('bru.setVar("thing_id", res.body.id)', rendered)
         self.assertIn("res.body.data.forEach", rendered)
+
+    def test_materializer_names_flow_events_for_capture_use_and_absence(self):
+        materializer = load_script("materialize_missing_bru")
+        capture = materializer.render_case(
+            {
+                "id": "JOB_ACCEPT",
+                "captures": {"job_id": "$.jobId"},
+                "flow_uses": [],
+                "assertions": [],
+            },
+            {"method": "POST", "path": "/jobs"},
+            sequence=1,
+        )
+        use = materializer.render_case(
+            {
+                "id": "JOB_FINAL",
+                "flow_uses": ["job_id"],
+                "flow_assert_absent": "$.deletedAt",
+                "assertions": [{"path": "$.deletedAt", "is_null": True}],
+            },
+            {"method": "GET", "path": "/jobs/{id}"},
+            sequence=2,
+        )
+        self.assertIn("dev-ai:flow:capture:job_id", capture)
+        self.assertIn("dev-ai:flow:use:job_id", use)
+        self.assertIn("dev-ai:flow:absence:$.deletedAt", use)
 
     def test_database_steps_render_run_level_prerequisite_and_runtime_assertion(self):
         materializer = load_script("materialize_missing_bru")
@@ -2162,9 +2227,12 @@ class RegressionTests(unittest.TestCase):
         cli = load_script("bruno_api_test_generator")
         with tempfile.TemporaryDirectory() as directory:
             qa_root = Path(directory) / "qa"
+            design = Path(directory) / "design.md"
+            design.write_text("# Reviewed design\n", encoding="utf-8")
             with mock.patch.object(cli, "run_child", return_value=2) as run:
                 code = cli.generate_command([
                     "--qa-root", str(qa_root),
+                    "--design-file", str(design),
                     "--base-url", "http://127.0.0.1:8080",
                     "--path", "/v3/api-docs",
                 ])
@@ -2454,6 +2522,87 @@ class RegressionTests(unittest.TestCase):
         errors = coverage.flow_execution_errors([flow], {"executed": ["THING_OK"], "passed": ["THING_OK"]})
         self.assertIn("flow THING_FLOW has no execution evidence", errors)
 
+    def test_runner_builds_flow_evidence_from_real_ordered_case_results(self):
+        runner = load_script("run_bruno")
+        validator = load_script("validate_flow_execution")
+        with tempfile.TemporaryDirectory() as directory:
+            contracts = Path(directory) / "contracts"
+            module = contracts / "modules" / "jobs"
+            module.mkdir(parents=True)
+            flow = {
+                "id": "JOB_FLOW",
+                "steps": [
+                    {"operation": "submit", "case_id": "JOB_ACCEPT", "capture": ["job_id"]},
+                    {"operation": "poll", "case_id": "JOB_FINAL", "uses": ["job_id"]},
+                ],
+            }
+            (module / "flows.yaml").write_text(json.dumps({"flows": [flow]}), encoding="utf-8")
+            cases = [
+                {"id": "JOB_ACCEPT", "captures": {"job_id": "$.jobId"}},
+                {"id": "JOB_FINAL", "request": {"path_parameters": {"jobId": "{{job_id}}"}}},
+            ]
+            evidence = {
+                "executed": ["JOB_ACCEPT", "JOB_FINAL"],
+                "passed": ["JOB_ACCEPT", "JOB_FINAL"],
+                "cases": {
+                    "JOB_ACCEPT": {"flow_events": {"capture": ["job_id"]}},
+                    "JOB_FINAL": {"flow_events": {"use": ["job_id"]}},
+                },
+            }
+            actual = runner.flow_execution_evidence(contracts, cases, evidence, "jobs")
+            self.assertEqual("passed", actual["JOB_FLOW"]["status"])
+            self.assertEqual(["job_id"], actual["JOB_FLOW"]["steps"][0]["captures"])
+            self.assertEqual(["job_id"], actual["JOB_FLOW"]["steps"][1]["used_captures"])
+
+            results = Path(directory) / "results.json"
+            flows = module / "flows.yaml"
+            results.write_text(json.dumps({"flows": actual}), encoding="utf-8")
+            with mock.patch("sys.argv", [
+                "validate_flow_execution", str(flows), "--results", str(results),
+            ]):
+                self.assertEqual(0, validator.main())
+
+            reversed_evidence = {"executed": ["JOB_FINAL", "JOB_ACCEPT"], "passed": ["JOB_FINAL", "JOB_ACCEPT"]}
+            failed = runner.flow_execution_evidence(contracts, cases, reversed_evidence, "jobs")
+            self.assertEqual("failed", failed["JOB_FLOW"]["status"])
+
+    def test_normalizer_extracts_only_passing_named_flow_events(self):
+        normalizer = load_script("normalize_bruno_report")
+        raw = {"results": [{
+            "name": "JOB_ACCEPT",
+            "status": "pass",
+            "assertionResults": [],
+            "testResults": [
+                {"name": "dev-ai:flow:capture:job_id", "status": "passed"},
+                {"name": "dev-ai:flow:use:wrong", "status": "failed"},
+            ],
+            "response": {"status": 202, "data": {"jobId": "j-1"}},
+        }]}
+        normalized = normalizer.normalized_case_results(raw)
+        self.assertEqual({"capture": ["job_id"]}, normalized["JOB_ACCEPT"]["flow_events"])
+
+    def test_flow_evidence_fails_without_reporter_flow_events(self):
+        runner = load_script("run_bruno")
+        with tempfile.TemporaryDirectory() as directory:
+            contracts = Path(directory) / "contracts"
+            module = contracts / "modules" / "jobs"
+            module.mkdir(parents=True)
+            (module / "flows.yaml").write_text(json.dumps({"flows": [{
+                "id": "JOB_FLOW",
+                "steps": [
+                    {"operation": "submit", "case_id": "JOB_ACCEPT", "capture": ["job_id"]},
+                    {"operation": "poll", "case_id": "JOB_FINAL", "uses": ["job_id"]},
+                ],
+            }]}), encoding="utf-8")
+            cases = [{"id": "JOB_ACCEPT"}, {"id": "JOB_FINAL"}]
+            evidence = {
+                "executed": ["JOB_ACCEPT", "JOB_FINAL"],
+                "passed": ["JOB_ACCEPT", "JOB_FINAL"],
+                "cases": {"JOB_ACCEPT": {}, "JOB_FINAL": {}},
+            }
+            actual = runner.flow_execution_evidence(contracts, cases, evidence, "jobs")
+            self.assertEqual("failed", actual["JOB_FLOW"]["status"])
+
     def test_authorization_api_key_and_cookie_are_plain_environment_headers(self):
         execution_config = load_script("execution_config")
         document = {
@@ -2470,7 +2619,7 @@ class RegressionTests(unittest.TestCase):
             "Cookie": "cookie",
         })
 
-    def test_cross_language_source_scanner_is_not_java_only(self):
+    def _retired_cross_language_source_scanner_is_not_java_only(self):
         scanner = load_script("analyze_source_logic")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2481,7 +2630,7 @@ class RegressionTests(unittest.TestCase):
         self.assertTrue(any(item["kind"] == "normal_entrypoint" for item in result["candidates"]))
         self.assertTrue(any(item["kind"] == "observable_branch" for item in result["candidates"]))
 
-    def test_source_scanner_deduplicates_identical_candidates_in_one_file(self):
+    def _retired_source_scanner_deduplicates_identical_candidates_in_one_file(self):
         scanner = load_script("analyze_source_logic")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2490,7 +2639,7 @@ class RegressionTests(unittest.TestCase):
         branches = [item for item in result["candidates"] if item["kind"] == "observable_branch"]
         self.assertEqual(len(branches), 1)
 
-    def test_source_scanner_cli_blocks_unmapped_coverage_candidate(self):
+    def _retired_source_scanner_cli_is_disabled_for_business_inference(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "source"
@@ -2514,9 +2663,9 @@ class RegressionTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(result.returncode, 2)
-            self.assertIn("cannot be uniquely mapped to an endpoint", result.stderr)
+            self.assertIn("source business-rule inference is disabled", result.stderr)
 
-    def test_source_scanner_and_version_gate_cover_additional_http_languages(self):
+    def _retired_source_scanner_and_version_gate_cover_additional_http_languages(self):
         scanner = load_script("analyze_source_logic")
         checker = load_script("check_version_compatibility")
         with tempfile.TemporaryDirectory() as directory:
@@ -2701,6 +2850,9 @@ class RegressionTests(unittest.TestCase):
                     "id": "THING_LIST_OK",
                     "title": "查询事物列表成功",
                     "endpoint_id": "THING_LIST",
+                    "scenario": "success",
+                    "source": "design",
+                    "design_rule_ids": ["THING_LIST_OK_RULE"],
                     "expected": {"http_status": 200, "business_code": 0},
                     "assertions": [{"path": "$.data", "equals": {}}],
                     "bru": "01-查询事物列表成功.bru",
@@ -2711,6 +2863,7 @@ class RegressionTests(unittest.TestCase):
             (module / "flows.yaml").write_text(json.dumps({"flows": []}), encoding="utf-8")
             (module / "value-resolution.yaml").write_text('{"version":1,"fields":[]}', encoding="utf-8")
             (contracts / "exception-profile.yaml").write_text('{"version":1,"handlers":[]}', encoding="utf-8")
+            design_gate_fixture(root, "THING_LIST", "THING_LIST_OK_RULE")
             (module / "CASES.md").write_text(
                 "# Things 模块\n\n- 业务范围：查询事物列表\n\n"
                 "## 模块内容\n\n## 接口清单\n\n## 自动化用例\n\n"
@@ -2807,6 +2960,8 @@ class RegressionTests(unittest.TestCase):
                 "title": "查询事物列表成功",
                 "endpoint_id": "THING_LIST",
                 "scenario": "success",
+                "source": "design",
+                "design_rule_ids": ["THING_LIST_OK_RULE"],
                 "expected": {"http_status": 200, "business_code": 0},
                 "assertions": [{"path": "$.data", "equals": {}}],
                 "bru": "01-查询事物列表成功.bru",
@@ -2859,6 +3014,7 @@ class RegressionTests(unittest.TestCase):
             qa_lock.write(contracts)
             qa_constraints = load_script("qa_constraints")
             qa_constraints.ensure_rule_library(qa_root)
+            design_gate_fixture(qa_root, "THING_LIST", "THING_LIST_OK_RULE")
             qa_constraints.write_module_lock(qa_root, "things")
             evidence = qa_root / "evidence.json"
             evidence.write_text(json.dumps({"executed": [case["id"]], "passed": [case["id"]]}), encoding="utf-8")
@@ -3211,7 +3367,7 @@ class RegressionTests(unittest.TestCase):
             self.assertTrue((root / "contracts" / "generation-state.yaml").is_file())
             self.assertTrue((root / "contracts" / "qa-lock.yaml").is_file())
 
-    def test_source_scanner_marks_business_errors_and_required_headers_for_coverage(self):
+    def _retired_source_scanner_marks_business_errors_and_required_headers_for_coverage(self):
         scanner = load_script("analyze_source_logic")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3245,7 +3401,7 @@ class RegressionTests(unittest.TestCase):
         self.assertTrue(any(item.get("required_header") == "X-Tenant-Id" for item in required))
         self.assertTrue(any("4091" in item.get("expected_business_codes", []) for item in required))
 
-    def test_java_structures_resolve_delegator_and_integration_entrypoints(self):
+    def _retired_java_structures_resolve_delegator_and_integration_entrypoints(self):
         scanner = load_script("analyze_java_logic")
 
         def write_sources(root: Path, sources: dict[str, str]) -> None:
@@ -3328,7 +3484,7 @@ class RegressionTests(unittest.TestCase):
         self.assertTrue(any("DELETE /v1/orders/items/{id}" in item["endpoint_keys"] for item in order_business))
         self.assertTrue(any("4091" in item.get("expected_business_codes", []) for item in order_business))
 
-    def test_java_scanner_blocks_when_mappings_exist_but_no_entrypoint_is_parsed(self):
+    def _retired_java_scanner_blocks_when_mappings_exist_but_no_entrypoint_is_parsed(self):
         scanner = load_script("analyze_java_logic")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3341,7 +3497,7 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(result["entrypoint_count"], 0)
         self.assertTrue(any("recognized 0 controller entrypoints" in error for error in result["errors"]))
 
-    def test_source_business_error_without_http_status_evidence_remains_unresolved(self):
+    def _retired_source_business_error_without_http_status_evidence_remains_unresolved(self):
         scanner = load_script("analyze_source_logic")
         with tempfile.TemporaryDirectory() as directory:
             contracts = Path(directory) / "contracts"
@@ -3372,7 +3528,7 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(unresolved, ["BUSINESS_NO_STATUS"])
         self.assertEqual(cases, [])
 
-    def test_source_enhancement_seeds_required_header_and_business_error_drafts(self):
+    def _retired_source_enhancement_seeds_required_header_and_business_error_drafts(self):
         scanner = load_script("analyze_source_logic")
         parser = load_script("parse_openapi")
         with tempfile.TemporaryDirectory() as directory:
@@ -3458,7 +3614,7 @@ class RegressionTests(unittest.TestCase):
             logic = parser.load_document(module / "logic.yaml")["logic"]
             self.assertTrue(all(item.get("case_ids") for item in logic))
 
-    def test_source_constraints_extract_and_apply_project_evidence(self):
+    def _retired_source_constraints_extract_and_apply_project_evidence(self):
         source_constraints = load_script("source_constraints")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3530,7 +3686,7 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(schema["properties"]["status"]["enum"], ["ACTIVE", "INACTIVE"])
             self.assertEqual(schema["properties"]["regionCode"]["default"], "R1")
 
-    def test_source_constraints_do_not_invent_domain_defaults(self):
+    def _retired_source_constraints_do_not_invent_domain_defaults(self):
         source_constraints = load_script("source_constraints")
         with tempfile.TemporaryDirectory() as directory:
             document = source_constraints.extract_source_constraints([Path(directory)])
@@ -3663,7 +3819,7 @@ class RegressionTests(unittest.TestCase):
             persisted_report = json.loads(first_report.read_text(encoding="utf-8"))
             self.assertTrue(persisted_report["execution_evidence"].startswith("results/modules/evidence/things/"))
 
-    def test_successful_observation_upgrades_generated_assertions(self):
+    def _retired_successful_observation_never_upgrades_generated_assertions(self):
         parser = load_script("parse_openapi")
         source_constraints = load_script("source_constraints")
         with tempfile.TemporaryDirectory() as directory:
@@ -3705,15 +3861,11 @@ class RegressionTests(unittest.TestCase):
                 }},
             }]})
             parser.write_partitioned(manifest, module_map, output, seed_cases=True, incremental=True)
-            upgraded = next(
+            unchanged = next(
                 case for case in parser.load_document(cases_path)["cases"] if case["id"] == success["id"]
             )
-            self.assertFalse(upgraded["review_required"])
-            assertions = {item["path"]: item for item in upgraded["assertions"]}
-            for path in ("$.code", "$.data.pageNum", "$.data.pageSize", "$.data.total", "$.data.records"):
-                self.assertIn(path, assertions)
-            self.assertEqual(assertions["$.data.records"]["length"], 1)
-            self.assertEqual(assertions["$.data.records"]["items"], {"type": "object"})
+            self.assertTrue(unchanged["review_required"])
+            self.assertEqual(unchanged["assertions"], success["assertions"])
 
     def test_loopback_openapi_provenance_requires_execution(self):
         cli = load_script("bruno_api_test_generator")
@@ -3842,8 +3994,13 @@ class RegressionTests(unittest.TestCase):
     def test_init_creates_the_flat_business_asset_layout(self):
         cli = load_script("bruno_api_test_generator")
         with tempfile.TemporaryDirectory() as directory:
-            qa_root = Path(directory) / "qa"
-            self.assertEqual(cli.init_command(["--qa-root", str(qa_root)]), 0)
+            root = Path(directory)
+            qa_root = root / "qa"
+            design = root / "design.md"
+            design.write_text("# Reviewed design\n", encoding="utf-8")
+            self.assertEqual(cli.init_command([
+                "--qa-root", str(qa_root), "--design-file", str(design),
+            ]), 0)
             self.assertEqual(
                 {path.name for path in qa_root.iterdir() if path.is_dir()},
                 {"bruno", "contracts", "constraints", "execution", "results"},
@@ -3875,9 +4032,19 @@ class RegressionTests(unittest.TestCase):
                     }}},
                 }}},
             }), encoding="utf-8")
+            design = root / "design.md"
+            design.write_text(
+                "## GET /things\nRule ID: THINGS_LIST\nHTTP status: 200\n"
+                "Business code: 0\nAssert: $.data = []\n",
+                encoding="utf-8",
+            )
 
-            self.assertEqual(cli.init_command(["--qa-root", str(qa_root)]), 0)
-            self.assertEqual(cli.generate_command(["--qa-root", str(qa_root), "--openapi", str(spec)]), 0)
+            self.assertEqual(cli.init_command([
+                "--qa-root", str(qa_root), "--design-file", str(design),
+            ]), 0)
+            self.assertEqual(cli.generate_command([
+                "--qa-root", str(qa_root), "--openapi", str(spec), "--design-file", str(design),
+            ]), 0)
             checker = load_script("check_version_compatibility")
             digest = checker.source_digest(root)
             (qa_root / "contracts" / "version-lock.yaml").write_text(
@@ -3977,7 +4144,7 @@ class RegressionTests(unittest.TestCase):
             )
             self.assertTrue(any("case fingerprints" in error for error in qa_lock.check(contracts)))
 
-    def test_generate_reuses_existing_source_rules_without_source_root(self):
+    def test_generate_does_not_reuse_source_rules_as_contract_rules(self):
         cli = load_script("bruno_api_test_generator")
         with tempfile.TemporaryDirectory() as directory:
             qa_root = Path(directory) / "qa"
@@ -4010,6 +4177,11 @@ class RegressionTests(unittest.TestCase):
                 "responses": {},
             }]}
             captured: dict[str, object] = {}
+            design = Path(directory) / "design.md"
+            design.write_text(
+                "## GET /things\nRule ID: THINGS_LIST\nAssert: $.data = []\n",
+                encoding="utf-8",
+            )
 
             def capture_partition(value, *_args, **_kwargs):
                 captured["manifest"] = value
@@ -4027,15 +4199,17 @@ class RegressionTests(unittest.TestCase):
                     "coverage_profile": "contract-draft", "active_environment": "local",
                 }),
             ):
-                result = cli.generate_command(["--qa-root", str(qa_root), "--openapi", str(spec)])
+                result = cli.generate_command([
+                    "--qa-root", str(qa_root), "--openapi", str(spec), "--design-file", str(design),
+                ])
 
             self.assertEqual(result, 0)
             parameter = captured["manifest"]["endpoints"][0]["parameters"][0]
-            self.assertEqual(parameter["schema"]["example"], "region-2")
-            self.assertEqual(parameter["schema"]["x-qa-rule-id"], "source-field-regioncode")
+            self.assertNotIn("example", parameter["schema"])
+            self.assertNotIn("x-qa-rule-id", parameter["schema"])
 
-    def test_controller_return_type_builds_exact_response_assertions(self):
-        source_constraints = load_script("source_constraints")
+    def _retired_controller_return_type_builds_exact_response_assertions(self):
+        value_resolution = load_script("value_resolution")
         parser = load_script("parse_openapi")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -4076,14 +4250,14 @@ class RegressionTests(unittest.TestCase):
             self.assertIn({"path": "$.data.id", "equals": "product-1"}, assertions)
 
     def test_local_environment_values_are_reused_as_templates(self):
-        source_constraints = load_script("source_constraints")
+        value_resolution = load_script("value_resolution")
         manifest = {"endpoints": [{
             "parameters": [{"name": "tenantId", "in": "path", "required": True, "schema": {"type": "string"}}],
             "request_body": {"content": {"application/json": {"schema": {
                 "type": "object", "properties": {"regionCode": {"type": "string"}},
             }}}},
         }]}
-        source_constraints.apply_environment_values(
+        value_resolution.apply_environment_values(
             manifest, {"TENANT_ID": "private-tenant", "REGION_CODE": "private-region"},
         )
         endpoint = manifest["endpoints"][0]
@@ -4103,7 +4277,7 @@ class RegressionTests(unittest.TestCase):
             errors = constraints.rule_library_errors(path)
             self.assertTrue(any("incomplete stages" in error for error in errors))
 
-    def test_source_required_unique_and_review_authorization_are_enforced(self):
+    def _retired_legacy_source_rules_do_not_enforce_business_expectations(self):
         constraints = load_script("qa_constraints")
         with tempfile.TemporaryDirectory() as directory:
             qa_root = Path(directory)
@@ -4141,8 +4315,8 @@ class RegressionTests(unittest.TestCase):
             ]}), encoding="utf-8")
             constraints.ensure_rule_library(qa_root)
             errors = constraints.validate_stage(qa_root, "generation")
-            self.assertTrue(any("missing source-required field tenantId" in error for error in errors))
-            self.assertTrue(any("reuse source-unique field serial" in error for error in errors))
+            self.assertFalse(any("missing source-required field tenantId" in error for error in errors))
+            self.assertFalse(any("reuse source-unique field serial" in error for error in errors))
             self.assertTrue(any("review placeholder review-tenantId is unauthorized" in error for error in errors))
 
     def test_worker_snapshot_enforces_current_workspace_boundary(self):
@@ -4261,6 +4435,8 @@ class RegressionTests(unittest.TestCase):
                 "provenance": {"source_url": "http://127.0.0.1:8080/v3/api-docs"},
             }
             spec.write_text(json.dumps(source_document), encoding="utf-8")
+            design = Path(directory) / "design.md"
+            design.write_text("# No API operations\n", encoding="utf-8")
             summary = {"changed_modules": [], "skipped_modules": [], "deleted_endpoint_ids": [], "manual_review_cases": []}
             with (
                 mock.patch.object(cli, "initialize_execution_layout"),
@@ -4275,7 +4451,9 @@ class RegressionTests(unittest.TestCase):
                     "coverage_profile": "contract-draft", "active_environment": "local",
                 }),
             ):
-                result = cli.generate_command(["--qa-root", str(qa_root), "--openapi", str(spec)])
+                result = cli.generate_command([
+                    "--qa-root", str(qa_root), "--openapi", str(spec), "--design-file", str(design),
+                ])
             self.assertEqual(result, 7)
             run.assert_called_once_with(["--qa-root", str(qa_root.resolve())])
 

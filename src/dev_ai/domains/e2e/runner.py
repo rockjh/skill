@@ -16,6 +16,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from ...core.redaction import redact
 from ...core.schema import (
     E2E_ORDERED_GATES,
@@ -25,7 +27,7 @@ from ...core.schema import (
     WORKSPACE_DOCUMENT_SCHEMA,
     validate_schema,
 )
-from .contracts import CONTROL_NAMES, contract_errors
+from .contracts import CONTROL_NAMES, _expectation_field, _lookup_value, contract_errors
 from .discovery import (
     _contains_usable_credential_text,
     _error,
@@ -34,6 +36,7 @@ from .discovery import (
     _strings,
     _walk_files,
     discovery_errors,
+    read_only_environment_probe,
 )
 from .source_versions import source_version_results
 from .static_checks import (
@@ -99,9 +102,10 @@ def _events(
     if not evidence_root.is_dir():
         return events, errors
     schemas = {
-        "endpoint": {"phase", "method", "target_ref", "status", "summary", "verified"},
+        "endpoint": {"phase", "method", "target_ref", "status", "summary", "verified", "step_id", "protocol_ref", "protocol_path"},
         "business_entered": set(),
         "control": {"control_kind", "action", "correlation_ref", "side_effect"},
+        "step": {"step_id", "status", "reason", "evidence"},
         "restoration": {"status", "resources"},
     }
     project_root = evidence_root.parents[2]
@@ -139,7 +143,10 @@ def _events(
             ):
                 errors.append(_error(path, "evidence-restoration", "恢复证据结构或状态无效"))
                 continue
-        elif actual != expected:
+        elif kind == "control" and actual not in (expected, expected | {"step_id", "protocol_ref", "protocol_path"}):
+            errors.append(_error(path, "evidence-details", f"{kind} 证据字段无效"))
+            continue
+        elif kind != "control" and actual != expected:
             errors.append(_error(path, "evidence-details", f"{kind} 证据字段无效"))
             continue
         elif kind == "endpoint" and (
@@ -147,6 +154,13 @@ def _events(
             or not isinstance(details.get("method"), str)
             or not details["method"].strip()
             or details.get("phase") == "smoke" and details["method"].upper() not in {"GET", "HEAD", "READ"}
+            or details.get("phase") == "business" and (
+                not isinstance(details.get("step_id"), str) or not details["step_id"].strip()
+                or not isinstance(details.get("protocol_ref"), str) or not details["protocol_ref"].strip()
+            )
+            or details.get("phase") == "smoke" and (
+                details.get("step_id") is not None or details.get("protocol_ref") is not None or details.get("protocol_path") is not None
+            )
             or not isinstance(details.get("target_ref"), str)
             or not details["target_ref"].strip()
             or details.get("verified") is not True
@@ -166,10 +180,94 @@ def _events(
             or not isinstance(details.get("correlation_ref"), str)
             or not details["correlation_ref"].strip()
             or details.get("side_effect") not in {"read", "write"}
+            or ("step_id" in details and (
+                not isinstance(details.get("step_id"), str) or not details["step_id"].strip()
+                or not isinstance(details.get("protocol_ref"), str) or not details["protocol_ref"].strip()
+                or details.get("protocol_path") is not None
+                and (not isinstance(details.get("protocol_path"), str) or not details["protocol_path"].startswith("/"))
+            ))
         ):
             errors.append(_error(path, "evidence-control", "控制证据类别、动作或关联引用无效"))
             continue
+        elif kind == "step" and (
+            not isinstance(details.get("step_id"), str)
+            or not details["step_id"].strip()
+            or details.get("status") not in {
+                "executable", "environment_missing", "authorization_missing", "control_gap", "product_gap", "runtime_failure",
+            }
+            or not isinstance(details.get("reason"), str)
+            or not details["reason"].strip()
+            or not _strings(details.get("evidence"), nonempty=False)
+        ):
+            errors.append(_error(path, "evidence-step", "步骤证据状态、原因或引用无效"))
+            continue
         events.append(event)
+    protocol_path = project_root / "discovery" / "protocol-rules.yaml"
+    try:
+        protocol = yaml.safe_load(protocol_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError):
+        protocol = None
+    operations = {
+        str(item.get("id")): item
+        for item in (protocol.get("operations", []) if isinstance(protocol, dict) else [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    scenario_steps: dict[str, dict[str, Mapping[str, Any]]] = {}
+    for scenario_name in scenario_names:
+        definition_path = scenario_root / scenario_name / "场景定义.yaml"
+        try:
+            definition = yaml.safe_load(definition_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, yaml.YAMLError):
+            continue
+        scenario_steps[scenario_name] = {
+            str(step.get("id")): step
+            for step in (definition.get("steps", []) if isinstance(definition, dict) else [])
+            if isinstance(step, Mapping) and step.get("id")
+        }
+    for event in events:
+        details = event.get("details", {})
+        if event.get("kind") not in {"endpoint", "control"} or details.get("phase") == "smoke":
+            continue
+        if event.get("kind") == "control" and "step_id" not in details:
+            continue
+        step = scenario_steps.get(str(event.get("scenario")), {}).get(str(details.get("step_id")))
+        operation = operations.get(str(details.get("protocol_ref")))
+        if not isinstance(step, Mapping) or step.get("protocol_ref") != details.get("protocol_ref"):
+            errors.append(_error(protocol_path, "evidence-protocol-step", f"接口证据未绑定场景步骤的 protocol_ref: {details.get('step_id')}"))
+            continue
+        if not isinstance(operation, Mapping):
+            errors.append(_error(protocol_path, "evidence-protocol-ref", f"接口证据引用未知正式协议操作: {details.get('protocol_ref')}"))
+            continue
+        if event.get("kind") == "control":
+            if operation.get("kind") == "http":
+                if details.get("protocol_path") != operation.get("path"):
+                    errors.append(_error(protocol_path, "evidence-protocol-path", f"控制证据路径与正式协议不一致: {details.get('protocol_ref')}"))
+            elif details.get("protocol_path") is not None:
+                errors.append(_error(protocol_path, "evidence-protocol-path", "非 HTTP 控制证据不得声明 HTTP path"))
+            continue
+        if operation.get("kind") == "http":
+            if str(operation.get("method", "")).upper() != str(details.get("method", "")).upper():
+                errors.append(_error(protocol_path, "evidence-protocol-method", f"实际方法与正式协议不一致: {details.get('protocol_ref')}"))
+            if operation.get("path") != details.get("protocol_path"):
+                errors.append(_error(protocol_path, "evidence-protocol-path", f"实际路径与正式协议不一致: {details.get('protocol_ref')}"))
+            statuses = {str(value).upper() for value in operation.get("status_codes", [])}
+            actual = str(details.get("status"))
+            if statuses and actual not in statuses and (f"{actual[:1]}XX" if actual else "") not in statuses and "DEFAULT" not in statuses:
+                errors.append(_error(protocol_path, "evidence-protocol-status", f"实际状态码不在正式协议中: {details.get('protocol_ref')}={actual}"))
+        response_fields = {
+            str(field.get("path") or field.get("name"))
+            for field in operation.get("response_fields", [])
+            if isinstance(field, Mapping) and (field.get("path") or field.get("name"))
+        }
+        if response_fields:
+            summary = details.get("summary")
+            for expectation in step.get("expect", []) if isinstance(step.get("expect"), list) else []:
+                field_name, _ = _expectation_field(expectation)
+                if not field_name or not any(path == field_name or path.endswith("." + field_name) for path in response_fields):
+                    continue
+                found, _ = _lookup_value(summary, field_name, "header" if field_name.startswith("header.") else "response")
+                if not found:
+                    errors.append(_error(protocol_path, "evidence-protocol-response", f"运行响应缺少正式协议断言字段: {field_name}"))
     return events, errors
 
 
@@ -185,12 +283,86 @@ def _report_scenarios(
     for directory, definition in scenarios:
         scenario_events = [event for event in events if event.get("scenario") == directory.name]
         controls = definition.get("controls", {})
+        step_events = {
+            str(event.get("details", {}).get("step_id")): event.get("details", {})
+            for event in scenario_events if event.get("kind") == "step"
+        }
+        endpoint_events = {
+            str(event.get("details", {}).get("step_id")): event.get("details", {})
+            for event in scenario_events
+            if event.get("kind") == "endpoint" and event.get("details", {}).get("phase") == "business"
+        }
+        step_results = []
+        for step in definition.get("steps", []):
+            if not isinstance(step, Mapping):
+                continue
+            step_id = str(step.get("id"))
+            detail = step_events.get(step_id)
+            if detail is None:
+                status = str(step.get("status", "executable"))
+                reason = str(step.get("status_reason", "未产生运行证据"))
+                evidence = [str(item) for item in step.get("evidence", [])]
+            else:
+                status = str(detail.get("status"))
+                reason = str(detail.get("reason"))
+                evidence = [str(item) for item in detail.get("evidence", [])]
+            endpoint_detail = endpoint_events.get(step_id, {})
+            step_results.append({
+                "id": step_id,
+                "status": status,
+                "reason": reason,
+                "evidence": evidence,
+                "design_rule_id": step.get("design_rule_id"),
+                "protocol_ref": step.get("protocol_ref"),
+                "phase": step.get("phase"),
+                "expected": [str(value) for value in step.get("expect", [])] if isinstance(step.get("expect"), list) else [],
+                "actual": (
+                    detail.get("actual") if detail is not None and detail.get("actual") is not None
+                    else endpoint_detail.get("summary", endpoint_detail.get("status"))
+                    if endpoint_detail else None
+                ),
+            })
+        executed = sum(
+            item.get("status") in {"executable", "runtime_failure", "product_gap"}
+            for step_id, item in step_events.items() if step_id in {str(step.get("id")) for step in definition.get("steps", []) if isinstance(step, Mapping)}
+        )
+        covered = sum(item["id"] in step_events for item in step_results)
+        has_runtime_failure = any(item["status"] == "runtime_failure" for item in step_results)
+        has_product_failure = any(item["status"] == "product_gap" for item in step_results)
+        blocked = any(item["status"] in {"environment_missing", "authorization_missing", "control_gap"} for item in step_results)
+        all_blocked = bool(step_results) and all(
+            item["status"] in {"environment_missing", "authorization_missing", "control_gap"}
+            for item in step_results
+        )
+        business_info = executions.get(directory.name, {"status": "N/A", "exit_code": None, "reason": "未执行"})
+        business_status = business_info.get("status")
+        business_failed = has_runtime_failure or has_product_failure or (business_status == "failed" and not blocked)
+        classification = (
+            "business_failure" if business_failed else
+            "blocked" if all_blocked and business_status == "N/A" else
+            "partially_covered" if blocked or (step_results and covered < len(step_results) and business_status != "N/A") else
+            "executed" if business_status == "passed" else
+            "blocked" if definition.get("meta", {}).get("status") != "ready" else
+            "static_complete"
+        )
         reports.append({
             "name": directory.name,
             "owner": definition.get("generation", {}).get("owner"),
             "generation_mode": definition.get("generation", {}).get("mode"),
             "degradation_reason": definition.get("generation", {}).get("degradation_reason"),
             "status": definition.get("meta", {}).get("status"),
+            "participants": [str(item) for item in definition.get("meta", {}).get("participants", [])] if isinstance(definition.get("meta", {}).get("participants", []), list) else [],
+            "integrations": definition.get("integrations", {"services": [], "components": []}) if isinstance(definition.get("integrations"), Mapping) else {"services": [], "components": []},
+            "design_rule_ids": sorted({
+                str(step.get("design_rule_id"))
+                for step in definition.get("steps", [])
+                if isinstance(step, Mapping) and step.get("design_rule_id")
+            }),
+            "protocol_refs": sorted({
+                str(step.get("protocol_ref"))
+                for step in definition.get("steps", [])
+                if isinstance(step, Mapping) and step.get("protocol_ref")
+            }),
             "planned_controls": [
                 name for name in CONTROL_NAMES
                 if isinstance(controls.get(name), dict) and controls[name].get("planned_use")
@@ -205,8 +377,13 @@ def _report_scenarios(
                     for event in scenario_events
                 ) else "failed"
             ),
-            "business": executions.get(directory.name, {"status": "N/A", "exit_code": None, "reason": "未执行"}),
+            "business": business_info,
             "restoration": [event.get("details") for event in scenario_events if event.get("kind") == "restoration"],
+            "step_results": step_results,
+            "execution_rate": (executed / len(step_results)) if step_results else 0,
+            "coverage_rate": (covered / len(step_results)) if step_results else 0,
+            "business_correctness": "failed" if business_failed else "passed" if business_status == "passed" and not blocked else "unknown",
+            "classification": classification,
         })
     return reports
 
@@ -415,6 +592,11 @@ def _contract_inputs(project_root: Path, selected: str | None) -> list[Path]:
     """列出契约门禁摘要覆盖的发现和场景定义文件。"""
 
     paths = _discovery_inputs(project_root)
+    paths.extend(
+        project_root / "discovery" / name
+        for name in ("design-rules.yaml", "protocol-rules.yaml", "logic.yaml", "scenario-plan.yaml", "version-lock.yaml", "exclusions.yaml")
+    )
+    paths.append(project_root / "config" / "value-resolution.yaml")
     root = project_root / "scenarios"
     if root.is_dir():
         paths.extend(path / "场景定义.yaml" for path in root.iterdir() if path.is_dir())
@@ -441,6 +623,7 @@ def _scoped_errors(errors: list[str], stage: str) -> list[str]:
         "control_matrix": (
             "scenario-schema", "scenario-meta", "scenario-id", "scenario-status", "readiness-", "preconditions",
             "steps-", "step-", "control-", "ready-", "database-", "integration-", "pending-", "contract-",
+            "design-", "protocol-", "logic-", "scenario-plan-", "value-resolution-", "version-lock-", "generation-",
         ),
         "scenario_split": ("generation-schema", "generation-mode", "generation-degradation", "multi-scenario-mode"),
         "scenario_ownership": ("generation-owner", "generation-scope", "multi-scenario-owner"),
@@ -536,12 +719,31 @@ def run_ordered(project_root: Path, scenario: str | None, pytest_args: list[str]
         "static_only": static_only,
         "stages": outcomes,
         "discovery": {},
+        "design": {},
+        "protocol": {},
+        "coverage": {},
+        "exclusions": [],
+        "support_only": {},
+        "differences": [],
         "source_versions": [],
         "scenarios": [],
         "evidence_diagnostics": [],
     }
     executions: dict[str, dict[str, Any]] = {}
     run_event_paths: set[Path] = set()
+    try:
+        active_probe = read_only_environment_probe(project_root)
+    except Exception as exc:
+        active_probe = {
+            "requested": True,
+            "outcome": "blocked",
+            "blockers": [f"probe:{type(exc).__name__}"],
+            "listeners": [],
+            "processes": [],
+            "associations": [],
+            "read_only_smoke": [],
+            "configuration_checks": [],
+        }
 
     def finish(exit_code: int) -> int:
         """聚合当前证据、写报告并保留原始失败状态。"""
@@ -572,14 +774,119 @@ def run_ordered(project_root: Path, scenario: str | None, pytest_args: list[str]
             "topology": topology,
             "configuration": configuration,
             "runtime_probe": runtime_probe,
+            "active_runtime_probe": active_probe,
             "diagnostics": contract_diagnostics if exit_code else [],
         }
+        if active_probe.get("outcome") == "blocked":
+            report["discovery"]["diagnostics"].append(
+                f"active read-only probe blocked: {active_probe.get('blockers', ['unknown'])}"
+            )
+        def artifact(name: str) -> dict[str, Any]:
+            artifact_path = project_root / "discovery" / name
+            try:
+                value = yaml.safe_load(artifact_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, yaml.YAMLError):
+                return {}
+            return value if isinstance(value, dict) else {}
+
+        design_artifact = artifact("design-rules.yaml")
+        protocol_artifact = artifact("protocol-rules.yaml")
+        report["design"] = {
+            "documents": design_artifact.get("documents", []),
+            "rules": [
+                {"id": item.get("id"), "section": item.get("section"), "source": item.get("source")}
+                for item in design_artifact.get("rules", []) if isinstance(item, dict)
+            ],
+            "manual_confirmation": [
+                item.get("id") for item in design_artifact.get("rules", [])
+                if isinstance(item, dict) and item.get("manual_confirmation")
+            ],
+        }
+        report["protocol"] = {
+            "documents": protocol_artifact.get("documents", []),
+            "operations": [
+                {"id": item.get("id"), "kind": item.get("kind"), "method": item.get("method"), "path": item.get("path"), "source": item.get("source")}
+                for item in protocol_artifact.get("operations", []) if isinstance(item, dict)
+            ],
+        }
+        value_path = project_root / "config" / "value-resolution.yaml"
+        try:
+            value_resolution = yaml.safe_load(value_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, yaml.YAMLError):
+            value_resolution = {}
+        report["support_only"] = {
+            "repository_versions": [
+                {"repo": item.get("id"), "commit": item.get("commit")}
+                for item in repositories if isinstance(item, dict)
+            ],
+            "configuration": configuration,
+            "value_resolution": value_resolution if isinstance(value_resolution, dict) else {},
+        }
+        report["coverage"] = {
+            "design_to_scenario": {
+                "rule_count": len(report["design"]["rules"]),
+                "rule_ids": [str(item.get("id")) for item in report["design"]["rules"] if item.get("id")],
+                "scenario_references": sum(
+                    1 for _, definition in selected_scenarios
+                    for step in definition.get("steps", [])
+                    if isinstance(step, dict) and step.get("design_rule_id")
+                ),
+            },
+            "protocol_to_call": {
+                "operation_count": len(report["protocol"]["operations"]),
+                "operation_ids": [str(item.get("id")) for item in report["protocol"]["operations"] if item.get("id")],
+                "calls": sum(len(item.get("endpoint_calls", [])) for item in report.get("scenarios", [])),
+            },
+        }
+        referenced_rules = {
+            str(step.get("design_rule_id"))
+            for _, definition in selected_scenarios
+            for step in definition.get("steps", [])
+            if isinstance(step, dict) and step.get("design_rule_id")
+        }
+        referenced_protocols = {
+            str(step.get("protocol_ref"))
+            for _, definition in selected_scenarios
+            for step in definition.get("steps", [])
+            if isinstance(step, dict) and step.get("protocol_ref")
+        }
+        report["coverage"]["design_to_scenario"]["unreferenced_rules"] = sorted(
+            set(report["coverage"]["design_to_scenario"]["rule_ids"]) - referenced_rules
+        )
+        report["coverage"]["protocol_to_call"]["unused_operations"] = sorted(
+            set(report["coverage"]["protocol_to_call"]["operation_ids"]) - referenced_protocols
+        )
+        exclusions_path = project_root / "discovery" / "exclusions.yaml"
+        try:
+            exclusions_document = yaml.safe_load(exclusions_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, yaml.YAMLError):
+            exclusions_document = {}
+        if isinstance(exclusions_document, dict) and isinstance(exclusions_document.get("exclusions"), list):
+            report["exclusions"] = exclusions_document["exclusions"]
         report["scenarios"] = _report_scenarios(
             selected_scenarios,
             events,
             executions,
             outcomes["read_only_smoke"]["status"],
         )
+        report["coverage"]["protocol_to_call"]["calls"] = sum(
+            len(item.get("endpoint_calls", [])) for item in report["scenarios"]
+        )
+        report["differences"] = [
+            {
+                "scenario": item["name"],
+                "step": step["id"],
+                "design_rule_id": step.get("design_rule_id"),
+                "protocol_ref": step.get("protocol_ref"),
+                "expected": step.get("expected", []),
+                "actual": step.get("actual"),
+                "status": step["status"],
+                "reason": step["reason"],
+            }
+            for item in report["scenarios"]
+            for step in item.get("step_results", [])
+            if step.get("status") in {"product_gap", "runtime_failure"}
+        ]
         report["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
         outcomes["summary"] = {"status": "passed" if exit_code == 0 else "failed", "exit_code": exit_code}
         path = _write_report(project_root, report)
@@ -637,7 +944,19 @@ def run_ordered(project_root: Path, scenario: str | None, pytest_args: list[str]
 
     _, selected_scenarios, discovery = contract_errors(project_root, scenario)
     probe = discovery.get("runtime_probe", {}) if isinstance(discovery, dict) else {}
-    if probe.get("requested") is True:
+    if any("constructability" in definition for _, definition in selected_scenarios) and (
+        probe.get("requested") is not True or probe.get("outcome") != "completed"
+    ):
+        for directory, _ in selected_scenarios:
+            executions[directory.name] = {
+                "status": "N/A",
+                "exit_code": None,
+                "reason": "执行型任务必须先完成本地只读运行探测",
+            }
+        print("执行型任务缺少 completed 的本地只读运行探测", file=sys.stderr)
+        outcomes["read_only_smoke"] = {"status": "failed", "exit_code": 8}
+        return finish(8)
+    if probe.get("requested") is True and probe.get("read_only_smoke"):
         for directory, _ in selected_scenarios:
             smoke_targets = _smoke_paths(project_root, {directory.name})
             if not smoke_targets:
@@ -668,27 +987,26 @@ def run_ordered(project_root: Path, scenario: str | None, pytest_args: list[str]
                 return finish(smoke_code or 1)
         outcomes["read_only_smoke"] = {"status": "passed", "exit_code": 0}
 
-    non_ready = [item for item in selected_scenarios if item[1].get("meta", {}).get("status") != "ready"]
-    if non_ready:
-        for directory, definition in non_ready:
+    from . import runtime as runtime_module
+    business_code = 0
+    for directory, definition in selected_scenarios:
+        contract_steps = [step for step in definition.get("steps", []) if isinstance(step, dict)]
+        executable_steps = [step for step in contract_steps if step.get("status", "executable") == "executable"]
+        if not executable_steps and ("constructability" in definition or definition.get("meta", {}).get("status") != "ready"):
             executions[directory.name] = {
                 "status": "N/A",
                 "exit_code": None,
-                "reason": f"静态状态为 {definition.get('meta', {}).get('status')}，真实业务未执行",
+                "reason": "没有具备安全执行条件的步骤；逐步骤阻塞原因见 step_results",
             }
-        print("选中范围包含非 ready 场景；业务与恢复阶段保持 N/A", file=sys.stderr)
-        return finish(8)
-    ready = selected_scenarios
-    from . import runtime as runtime_module
-    business_code = 0
-    for index, (directory, definition) in enumerate(ready):
+            business_code = business_code or 8
+            continue
         try:
             runtime_module.preflight(project_root, directory.name, environ=environment)
         except Exception as exc:
             print(f"运行预检失败 [{directory.name}]: {exc}", file=sys.stderr)
             executions[directory.name] = {"status": "failed", "exit_code": 1, "reason": f"运行预检失败: {exc}"}
             business_code = 1
-            break
+            continue
         target = str(directory / f"test_{directory.name}.py")
         before = set(evidence_root.glob("*.json")) if evidence_root.is_dir() else set()
         business_junit = evidence_root / f"business-{directory.name}.xml"
@@ -715,36 +1033,75 @@ def run_ordered(project_root: Path, scenario: str | None, pytest_args: list[str]
         controls = definition.get("controls", {})
         planned = {
             (str(step.get("control")), str(step.get("action")), str(step.get("side_effect")))
-            for step in definition.get("steps", []) if isinstance(step, dict)
+            for step in executable_steps
         }
         missing_controls = planned - observed_controls
         unexpected_correlations = _unexpected_control_correlations(definition, scenario_events)
         planned_api = any(name in {"public_api", "test_or_admin_api"} for name, _, _ in planned)
-        evidence_failure = bool(current_evidence_errors or foreign_events or not entered or missing_controls or unexpected_correlations)
+        step_events = [event.get("details", {}) for event in scenario_events if event.get("kind") == "step"]
+        expected_step_ids = [str(step.get("id")) for step in contract_steps]
+        actual_step_ids = [str(item.get("step_id")) for item in step_events]
+        step_evidence_required = "constructability" in definition
+        invalid_step_coverage = step_evidence_required and (
+            sorted(actual_step_ids) != sorted(expected_step_ids) or len(actual_step_ids) != len(set(actual_step_ids))
+        )
+        planned_status = {str(step.get("id")): str(step.get("status", "executable")) for step in contract_steps}
+        invalid_reclassification = any(
+            planned_status.get(str(item.get("step_id"))) == "executable"
+            and item.get("status") in {"environment_missing", "authorization_missing", "control_gap"}
+            for item in step_events
+        )
+        reported_failure = any(item.get("status") in {"product_gap", "runtime_failure"} for item in step_events)
+        reported_blocker = any(
+            item.get("status") in {"environment_missing", "authorization_missing", "control_gap"}
+            for item in step_events
+        )
+        missing_failure_evidence = step_evidence_required and code != 0 and not reported_failure and not reported_blocker
+        evidence_failure = bool(
+            current_evidence_errors or foreign_events or not entered or missing_controls or unexpected_correlations
+            or invalid_step_coverage or invalid_reclassification or missing_failure_evidence
+        )
         if planned_api and not endpoints:
             evidence_failure = True
         if evidence_failure:
             print(
                 f"业务证据不完整 [{directory.name}]: entered={entered}, missing_controls={sorted(missing_controls)}, "
-                f"unexpected_correlations={sorted(unexpected_correlations)}, foreign_events={len(foreign_events)}, business_endpoints={len(endpoints)}",
+                f"unexpected_correlations={sorted(unexpected_correlations)}, foreign_events={len(foreign_events)}, "
+                f"business_endpoints={len(endpoints)}, step_ids={actual_step_ids}",
                 file=sys.stderr,
             )
-        scenario_code = code or (1 if evidence_failure or not _pytest_junit_passed(business_junit) else 0)
+        protocol_controls = [
+            (str(step.get("id")), str(step.get("protocol_ref")))
+            for step in executable_steps
+            if step.get("protocol_ref") and step.get("control") in {"messages", "scheduled_jobs", "test_or_admin_api"}
+        ]
+        observed_protocol_controls = {
+            (str(event.get("details", {}).get("step_id")), str(event.get("details", {}).get("protocol_ref")))
+            for event in scenario_events
+            if event.get("kind") == "control" and event.get("details", {}).get("step_id")
+        }
+        if set(protocol_controls) - observed_protocol_controls:
+            evidence_failure = True
+            print(f"协议控制缺少逐步骤运行证据 [{directory.name}]: {sorted(set(protocol_controls) - observed_protocol_controls)}", file=sys.stderr)
+        partial_or_failed = reported_failure or reported_blocker
+        scenario_code = code or (1 if evidence_failure or partial_or_failed or not _pytest_junit_passed(business_junit) else 0)
         executions[directory.name] = {
             "status": "passed" if scenario_code == 0 else "failed",
             "exit_code": scenario_code,
-            "reason": "pytest 与运行证据均通过" if scenario_code == 0 else "pytest 失败或运行证据不完整",
+            "reason": (
+                "pytest 与逐步骤运行证据均通过" if scenario_code == 0 else
+                "场景仅部分执行" if reported_blocker and not reported_failure else
+                "业务结果失败" if reported_failure else
+                "pytest 失败或运行证据不完整"
+            ),
         }
         if scenario_code:
-            business_code = scenario_code
-            for remaining, _ in ready[index + 1:]:
-                executions[remaining.name] = {"status": "N/A", "exit_code": None, "reason": "前序业务场景失败后停止"}
-            break
+            business_code = business_code or scenario_code
     outcomes["business"] = {"status": "passed" if business_code == 0 else "failed", "exit_code": business_code}
 
     events, evidence_errors = _events(evidence_root, run_id, run_event_paths)
     write_definitions = {
-        directory.name: definition for directory, definition in ready
+        directory.name: definition for directory, definition in selected_scenarios
         if executions.get(directory.name, {}).get("status") in {"passed", "failed"}
         and any(
             event.get("kind") == "business_entered" and event.get("scenario") == directory.name
