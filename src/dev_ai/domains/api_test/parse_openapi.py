@@ -266,11 +266,13 @@ def extract(path: Path, document: dict[str, Any]) -> dict[str, Any]:
 
     endpoints.sort(key=lambda item: (item["path"], item["method"]))
     source_sha = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+    info = document.get("info") if isinstance(document.get("info"), dict) else {}
     return {
         "version": 1,
         "source": {
             "file": str(path),
             "spec_version": str(version),
+            "api_version": str(info.get("version", "")) if info.get("version") is not None else "",
             "sha256": source_sha,
         },
         "components": {

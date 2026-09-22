@@ -109,10 +109,42 @@ def design_gate_fixture(qa_root: Path, endpoint_id: str, rule_id: str = "DESIGN_
     (constraints / "design-rules.yaml").write_text(yaml.safe_dump({
         "version": 1,
         "source": "design",
-        "documents": [{"path": evidence["file"], "sha256": "0" * 64, "sections": 1}],
-        "rules": [{"id": rule_id, "endpoint_id": endpoint_id, "evidence": evidence}],
+        "documents": [{"path": evidence["file"], "sha256": "0" * 64, "sections": 1, "semantic_rules": 1, "parser_gap": False, "design_version": None}],
+        "parser_diagnostics": [],
+        "rules": [{
+            "id": rule_id, "method": "GET", "path": "/things", "title": rule_id, "content": rule_id,
+            "scenario": "success", "condition": "", "business_codes": [0], "http_statuses": [200],
+            "states": [], "transitions": [], "side_effects": [], "negative_constraints": [],
+            "idempotency": [], "retries": [], "concurrency": [], "external_failures": [],
+            "async": False, "acceptance_statuses": [], "final_statuses": [],
+            "assertions": [{"path": "$.data", "equals": {}}], "candidate_assertions": [],
+            "request": {}, "request_declared": True, "marker_errors": [], "section_line": 1,
+            "section_sha256": "0" * 64, "evidence": evidence, "endpoint_id": endpoint_id,
+            "evidence_level": "explicit", "derivation": "", "understanding": {
+                "preconditions": [], "request_meaning": [], "success_results": [], "business_errors": [],
+                "side_effects": [], "idempotency": [], "retries": [], "concurrency": [], "async": [],
+                "consistency": [], "negative_constraints": [],
+            }, "mapping_category": "exact", "matched_operation": "GET /things", "parameter_aliases": {},
+        }],
+        "understanding": [{
+            "rule_id": rule_id, "business_name": rule_id, "design_source": evidence, "design_summary": rule_id,
+            "candidate_http_method": "GET", "candidate_url_path": "/things", "matched_openapi_operation": "GET /things",
+            "preconditions": [], "request_meaning": [], "success_result": [], "state_changes": [],
+            "business_errors": [], "side_effects": [], "idempotency": [], "retries": [], "concurrency": [],
+            "async": [], "consistency": [], "negative_constraints": [], "candidate_assertions": [],
+            "evidence_level": "explicit", "derivation": "", "unknown": [], "can_generate": True,
+        }],
+        "mapping": {"items": [{"rule_id": rule_id, "category": "exact", "design_operation": "GET /things", "openapi_operation": "GET /things", "endpoint_id": endpoint_id, "parameter_aliases": {}}], "counts": {
+            "exact": 1, "parameter_alias": 0, "semantic_candidate": 0, "design_without_openapi": 0,
+            "openapi_without_design": 0, "multiple_candidates": 0,
+        }},
+        "flows": [], "flow_candidates": [],
         "exclusions": [],
         "manual_confirmations": [],
+        "understanding_status": "complete",
+        "design_fingerprint": "0" * 64,
+        "openapi_fingerprint": "",
+        "coverage": {"openapi_endpoints": 1, "documented_endpoints": 1, "excluded_endpoints": 0, "mapped_endpoints": 1},
     }, sort_keys=False), encoding="utf-8")
 
 

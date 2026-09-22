@@ -4,6 +4,7 @@ Install the single `seres-dev-ai` package. There is no domain-specific Python pa
 
 ```text
 dev-ai api-test init
+dev-ai api-test understand
 dev-ai api-test generate
 dev-ai api-test materialize
 dev-ai api-test check
@@ -20,11 +21,18 @@ dev-ai api-test scripts
 
 Use `--qa-root qa` when the QA root is not the default. `dev-ai schema api-test.<command>` is the source of truth for options. Pipeline output is a JSON envelope; an interactive terminal receives Markdown. Progress is written to stderr. Add `--full` only when complete diagnostics are needed.
 
-`init` and `generate` accept repeated `--design-root` and `--design-file`
-selectors. Generation is blocked until one unambiguous reviewed design set is
-selected and every OpenAPI operation is mapped or explicitly excluded.
+`init`, `understand`, and `generate` accept repeated `--design-root` and
+`--design-file` selectors. `understand` persists the design matrix and fails
+with concrete confirmations for unknown business facts. Generation is blocked
+until the matrix is complete and current for both the selected design files and
+the OpenAPI fingerprint; every OpenAPI operation must be mapped or explicitly
+excluded. Both understanding and generation write the categorized audit report
+to `qa/results/design-generation-report.json`.
+Early blockers such as a missing design source or invalid OpenAPI also create
+the report and record the concrete gate failure; they are not represented as a
+successful empty QA project.
 
-`init` writes `.dev-ai.lock.json`. Every later command rejects a different installed tool version. The API contract schema version in that lock is independent from the dev-ai release version.
+`init` writes `.dev-ai.lock.json`. Every later command rejects a different installed tool version. The API contract schema version in that lock is independent from the dev-ai release version; design-understanding and mapping fields use the current `api-test` schema exposed by `dev-ai version`.
 
 `scripts` does not synchronize project-local code. It reports the shared runtime
 by default and exposes `version-init`, `version-check`, and `version-complete`

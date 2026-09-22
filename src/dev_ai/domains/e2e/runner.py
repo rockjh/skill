@@ -138,7 +138,7 @@ def _events(
             if (
                 actual not in (expected, expected | {"error"})
                 or details.get("status") not in {"passed", "failed"}
-                or not _strings(details.get("resources"))
+                or not _strings(details.get("resources"), nonempty=False)
                 or (details.get("status") == "failed") != ("error" in details)
             ):
                 errors.append(_error(path, "evidence-restoration", "恢复证据结构或状态无效"))

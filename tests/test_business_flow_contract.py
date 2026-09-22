@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 from dev_ai.cli import console_main
 from dev_ai.core.schema import get_schema, validate_schema
@@ -43,8 +45,20 @@ class BusinessFlowContractTests(unittest.TestCase):
         module_map = root / "docs" / "business-flow" / "business-flow-modules.json"
         document = json.loads(module_map.read_text(encoding="utf-8"))
         document["confirmed"] = True
+        for review in document.get("entry_reviews", []):
+            review["status"] = "confirmed"
+            review["confirmed_by"] = "test reviewer"
+            review["trigger"] = "HTTP 客户端"
+            review["purpose"] = "读取资源列表"
+            review["input"] = "GET /resources 请求"
+            review["outcome"] = "返回资源列表或明确的业务错误"
+            review["failure"] = "资源缺失时返回 RESOURCE_NOT_FOUND；未确认的远端终态不作推断"
+            for step in review.get("steps", []):
+                if "代码中未确认" in str(step.get("text", "")):
+                    step["text"] = "进入资源查询处理"
         for module in document["modules"]:
             module["rationale"] = "入口围绕同一业务对象、路径和处理能力划分。"
+            module["responsibility"] = "资源查询与业务错误返回"
         module_map.write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8")
         return module_map
 
@@ -54,7 +68,7 @@ class BusinessFlowContractTests(unittest.TestCase):
             self.project(root)
             code, result = self.invoke("schema", "business-flow.generate")
             self.assertEqual(0, code)
-            self.assertEqual("2", result["data"]["schema_version"])
+            self.assertEqual("3", result["data"]["schema_version"])
             self.assertIn("--commit", result["data"]["options"])
             code, result = self.invoke("schema", "business-flow.discover")
             self.assertEqual(0, code)
@@ -64,7 +78,7 @@ class BusinessFlowContractTests(unittest.TestCase):
             self.assertIn("confirmed", result["data"]["properties"])
             code, result = self.invoke("schema", "business-flow.report")
             self.assertEqual(0, code)
-            self.assertEqual("2", result["data"]["schema_version"])
+            self.assertEqual("3", result["data"]["schema_version"])
 
             code, result = self.invoke("business-flow", "init", "--project", str(root))
             self.assertEqual(0, code, result)
@@ -97,10 +111,45 @@ class BusinessFlowContractTests(unittest.TestCase):
                 ("business-flow-modules.json", "business-flow.module-map"),
                 ("business-flow-index.json", "business-flow.index"),
                 ("business-flow-report.json", "business-flow.report"),
+                ("business-flow-ownership.json", "business-flow.ownership"),
+                ("business-flow-migrations.json", "business-flow.migrations"),
+                ("business-flow-comparison.json", "business-flow.comparison"),
+                ("business-flow-evidence-cache.json", "business-flow.evidence-cache"),
+                ("business-flow-dependency-graph.json", "business-flow.dependency-graph"),
             ):
                 value = json.loads((docs / name).read_text(encoding="utf-8"))
                 self.assertEqual([], validate_schema(get_schema(scope), value), name)
                 self.assertTrue(value["source_fingerprint"])
+
+    def test_markdown_comparison_reports_fact_drift_without_a_score(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.project(root)
+            self.initialize_and_confirm(root)
+            code, result = self.invoke("business-flow", "generate", "--project", str(root))
+            self.assertEqual(0, code, result)
+            document_path = root / "docs" / "business-flow" / "00-resources.md"
+            document = document_path.read_text(encoding="utf-8")
+            document_path.write_text(document.replace("读取资源列表", "旧版本规则"), encoding="utf-8")
+            source = root / "app.py"
+            source.write_text(source.read_text(encoding="utf-8").replace("'missing'", "'missing now'"), encoding="utf-8")
+            self.initialize_and_confirm(root)
+            code, result = self.invoke("business-flow", "generate", "--project", str(root))
+            self.assertEqual(0, code, result)
+            comparison = json.loads((root / "docs" / "business-flow" / "business-flow-comparison.json").read_text(encoding="utf-8"))
+            self.assertTrue(any(item["category"] == "prose" for item in comparison["semantic_diffs"]))
+            self.assertNotIn("score", comparison)
+
+    def test_writer_lock_rejects_overlapping_process_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.project(root)
+            docs = root / "docs" / "business-flow"
+            docs.mkdir(parents=True)
+            (docs / "business-flow-run.lock").write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+            code, result = self.invoke("business-flow", "init", "--project", str(root))
+            self.assertEqual(8, code, result)
+            self.assertIn("writer is active", result["error"]["message"])
 
     def test_missing_lock_is_a_gate_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -109,6 +158,16 @@ class BusinessFlowContractTests(unittest.TestCase):
             code, result = self.invoke("business-flow", "generate", "--project", str(root))
             self.assertEqual(8, code)
             self.assertEqual("GATE_FAILED", result["error"]["code"])
+
+    def test_protected_production_path_blocks_document_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "prod"
+            root.mkdir()
+            self.project(root)
+            code, result = self.invoke("business-flow", "init", "--project", str(root))
+            self.assertEqual(8, code, result)
+            self.assertEqual("GATE_FAILED", result["error"]["code"])
+            self.assertIn("protected production paths", result["error"]["message"])
 
     def test_non_business_git_change_only_updates_document_version(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -182,6 +241,46 @@ class BusinessFlowContractTests(unittest.TestCase):
             code, result = self.invoke("business-flow", "generate", "--project", str(root))
             self.assertEqual(0, code, result)
 
+    def test_critical_receiver_resolution_requires_structured_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "app.py").write_text(
+                "from fastapi import FastAPI\n"
+                "app = FastAPI()\n"
+                "@app.get('/resources')\n"
+                "def list_resources():\n"
+                "    client.save()\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            subprocess.run(["git", "add", "app.py"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "unknown receiver"], cwd=root, check=True)
+            self.initialize_and_confirm(root)
+            docs = root / "docs" / "business-flow"
+            module_map = docs / "business-flow-modules.json"
+            document = json.loads(module_map.read_text(encoding="utf-8"))
+            discovery = json.loads((docs / "business-flow-discovery.json").read_text(encoding="utf-8"))
+            finding = next(item for item in discovery["unresolved"] if "unknown receiver type" in item)
+            document["resolutions"] = [{
+                "finding": finding,
+                "resolution": "外部客户端类型由运行框架提供，远端实现不在源码范围内。",
+                "evidence": ["app.py:5"],
+            }]
+            module_map.write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8")
+            code, result = self.invoke("business-flow", "generate", "--project", str(root))
+            self.assertEqual(8, code, result)
+            self.assertIn("structured fields", result["error"]["message"])
+            document["resolutions"][0].update({
+                "path": ["app.py:5"],
+                "controls": ["外部客户端类型无法静态解析"],
+                "unknowns": ["远端实现和终态不可见"],
+            })
+            module_map.write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8")
+            code, result = self.invoke("business-flow", "generate", "--project", str(root))
+            self.assertEqual(0, code, result)
+
     def test_check_reads_markdown_and_rejects_missing_document(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -192,6 +291,35 @@ class BusinessFlowContractTests(unittest.TestCase):
             code, result = self.invoke("business-flow", "check", "--project", str(root))
             self.assertEqual(8, code, result)
             self.assertIn("00-resources.md", result["error"]["message"])
+
+    def test_check_requires_current_discovery_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.project(root)
+            self.initialize_and_confirm(root)
+            self.invoke("business-flow", "generate", "--project", str(root))
+            discovery = root / "docs" / "business-flow" / "business-flow-discovery.json"
+            discovery.unlink()
+            code, result = self.invoke("business-flow", "check", "--project", str(root))
+            self.assertEqual(8, code, result)
+            self.assertEqual("business-flow artifact is missing or stale: business-flow-discovery.json", result["error"]["message"])
+
+    def test_old_index_path_cannot_escape_docs_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.project(root)
+            self.initialize_and_confirm(root)
+            self.invoke("business-flow", "generate", "--project", str(root))
+            docs = root / "docs" / "business-flow"
+            outside = docs.parent / "outside.md"
+            outside.write_text("sentinel", encoding="utf-8")
+            index_path = docs / "business-flow-index.json"
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+            index["modules"][0]["file"] = "../outside.md"
+            index_path.write_text(json.dumps(index, ensure_ascii=False), encoding="utf-8")
+            code, result = self.invoke("business-flow", "generate", "--project", str(root))
+            self.assertEqual(0, code, result)
+            self.assertEqual("sentinel", outside.read_text(encoding="utf-8"))
 
     def test_caught_error_is_not_documented_and_markdown_is_redacted(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -237,8 +365,20 @@ class BusinessFlowContractTests(unittest.TestCase):
             module_map = root / "docs" / "business-flow" / "business-flow-modules.json"
             document = json.loads(module_map.read_text(encoding="utf-8"))
             document["confirmed"] = True
+            for review in document.get("entry_reviews", []):
+                review["status"] = "confirmed"
+                review["confirmed_by"] = "test reviewer"
+                review["trigger"] = "HTTP 客户端"
+                review["purpose"] = "读取资源列表"
+                review["input"] = "GET /resources 请求"
+                review["outcome"] = "返回资源列表或明确的业务错误"
+                review["failure"] = "资源缺失时返回 RESOURCE_NOT_FOUND；未确认的远端终态不作推断"
+                for step in review.get("steps", []):
+                    if "代码中未确认" in str(step.get("text", "")):
+                        step["text"] = "进入资源查询处理"
             for module in document["modules"]:
                 module["rationale"] = "入口围绕同一业务对象、路径和处理能力划分。"
+                module["responsibility"] = "资源查询与业务错误返回"
             module_map.write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8")
             code, result = self.invoke("business-flow", "update", "--project", str(root))
             self.assertEqual(0, code, result)
@@ -269,6 +409,67 @@ class BusinessFlowContractTests(unittest.TestCase):
             code, result = self.invoke("business-flow", "check", "--project", str(root))
             self.assertEqual(8, code, result)
             self.assertIn("markdown_missing_error_evidence", result["error"]["message"])
+
+    def test_check_rejects_diagram_control_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.project(root)
+            self.initialize_and_confirm(root)
+            self.invoke("business-flow", "generate", "--project", str(root))
+            document = root / "docs" / "business-flow" / "00-resources.md"
+            text = document.read_text(encoding="utf-8")
+            document.write_text(text.replace("alt RESOURCE_NOT_FOUND：", "opt RESOURCE_NOT_FOUND：", 1), encoding="utf-8")
+            code, result = self.invoke("business-flow", "check", "--project", str(root))
+            self.assertEqual(8, code, result)
+            self.assertIn("markdown_diagram_mismatches", result["error"]["message"])
+
+    def test_check_recomputes_report_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.project(root)
+            self.initialize_and_confirm(root)
+            code, result = self.invoke("business-flow", "generate", "--project", str(root))
+            self.assertEqual(0, code, result)
+            report_path = root / "docs" / "business-flow" / "business-flow-report.json"
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            report["entry_count"] += 1
+            report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+            code, result = self.invoke("business-flow", "check", "--project", str(root))
+            self.assertEqual(8, code, result)
+            self.assertIn("report_counts_match", result["error"]["message"])
+            self.assertIn("entry_count", result["error"]["message"])
+
+    def test_resume_records_validated_evidence_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.project(root)
+            self.initialize_and_confirm(root)
+            code, result = self.invoke("business-flow", "generate", "--project", str(root))
+            self.assertEqual(0, code, result)
+            with patch("dev_ai.domains.business_flow.cli.scan", side_effect=AssertionError("resume must use cached evidence")):
+                code, result = self.invoke("business-flow", "generate", "--project", str(root), "--resume")
+            self.assertEqual(0, code, result)
+            progress = json.loads(
+                (root / "docs" / "business-flow" / "business-flow-progress.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(progress["resumed"])
+            self.assertGreaterEqual(progress["cache_entries"], 1)
+
+    def test_resume_rejects_malformed_evidence_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.project(root)
+            self.initialize_and_confirm(root)
+            code, result = self.invoke("business-flow", "generate", "--project", str(root))
+            self.assertEqual(0, code, result)
+            cache = root / "docs" / "business-flow" / "business-flow-evidence-cache.json"
+            value = json.loads(cache.read_text(encoding="utf-8"))
+            value["source_lines"] = []
+            cache.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+            code, result = self.invoke("business-flow", "generate", "--project", str(root), "--resume")
+            self.assertEqual(8, code, result)
+            self.assertEqual("GATE_FAILED", result["error"]["code"])
+            self.assertIn("source_lines must be an object", result["error"]["message"])
 
     def test_discovery_covers_protocol_graphql_jobs_messages_and_cli_config(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

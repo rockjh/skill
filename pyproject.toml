@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "seres-dev-ai"
-version = "6.6.0"
+version = "6.7.0"
 description = "Shared runtime for SERES development AI skills"
 requires-python = ">=3.11"
 dependencies = ["PyYAML>=6", "pytest>=8"]

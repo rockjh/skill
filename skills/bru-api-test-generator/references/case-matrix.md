@@ -113,7 +113,7 @@ restoration/cleanup operation. A step named `fault-inject`, `inject-failure`,
 execution evidence. All referenced operations still require OpenAPI endpoints
 and design rules.
 
-Supported markers are `Rule ID`, `Scenario`, `Condition`, `Request`, `Async`, `HTTP status`, `Business code`, `State`, `State transition`, `Acceptance status`, `Final status`, `Side effect`, `Idempotency`, `Retry`, `Concurrency`, `External failure`, and `Assert`. Marker values use YAML scalar/container types. Every non-success branch and every endpoint with multiple rules needs an explicit one-line `Request: {...}` mapping whose structure agrees with OpenAPI.
+Supported markers are `Rule ID`, `Scenario`, `Condition`, `Request`, `Async`, `HTTP status`, `Business code`, `State`, `State transition`, `Acceptance status`, `Final status`, `Side effect`, `Idempotency`, `Retry`, `Concurrency`, `External failure`, and `Assert`. Marker values use YAML scalar/container types. Markers are an acceleration format, not a design requirement: prose, tables, code/curl blocks, ordered steps, and acceptance checklists are read into the design-understanding matrix first. Each extracted fact is tagged `explicit`, `derived`, or `unknown`, with a source quote and derivation. Every non-success branch and every endpoint with multiple rules needs an executable request mapping; if prose does not establish one, keep the candidate in pending confirmation instead of borrowing values from source or runtime.
 
 An asynchronous rule must declare both acceptance and final status and a
 bounded polling/reconciliation mechanism with an explicit termination policy.

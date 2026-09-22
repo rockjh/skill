@@ -244,9 +244,12 @@ it accepts either this endpoint-level form or per-case `scenarios` entries.
 
 Contract generation may seed transport/protocol cases from OpenAPI. Business
 logic entries are written only from `design-rules.yaml`; execution-support source
-must never add business rules. Every entry must cite a design rule ID, describe
-an observable condition, declare the documented HTTP/business result when
-known, and link at least one case. Missing design coverage is a blocker.
+must never add business rules. Every entry must cite a design rule ID, preserve
+its design quote, evidence level (`explicit` or `derived`), derivation, and
+business assertions, describe an observable condition, declare the documented
+HTTP/business result when known, and link at least one case. Missing design
+coverage is a blocker. `unknown` understanding entries stay in the pending
+confirmation report and are never converted into business expectations.
 
     version: 1
     module: system-user

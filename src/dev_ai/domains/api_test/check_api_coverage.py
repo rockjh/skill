@@ -294,10 +294,12 @@ def case_completion_errors(case: dict[str, Any]) -> list[str]:
 
 
 def _assertion_is_exact(assertion: Any) -> bool:
-    return isinstance(assertion, dict) and bool({
-        "equals", "eq", "contains", "matches", "length", "minimum", "maximum",
-        "equals_variable", "items", "item_type",
-    } & set(assertion))
+    return (
+        isinstance(assertion, dict) and bool({
+            "equals", "eq", "contains", "matches", "length", "minimum", "maximum",
+            "equals_variable", "items", "item_type", "is_null",
+        } & set(assertion))
+    ) or (isinstance(assertion, dict) and assertion.get("exists") is False)
 
 
 def success_assertion_errors(case: dict[str, Any]) -> list[str]:
@@ -522,6 +524,8 @@ def assertion_requirements(assertion: dict[str, Any]) -> list[tuple[str, list[st
             requirements.append((key, [f"{expression}: {operator} {rendered()}" for expression in expressions]))
     if assertion.get("exists") is True:
         requirements.append(("exists", [f"{expression}: exists" for expression in expressions]))
+    if assertion.get("exists") is False:
+        requirements.append(("not_exists", [f"{expression}: notExists" for expression in expressions]))
     type_operator = {
         "string": "isString", "number": "isNumber", "integer": "isNumber",
         "boolean": "isBoolean", "array": "isArray", "object": "isObject",

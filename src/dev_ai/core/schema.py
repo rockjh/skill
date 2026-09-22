@@ -7,9 +7,25 @@ from copy import deepcopy
 from typing import Any
 
 
-API_TEST_SCHEMA_VERSION = "5.9"
-BUSINESS_FLOW_SCHEMA_VERSION = "2"
-E2E_GATE_SCHEMA_VERSION = "7"
+API_TEST_SCHEMA_VERSION = "6.2"
+BUSINESS_FLOW_SCHEMA_VERSION = "3"
+E2E_GATE_SCHEMA_VERSION = "10"
+E2E_RUNTIME_CLASSIFICATIONS = (
+    "protocol_available",
+    "service_not_found",
+    "protocol_unknown",
+    "incomplete_protocol",
+    "authentication_missing",
+    "read_only_failed",
+    "environment_invalid",
+)
+E2E_RULE_STATUSES = (
+    "confirmed",
+    "manual_confirmation",
+    "conflict",
+    "not_applicable",
+    "missing_evidence",
+)
 
 E2E_SCENARIO_STATUSES = ("ready", "pending_environment", "contract_blocked")
 E2E_GENERATION_MODES = ("delegated", "main_agent", "sequential_degraded")
@@ -43,6 +59,8 @@ E2E_CANDIDATE_KINDS = (
     "mocks_and_faults",
     "dynamic_configuration",
     "existing_test_data",
+    "database_read",
+    "observability",
 )
 E2E_ORDERED_GATES = (
     "workspace_inventory",
@@ -71,6 +89,11 @@ E2E_RUN_STAGES = (
 COMMAND_SCHEMAS: dict[str, dict[str, Any]] = {
     "api-test.init": {
         "options": {"--qa-root": "path", "--design-root": "path[]", "--design-file": "path[]"}
+    },
+    "api-test.understand": {
+        "options": {
+            "--qa-root": "path", "--openapi": "path", "--design-root": "path[]", "--design-file": "path[]",
+        }
     },
     "api-test.generate": {
         "options": {
@@ -182,19 +205,19 @@ COMMAND_SCHEMAS: dict[str, dict[str, Any]] = {
     "e2e.init": {
         "options": {
             "--project": "path", "--design-root": "path[]", "--design-file": "path[]",
-            "--openapi-root": "path[]", "--openapi-file": "path[]",
+            "--openapi-root": "path[]", "--openapi-file": "path[]", "--runtime-url": "url[]", "--protocol-url": "url[]",
         }
     },
     "e2e.discover": {
         "options": {
             "--project": "path", "--design-root": "path[]", "--design-file": "path[]",
-            "--openapi-root": "path[]", "--openapi-file": "path[]",
+            "--openapi-root": "path[]", "--openapi-file": "path[]", "--runtime-url": "url[]", "--protocol-url": "url[]",
         }
     },
     "e2e.generate": {
         "options": {
             "--project": "path", "--design-root": "path[]", "--design-file": "path[]",
-            "--openapi-root": "path[]", "--openapi-file": "path[]",
+            "--openapi-root": "path[]", "--openapi-file": "path[]", "--runtime-url": "url[]", "--protocol-url": "url[]",
         }
     },
     "e2e.check": {
@@ -216,16 +239,16 @@ COMMAND_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "business-flow.init": {"options": {"--project": "path", "--docs-root": "path"}},
     "business-flow.discover": {
-        "options": {"--project": "path", "--docs-root": "path", "--commit": "string"}
+        "options": {"--project": "path", "--docs-root": "path", "--commit": "string", "--resume": "boolean"}
     },
     "business-flow.generate": {
         "options": {
-            "--project": "path", "--docs-root": "path", "--module": "string", "--commit": "string",
+            "--project": "path", "--docs-root": "path", "--module": "string", "--commit": "string", "--resume": "boolean",
         }
     },
     "business-flow.update": {
         "options": {
-            "--project": "path", "--docs-root": "path", "--module": "string", "--commit": "string",
+            "--project": "path", "--docs-root": "path", "--module": "string", "--commit": "string", "--resume": "boolean",
         }
     },
     "business-flow.check": {
@@ -263,6 +286,13 @@ def _control_schema(name: str) -> dict[str, Any]:
         "assessment": NONEMPTY_STRING,
         "evidence": STRING_LIST,
         "planned_use": STRING_LIST,
+        "component": NONEMPTY_STRING,
+        "trigger": NONEMPTY_STRING,
+        "impact": NONEMPTY_STRING,
+        "observation": NONEMPTY_STRING,
+        "isolation": NONEMPTY_STRING,
+        "cleanup": STRING_LIST,
+        "recovery": STRING_LIST,
     }
     if name == "database_control":
         operation_schema = _object(
@@ -344,6 +374,8 @@ def _candidate_schema() -> dict[str, Any]:
             "observation": NONEMPTY_STRING,
             "isolation": NONEMPTY_STRING,
             "cleanup": NONEMPTY_STRING,
+            "impact": NONEMPTY_STRING,
+            "recovery": NONEMPTY_STRING,
             "evidence": NONEMPTY_STRING_LIST,
         }
     )
@@ -372,6 +404,7 @@ SCENARIO_DOCUMENT_SCHEMA = _object(
                 "status": {"type": "string", "enum": list(E2E_SCENARIO_STATUSES)},
                 "actor": NONEMPTY_STRING,
                 "participants": STRING_LIST,
+                "context": {"type": "object", "additionalProperties": True},
             },
             ("id", "name", "status", "actor"),
         ),
@@ -476,6 +509,23 @@ SCENARIO_DOCUMENT_SCHEMA = _object(
                     "design_rule_id": NONEMPTY_STRING,
                     "protocol_ref": NONEMPTY_STRING,
                     "phase": {"type": "string", "enum": ["request", "message_acceptance", "processing", "final_business", "side_effect"]},
+            "async": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "trigger": NONEMPTY_STRING,
+                            "correlation_key": NONEMPTY_STRING,
+                            "expected_status": NONEMPTY_STRING,
+                            "acceptance_status": NONEMPTY_STRING,
+                            "final_status": NONEMPTY_STRING,
+                            "timeout_seconds": {"type": "number", "exclusiveMinimum": 0},
+                            "interval_seconds": {"type": "number", "exclusiveMinimum": 0},
+                            "retries": {"type": "integer", "minimum": 0},
+                            "repeat_detection": NONEMPTY_STRING,
+                            "final_failure": NONEMPTY_STRING,
+                        },
+                        "required": ["trigger", "correlation_key", "expected_status", "timeout_seconds", "interval_seconds", "retries", "repeat_detection", "final_failure"],
+                    },
                 },
                 ("id", "action", "control", "side_effect", "expect", "status", "status_reason", "evidence"),
             ),
@@ -711,6 +761,11 @@ WORKSPACE_DOCUMENT_SCHEMA = _object(
                         }
                     )
                 ),
+                "component_probes": _array({"type": "object", "additionalProperties": True}),
+                "protocol_candidates": _array({"type": "object", "additionalProperties": True}),
+                "protocol_sources": _array({"type": "object", "additionalProperties": True}),
+                "classifications": _array({"type": "string", "enum": list(E2E_RUNTIME_CLASSIFICATIONS)}),
+                "failure_details": _array({"type": "object", "additionalProperties": True}),
                 "configuration_checks": _array(
                     _object(
                         {
@@ -835,7 +890,7 @@ ENDPOINT_EVENT_SCHEMA = _object(
 RESTORATION_EVENT_SCHEMA = _object(
     {
         "status": {"type": "string", "enum": ["passed", "failed"]},
-        "resources": NONEMPTY_STRING_LIST,
+        "resources": STRING_LIST,
         "error": NONEMPTY_STRING,
     },
     ("status", "resources"),
@@ -919,7 +974,11 @@ REPORT_DESIGN_SCHEMA = _object({
 REPORT_PROTOCOL_SCHEMA = _object({
     "documents": _array(_object({
         "path": NONEMPTY_STRING, "sha256": NONEMPTY_STRING, "version": {"type": ["string", "null"]},
-    })),
+        "source_type": {"type": "string"}, "service": {"type": ["string", "null"]},
+        "url": {"type": ["string", "null"]}, "format": {"type": ["string", "null"]},
+        "fetched_at": {"type": ["string", "null"]}, "content_sha256": {"type": ["string", "null"]},
+        "user_confirmed": {"type": "boolean"},
+    }, ("path", "sha256", "version"))),
     "operations": _array(_object({
         "id": NONEMPTY_STRING, "kind": NONEMPTY_STRING, "method": {"type": ["string", "null"]},
         "path": {"type": ["string", "null"]}, "source": {"type": "object", "additionalProperties": True},
@@ -1021,12 +1080,21 @@ API_TEST_EVIDENCE_SCHEMA = _object({
     "line": {"type": "integer", "minimum": 1},
     "endpoint_scope": NONEMPTY_STRING_LIST,
     "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
-})
+    "quote": {"type": "string"},
+    "evidence_level": {"type": "string", "enum": ["explicit", "derived", "unknown"]},
+}, ("source_kind", "file", "symbol", "line", "endpoint_scope", "confidence"))
 API_TEST_DESIGN_DOCUMENT_SCHEMA = _object({
     "path": NONEMPTY_STRING,
     "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "sections": {"type": "integer", "minimum": 0},
-})
+    "understanding": {"type": "string", "enum": ["marker", "semantic", "unknown"]},
+    "semantic_rules": {"type": "integer", "minimum": 0},
+    "parser_gap": {"type": "boolean"},
+    "marker_operations": STRING_LIST,
+    "semantic_operations": STRING_LIST,
+    "semantic_only_operations": STRING_LIST,
+    "design_version": {"type": ["string", "null"]},
+}, ("path", "sha256", "sections", "semantic_rules", "parser_gap"))
 API_TEST_FLOW_STEP_SCHEMA = _object({
     "rule_id": NONEMPTY_STRING,
     "operation": NONEMPTY_STRING,
@@ -1038,15 +1106,19 @@ API_TEST_FLOW_STEP_SCHEMA = _object({
     },
     "uses": NONEMPTY_STRING_LIST,
     "assert_absent": {},
-}, ("rule_id", "operation"))
+    "business_assertions": _array({"type": "object", "additionalProperties": True}),
+}, ("rule_id", "operation", "business_assertions"))
 API_TEST_FLOW_SCHEMA = _object({
     "id": NONEMPTY_STRING,
     "mode": {"const": "sequential"},
     "source": {"const": "design"},
     "design_rule_ids": NONEMPTY_STRING_LIST,
     "steps": _array(API_TEST_FLOW_STEP_SCHEMA, minimum=2),
+    "business_assertions": _array({"type": "object", "additionalProperties": True}),
+    "data_transfer": _array({"type": "object", "additionalProperties": True}),
+    "final_status": {"type": "string"},
     "cleanup": NONEMPTY_STRING,
-}, ("id", "mode", "source", "design_rule_ids", "steps"))
+}, ("id", "mode", "source", "design_rule_ids", "steps", "business_assertions", "data_transfer", "final_status"))
 API_TEST_DESIGN_RULE_SCHEMA = _object(
     {
         "id": NONEMPTY_STRING,
@@ -1063,6 +1135,7 @@ API_TEST_DESIGN_RULE_SCHEMA = _object(
         "states": STRING_LIST,
         "transitions": STRING_LIST,
         "side_effects": STRING_LIST,
+        "negative_constraints": STRING_LIST,
         "idempotency": STRING_LIST,
         "retries": STRING_LIST,
         "concurrency": STRING_LIST,
@@ -1070,7 +1143,11 @@ API_TEST_DESIGN_RULE_SCHEMA = _object(
         "async": {"type": "boolean"},
         "acceptance_statuses": STRING_LIST,
         "final_statuses": STRING_LIST,
-        "assertions": _array(_object({"path": NONEMPTY_STRING, "equals": {}}, ("path", "equals"))),
+        "assertions": _array(_object({
+            "path": NONEMPTY_STRING, "equals": {}, "exists": {"type": "boolean"},
+            "is_null": {"type": "boolean"}, "contains": {}, "matches": {"type": "string"},
+        }, ("path",))),
+        "candidate_assertions": _array({"type": "object", "additionalProperties": True}),
         "request": {"type": ["object", "null"], "additionalProperties": True},
         "request_declared": {"type": "boolean"},
         "marker_errors": STRING_LIST,
@@ -1078,17 +1155,34 @@ API_TEST_DESIGN_RULE_SCHEMA = _object(
         "section_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "evidence": API_TEST_EVIDENCE_SCHEMA,
         "endpoint_id": {"type": ["string", "null"]},
+        "evidence_level": {"type": "string", "enum": ["explicit", "derived", "unknown"]},
+        "derivation": {"type": "string"},
+        "understanding": {"type": "object", "additionalProperties": True},
+        "mapping_category": {"type": "string", "enum": [
+            "exact", "parameter_alias", "semantic_candidate", "design_without_openapi", "multiple_candidates",
+        ]},
+        "matched_operation": {"type": ["string", "null"]},
+        "parameter_aliases": {"type": "object", "additionalProperties": {"type": "string"}},
         "manual_confirmation": _object({
             "required": {"const": True},
             "reasons": NONEMPTY_STRING_LIST,
-        }),
+            "related_interface": NONEMPTY_STRING,
+            "business_rule": NONEMPTY_STRING,
+            "design_quote": NONEMPTY_STRING,
+            "current_derivation": NONEMPTY_STRING,
+            "ambiguity": NONEMPTY_STRING,
+            "impact": NONEMPTY_STRING,
+            "options": NONEMPTY_STRING_LIST,
+        }, ("required", "reasons")),
     },
     (
         "id", "method", "path", "title", "content", "scenario", "condition", "business_codes",
         "http_statuses", "states", "transitions", "side_effects", "idempotency", "retries",
-        "concurrency", "external_failures", "async", "acceptance_statuses", "final_statuses",
+        "concurrency", "external_failures", "async", "acceptance_statuses", "final_statuses", "negative_constraints",
         "assertions", "request", "request_declared", "marker_errors", "section_line", "section_sha256",
         "evidence", "endpoint_id",
+        "evidence_level", "derivation", "understanding", "mapping_category", "matched_operation", "parameter_aliases",
+        "candidate_assertions",
     ),
 )
 API_TEST_DESIGN_RULES_SCHEMA: dict[str, Any] = {
@@ -1099,20 +1193,103 @@ API_TEST_DESIGN_RULES_SCHEMA: dict[str, Any] = {
         "version": {"const": 1},
         "source": {"const": "design"},
         "documents": _array(API_TEST_DESIGN_DOCUMENT_SCHEMA),
+        "parser_diagnostics": _array({"type": "object", "additionalProperties": True}),
         "rules": _array(API_TEST_DESIGN_RULE_SCHEMA),
         "flows": _array(API_TEST_FLOW_SCHEMA),
+        "flow_candidates": _array({"type": "object", "additionalProperties": True}),
         "exclusions": _array({"type": "object", "additionalProperties": True}),
         "manual_confirmations": _array(_object({
             "rule_id": NONEMPTY_STRING,
             "reasons": NONEMPTY_STRING_LIST,
             "evidence": API_TEST_EVIDENCE_SCHEMA,
-        })),
+            "related_interface": NONEMPTY_STRING,
+            "business_rule": NONEMPTY_STRING,
+            "design_quote": NONEMPTY_STRING,
+            "current_derivation": NONEMPTY_STRING,
+            "ambiguity": NONEMPTY_STRING,
+            "impact": NONEMPTY_STRING,
+            "options": NONEMPTY_STRING_LIST,
+        }, ("rule_id", "reasons", "evidence", "related_interface", "business_rule", "design_quote", "current_derivation", "ambiguity", "impact", "options"))),
         "coverage": _object({
             "openapi_endpoints": {"type": "integer", "minimum": 0},
             "documented_endpoints": {"type": "integer", "minimum": 0},
             "excluded_endpoints": {"type": "integer", "minimum": 0},
-        }),
-    }, ("version", "source", "documents", "rules", "flows", "exclusions", "manual_confirmations", "coverage")),
+            "mapped_endpoints": {"type": "integer", "minimum": 0},
+        }, ("openapi_endpoints", "documented_endpoints", "excluded_endpoints")),
+        "understanding": _array(_object({
+            "rule_id": NONEMPTY_STRING,
+            "business_name": NONEMPTY_STRING,
+            "design_source": API_TEST_EVIDENCE_SCHEMA,
+            "design_summary": {"type": "string"},
+            "candidate_http_method": {"type": ["string", "null"]},
+            "candidate_url_path": {"type": ["string", "null"]},
+            "matched_openapi_operation": {"type": ["string", "null"]},
+            "preconditions": {"type": "array", "items": {}},
+            "request_meaning": {"type": "array", "items": {}},
+            "success_result": {"type": "array", "items": {}},
+            "state_changes": {"type": "array", "items": {}},
+            "business_errors": {"type": "array", "items": {}},
+            "side_effects": {"type": "array", "items": {}},
+            "idempotency": {"type": "array", "items": {}},
+            "retries": {"type": "array", "items": {}},
+            "concurrency": {"type": "array", "items": {}},
+            "async": {"type": "array", "items": {}},
+            "consistency": {"type": "array", "items": {}},
+            "negative_constraints": {"type": "array", "items": {}},
+            "candidate_assertions": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+            "evidence_level": {"type": "string", "enum": ["explicit", "derived", "unknown"]},
+            "derivation": {"type": "string"},
+            "unknown": STRING_LIST,
+            "can_generate": {"type": "boolean"},
+        }, (
+            "rule_id", "business_name", "design_source", "design_summary", "candidate_http_method",
+            "candidate_url_path", "matched_openapi_operation", "preconditions", "request_meaning",
+            "success_result", "state_changes", "business_errors", "side_effects", "idempotency", "retries",
+            "concurrency", "async", "consistency", "negative_constraints", "candidate_assertions",
+            "evidence_level", "derivation", "unknown", "can_generate",
+        ))),
+        "mapping": _object({
+            "items": _array(_object({
+                "rule_id": {"type": ["string", "null"]},
+                "category": {"type": "string", "enum": ["exact", "parameter_alias", "semantic_candidate", "design_without_openapi", "openapi_without_design", "multiple_candidates"]},
+                "design_operation": {"type": ["string", "null"]},
+                "openapi_operation": {"type": ["string", "null"]},
+                "endpoint_id": {"type": ["string", "null"]},
+                "parameter_aliases": {"type": "object", "additionalProperties": {"type": "string"}},
+                "candidates": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+                "note": {"type": "string"},
+            }, ("category", "design_operation", "openapi_operation", "endpoint_id", "parameter_aliases"))),
+            "counts": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+        }, ("items", "counts")),
+        "understanding_status": {"type": "string", "enum": ["incomplete", "blocked", "complete"]},
+        "design_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "openapi_fingerprint": {"type": "string"},
+    }, ("version", "source", "documents", "parser_diagnostics", "rules", "flows", "flow_candidates", "exclusions", "manual_confirmations", "coverage", "understanding", "mapping", "understanding_status", "design_fingerprint", "openapi_fingerprint")),
+}
+API_TEST_DESIGN_REPORT_SCHEMA: dict[str, Any] = {
+    "schema_version": API_TEST_SCHEMA_VERSION,
+    "contract": "api-test.design-generation-report",
+    "path": "qa/results/design-generation-report.json",
+    "document": _object({
+        "version": {"const": 1},
+        "source": {"const": "design"},
+        "status": {"type": "string", "enum": ["complete", "blocked", "failed"]},
+        "execution": {"type": "string"},
+        "matrix_path": NONEMPTY_STRING,
+        "formal_tests": _array({"type": "object", "additionalProperties": True}),
+        "protocol_tests": _array({"type": "object", "additionalProperties": True}),
+        "pending_cases": _array({"type": "object", "additionalProperties": True}),
+        "pending_confirmations": _array({"type": "object", "additionalProperties": True}),
+        "pending_flow_candidates": _array({"type": "object", "additionalProperties": True}),
+        "unsupported": _array({"type": "object", "additionalProperties": True}),
+        "uncovered_mapping": _array({"type": "object", "additionalProperties": True}),
+        "unexecuted": _array({"type": "object", "additionalProperties": True}),
+        "gate_failures": STRING_LIST,
+    }, (
+        "version", "source", "status", "execution", "matrix_path", "formal_tests", "protocol_tests",
+        "pending_cases", "pending_confirmations", "pending_flow_candidates", "unsupported",
+        "uncovered_mapping", "unexecuted", "gate_failures",
+    )),
 }
 API_TEST_LOGIC_SCHEMA: dict[str, Any] = {
     "schema_version": API_TEST_SCHEMA_VERSION,
@@ -1126,6 +1303,8 @@ API_TEST_LOGIC_SCHEMA: dict[str, Any] = {
             "id": NONEMPTY_STRING,
             "status": {"const": "confirmed"},
             "source": {"const": "design"},
+            "endpoint_id": NONEMPTY_STRING,
+            "openapi_operation": NONEMPTY_STRING,
             "source_symbol": NONEMPTY_STRING,
             "condition": NONEMPTY_STRING,
             "expected_http_status": {"type": ["integer", "null"]},
@@ -1141,9 +1320,18 @@ API_TEST_LOGIC_SCHEMA: dict[str, Any] = {
             "acceptance_status": {"type": ["string", "null"]},
             "final_status": {"type": ["string", "null"]},
             "design_rule_id": NONEMPTY_STRING,
+            "evidence_level": {"type": "string", "enum": ["explicit", "derived", "unknown"]},
+            "evidence_quote": {"type": "string"},
+            "derivation": {"type": "string"},
+            "business_assertions": _array({"type": "object", "additionalProperties": True}),
             "evidence": _array(API_TEST_EVIDENCE_SCHEMA, minimum=1),
             "case_ids": NONEMPTY_STRING_LIST,
-        })),
+        }, (
+            "id", "status", "source", "endpoint_id", "openapi_operation", "source_symbol", "condition", "expected_http_status",
+            "expected_business_code", "expected_state", "transitions", "side_effects", "idempotency",
+            "retries", "concurrency", "external_failures", "async", "acceptance_status", "final_status",
+            "design_rule_id", "evidence_level", "evidence_quote", "derivation", "business_assertions", "evidence", "case_ids",
+        ))),
     }, ("version", "module", "logic")),
 }
 API_TEST_VALUE_RESOLUTION_SCHEMA: dict[str, Any] = {
@@ -1182,7 +1370,12 @@ API_TEST_VERSION_LOCK_SCHEMA: dict[str, Any] = {
                 "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
             })),
             "rule_count": {"type": "integer", "minimum": 0},
-        }),
+            "mapping_counts": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+            "unknown_count": {"type": "integer", "minimum": 0},
+            "understanding_status": {"type": "string", "enum": ["incomplete", "blocked", "complete"]},
+            "design_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "openapi_fingerprint": {"type": "string"},
+        }, ("sha256", "documents", "rule_count")),
     }, ("version", "status", "business")),
 }
 
@@ -1191,6 +1384,13 @@ E2E_INPUT_DOCUMENT_SCHEMA = _object({
     "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "version": {"type": ["string", "null"]},
     "sections": {"type": "integer", "minimum": 0},
+    "source_type": {"type": "string", "enum": ["file", "runtime_url", "user_url", "service_config", "source_definition"]},
+    "service": {"type": ["string", "null"]},
+    "url": {"type": ["string", "null"]},
+    "format": {"type": ["string", "null"]},
+    "fetched_at": {"type": ["string", "null"]},
+    "content_sha256": {"type": ["string", "null"]},
+    "user_confirmed": {"type": "boolean"},
 }, ("path", "sha256", "version"))
 E2E_EVIDENCE_SOURCE_SCHEMA = _object({
     "source_kind": {"type": "string", "enum": ["design", "protocol"]},
@@ -1204,6 +1404,8 @@ E2E_DESIGN_RULE_SCHEMA = _object({
     "title": NONEMPTY_STRING,
     "type": {"type": "string", "enum": ["cross_service", "business"]},
     "manual_confirmation": {"type": "boolean"},
+    "status": {"type": "string", "enum": list(E2E_RULE_STATUSES)},
+    "context": {"type": "object", "additionalProperties": True},
     "method": {"type": ["string", "null"]},
     "path": {"type": ["string", "null"]},
     "event": {"type": ["string", "null"]},
@@ -1239,7 +1441,13 @@ E2E_DESIGN_RULE_SCHEMA = _object({
     "section_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "protocol_refs": STRING_LIST,
     "source": E2E_EVIDENCE_SOURCE_SCHEMA,
-})
+}, (
+    "id", "title", "type", "manual_confirmation", "method", "path", "event", "task", "calls",
+    "participants", "states", "transitions", "acceptance_statuses", "final_statuses", "preconditions",
+    "business_codes", "exceptions", "branches", "assertions", "final_result", "side_effects",
+    "idempotency", "retries", "concurrency", "async_behavior", "cleanup", "recovery", "async",
+    "section", "line", "section_sha256", "protocol_refs", "source",
+))
 E2E_PROTOCOL_OPERATION_SCHEMA = _object({
     "id": NONEMPTY_STRING,
     "kind": {"type": "string", "enum": ["http", "message", "rpc", "graphql", "task"]},
@@ -1264,6 +1472,9 @@ E2E_PROTOCOL_OPERATION_SCHEMA = _object({
     "operation_type": {"type": "string", "enum": ["query", "mutation", "subscription"]},
     "arguments": _array({"type": "object", "additionalProperties": True}),
     "source": E2E_EVIDENCE_SOURCE_SCHEMA,
+    "sources": _array({"type": "object", "additionalProperties": True}),
+    "conflicts": _array({"type": "object", "additionalProperties": True}),
+    "merge_classification": {"type": "string", "enum": ["auto_merge", "supplement", "needs_manual_confirmation", "unusable"]},
 }, ("id", "kind", "source"))
 
 E2E_DESIGN_RULES_SCHEMA: dict[str, Any] = {
@@ -1285,19 +1496,31 @@ E2E_PROTOCOL_RULES_SCHEMA: dict[str, Any] = {
         "version": {"const": 1}, "source": {"const": "protocol"},
         "documents": _array(E2E_INPUT_DOCUMENT_SCHEMA, minimum=1),
         "operations": _array(E2E_PROTOCOL_OPERATION_SCHEMA, minimum=1),
+        "sources": _array({"type": "object", "additionalProperties": True}),
+        "conflicts": _array({"type": "object", "additionalProperties": True}),
+        "runtime_sources": _array({"type": "object", "additionalProperties": True}),
+        "runtime_errors": STRING_LIST,
+        "runtime_classifications": _array({"type": "string", "enum": list(E2E_RUNTIME_CLASSIFICATIONS)}),
+        "runtime_failure_details": _array({"type": "object", "additionalProperties": True}),
         "errors": STRING_LIST,
-    }),
+    }, ("version", "source", "documents", "operations", "sources", "conflicts", "errors")),
 }
 E2E_LOGIC_ITEM_SCHEMA = _object({
     "id": NONEMPTY_STRING, "source": {"const": "design"}, "design_rule_id": NONEMPTY_STRING,
     "title": NONEMPTY_STRING, "participants": STRING_LIST, "protocol_refs": STRING_LIST,
+    "status": {"type": "string", "enum": list(E2E_RULE_STATUSES)},
+    "context": {"type": "object", "additionalProperties": True},
     "preconditions": STRING_LIST, "states": STRING_LIST, "transitions": STRING_LIST,
     "branches": STRING_LIST, "exceptions": STRING_LIST, "assertions": STRING_LIST,
     "final_result": STRING_LIST, "side_effects": STRING_LIST, "idempotency": STRING_LIST,
     "retries": STRING_LIST, "concurrency": STRING_LIST, "async_behavior": STRING_LIST,
     "async": {"type": "boolean"}, "acceptance_status": {"type": ["string", "null"]},
     "final_status": {"type": ["string", "null"]}, "evidence": _array(E2E_EVIDENCE_SOURCE_SCHEMA, minimum=1),
-})
+}, (
+    "id", "source", "design_rule_id", "title", "participants", "protocol_refs", "preconditions", "states",
+    "transitions", "branches", "exceptions", "assertions", "final_result", "side_effects", "idempotency",
+    "retries", "concurrency", "async_behavior", "async", "acceptance_status", "final_status", "evidence",
+))
 E2E_LOGIC_SCHEMA: dict[str, Any] = {
     "schema_version": E2E_GATE_SCHEMA_VERSION,
     "contract": "e2e.logic",
@@ -1363,24 +1586,45 @@ E2E_SCENARIO_PLAN_SCHEMA: dict[str, Any] = {
         "scenarios": _array(_object({
             "id": NONEMPTY_STRING, "title": NONEMPTY_STRING, "participants": NONEMPTY_STRING_LIST,
             "design_rule_ids": NONEMPTY_STRING_LIST, "protocol_refs": NONEMPTY_STRING_LIST,
+            "status": {"type": "string", "enum": list(E2E_SCENARIO_STATUSES)},
+            "blockers": STRING_LIST,
+            "context": {"type": "object", "additionalProperties": True},
             "required_coverage": _object({
                 "preconditions": STRING_LIST, "transitions": STRING_LIST, "branches": STRING_LIST,
                 "exceptions": STRING_LIST, "final_result": STRING_LIST, "side_effects": STRING_LIST,
             }),
-        }), minimum=1),
+        }, ("id", "title", "participants", "design_rule_ids", "protocol_refs", "required_coverage")), minimum=1),
     }),
 }
 
 BUSINESS_FLOW_ERROR_SCHEMA = _object({
-    "code": NONEMPTY_STRING, "condition": NONEMPTY_STRING, "source": NONEMPTY_STRING,
-})
+    "code": NONEMPTY_STRING,
+    "condition": NONEMPTY_STRING,
+    "source": NONEMPTY_STRING,
+    "capture_boundary": NONEMPTY_STRING,
+    "propagation": NONEMPTY_STRING,
+    "consequence": NONEMPTY_STRING,
+    "phase": NONEMPTY_STRING,
+    "recovery": NONEMPTY_STRING,
+}, ("code", "condition", "source", "capture_boundary", "propagation", "consequence", "phase", "recovery"))
 BUSINESS_FLOW_BEHAVIOR_SCHEMA = _object({
     "kind": NONEMPTY_STRING, "statement": NONEMPTY_STRING, "source": NONEMPTY_STRING,
 })
+BUSINESS_FLOW_STEP_SCHEMA = _object({
+    "kind": {"enum": ["action", "alt", "else", "opt", "loop", "end"]},
+    "text": NONEMPTY_STRING, "source": NONEMPTY_STRING, "participant": NONEMPTY_STRING,
+})
+BUSINESS_FLOW_REVIEW_SCHEMA = _object({
+    "id": NONEMPTY_STRING, "trigger": NONEMPTY_STRING, "purpose": NONEMPTY_STRING,
+    "input": NONEMPTY_STRING, "outcome": NONEMPTY_STRING, "failure": NONEMPTY_STRING,
+    "status": {"type": "string", "enum": ["draft", "confirmed"]},
+    "confirmed_by": {"type": "string"},
+    "steps": _array(BUSINESS_FLOW_STEP_SCHEMA, minimum=1),
+}, ("id", "trigger", "purpose", "input", "outcome", "failure", "status", "confirmed_by", "steps"))
 
 BUSINESS_FLOW_DISCOVERY_SCHEMA: dict[str, Any] = _object(
     {
-        "schema_version": {"const": 2},
+        "schema_version": {"const": 3},
         "source_fingerprint": NONEMPTY_STRING,
         "effective_git": _object({
             "commit": NONEMPTY_STRING, "branch": NONEMPTY_STRING, "workspace_dirty": {"type": "boolean"},
@@ -1395,19 +1639,27 @@ BUSINESS_FLOW_DISCOVERY_SCHEMA: dict[str, Any] = _object(
             "non_business_candidate": {"type": "boolean"}, "core_capabilities": STRING_LIST,
             "errors": _array(BUSINESS_FLOW_ERROR_SCHEMA),
         })),
+        "candidate_entry_count": {"type": "integer", "minimum": 0},
+        "confirmed_binding_count": {"type": "integer", "minimum": 0},
+        "confirmed_handler_count": {"type": "integer", "minimum": 0},
         "unresolved": STRING_LIST,
     }
 )
 
 BUSINESS_FLOW_MODULE_MAP_SCHEMA: dict[str, Any] = _object(
     {
-        "schema_version": {"const": 2},
+        "schema_version": {"const": 3},
         "source_fingerprint": NONEMPTY_STRING,
         "effective_git": NONEMPTY_STRING,
         "confirmed": {"type": "boolean"},
+        "entry_reviews": _array(BUSINESS_FLOW_REVIEW_SCHEMA),
+        "migrations": _array(_object({
+            "from": NONEMPTY_STRING, "to": NONEMPTY_STRING, "reason": NONEMPTY_STRING,
+        })),
         "resolutions": _array(_object({
             "finding": NONEMPTY_STRING, "resolution": NONEMPTY_STRING, "evidence": NONEMPTY_STRING_LIST,
-        })),
+            "path": STRING_LIST, "controls": STRING_LIST, "unknowns": STRING_LIST,
+        }, ("finding", "resolution", "evidence"))),
         "entry_overrides": _array(_object({
             "id": NONEMPTY_STRING, "type": NONEMPTY_STRING, "identifier": NONEMPTY_STRING,
             "handler": NONEMPTY_STRING, "caller": NONEMPTY_STRING,
@@ -1425,14 +1677,15 @@ BUSINESS_FLOW_MODULE_MAP_SCHEMA: dict[str, Any] = _object(
         })),
         "modules": _array(_object({
             "name": NONEMPTY_STRING, "display_name": NONEMPTY_STRING, "rationale": NONEMPTY_STRING,
-            "entry_ids": STRING_LIST,
+            "file": NONEMPTY_STRING, "responsibility": NONEMPTY_STRING, "objects": STRING_LIST,
+            "partners": STRING_LIST, "questions": STRING_LIST, "entry_ids": STRING_LIST,
         })),
     }
 )
 
 BUSINESS_FLOW_INDEX_SCHEMA: dict[str, Any] = _object(
     {
-        "schema_version": {"const": 2},
+        "schema_version": {"const": 3},
         "source_fingerprint": NONEMPTY_STRING,
         "effective_git": _object({
             "commit": NONEMPTY_STRING,
@@ -1448,6 +1701,7 @@ BUSINESS_FLOW_INDEX_SCHEMA: dict[str, Any] = _object(
             "name": NONEMPTY_STRING, "file": NONEMPTY_STRING, "rationale": NONEMPTY_STRING,
             "entry_ids": STRING_LIST,
         })),
+        "migrations": BUSINESS_FLOW_MODULE_MAP_SCHEMA["properties"]["migrations"],
         "entries": _array(_object({
             "id": NONEMPTY_STRING, "type": NONEMPTY_STRING, "identifier": NONEMPTY_STRING,
             "handler": NONEMPTY_STRING, "module": NONEMPTY_STRING, "source": NONEMPTY_STRING,
@@ -1455,6 +1709,7 @@ BUSINESS_FLOW_INDEX_SCHEMA: dict[str, Any] = _object(
             "error_codes": STRING_LIST,
             "errors": _array(BUSINESS_FLOW_ERROR_SCHEMA),
             "behaviors": _array(BUSINESS_FLOW_BEHAVIOR_SCHEMA),
+            "review": BUSINESS_FLOW_REVIEW_SCHEMA,
         })),
         "counts": _object({
             "entries": {"type": "integer", "minimum": 0},
@@ -1468,7 +1723,7 @@ BUSINESS_FLOW_INDEX_SCHEMA: dict[str, Any] = _object(
 
 BUSINESS_FLOW_REPORT_SCHEMA: dict[str, Any] = _object(
     {
-        "schema_version": {"const": 2},
+        "schema_version": {"const": 3},
         "source_fingerprint": NONEMPTY_STRING,
         "effective_git": BUSINESS_FLOW_INDEX_SCHEMA["properties"]["effective_git"],
         "project": NONEMPTY_STRING,
@@ -1483,6 +1738,12 @@ BUSINESS_FLOW_REPORT_SCHEMA: dict[str, Any] = _object(
         "other_entry_count": {"type": "integer", "minimum": 0},
         "active_error_code_count": {"type": "integer", "minimum": 0},
         "entry_count": {"type": "integer", "minimum": 0},
+        "candidate_entry_count": {"type": "integer", "minimum": 0},
+        "confirmed_binding_count": {"type": "integer", "minimum": 0},
+        "confirmed_handler_count": {"type": "integer", "minimum": 0},
+        "completed_entry_count": {"type": "integer", "minimum": 0},
+        "excluded_entry_count": {"type": "integer", "minimum": 0},
+        "pending_review_count": {"type": "integer", "minimum": 0},
         "added_entries": STRING_LIST,
         "updated_entries": STRING_LIST,
         "deleted_entries": STRING_LIST,
@@ -1513,11 +1774,90 @@ BUSINESS_FLOW_REPORT_SCHEMA: dict[str, Any] = _object(
             "markdown_missing_error_evidence": STRING_LIST,
             "markdown_stale_error_evidence": STRING_LIST,
             "markdown_diagram_mismatches": STRING_LIST,
+            "markdown_fact_mismatches": STRING_LIST,
             "markdown_version_mismatches": STRING_LIST,
         }),
         "index_path": NONEMPTY_STRING,
     }
 )
+
+# Auxiliary artifacts are deliberately small contracts rather than opaque JSON
+# blobs.  They let ``check`` detect stale or truncated supporting evidence too.
+BUSINESS_FLOW_OWNERSHIP_SCHEMA: dict[str, Any] = _object({
+    "schema_version": {"const": 3},
+    "source_fingerprint": NONEMPTY_STRING,
+    "confirmed": {"type": "boolean"},
+    "entries": _array(_object({
+        "id": NONEMPTY_STRING, "module": NONEMPTY_STRING, "file": NONEMPTY_STRING,
+    })),
+})
+
+BUSINESS_FLOW_MIGRATIONS_SCHEMA: dict[str, Any] = _object({
+    "schema_version": {"const": 3},
+    "source_fingerprint": NONEMPTY_STRING,
+    "migrations": BUSINESS_FLOW_MODULE_MAP_SCHEMA["properties"]["migrations"],
+})
+
+BUSINESS_FLOW_COMPARISON_SCHEMA: dict[str, Any] = _object({
+    "schema_version": {"const": 3},
+    "source_fingerprint": NONEMPTY_STRING,
+    "comparison": NONEMPTY_STRING,
+    "entry_alignment": _object({
+        "added": STRING_LIST, "updated": STRING_LIST, "deleted": STRING_LIST,
+    }),
+    "version_only_documents": STRING_LIST,
+    "business_changed_documents": STRING_LIST,
+    "changed_paths": STRING_LIST,
+    "comparison_error": {"type": ["string", "null"]},
+    "fact_diffs": _array(_object({"id": NONEMPTY_STRING, "changes": STRING_LIST})),
+    "semantic_diffs": _array(_object({
+        "id": NONEMPTY_STRING,
+        "category": NONEMPTY_STRING,
+        "status": {"type": "string", "enum": ["added", "missing", "contradictory", "unknown"]},
+        "old": STRING_LIST,
+        "new": STRING_LIST,
+        "reason": NONEMPTY_STRING,
+    })),
+})
+
+BUSINESS_FLOW_EVIDENCE_CACHE_SCHEMA: dict[str, Any] = _object({
+    "schema_version": {"const": 3},
+    "source_fingerprint": NONEMPTY_STRING,
+    "root": NONEMPTY_STRING,
+    "git": {"type": "object", "additionalProperties": True},
+    "languages": STRING_LIST,
+    "frameworks": STRING_LIST,
+    "files": STRING_LIST,
+    "source_lines": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+    "unresolved": STRING_LIST,
+    "exclusions": STRING_LIST,
+    "candidate_entry_count": {"type": "integer", "minimum": 0},
+    "confirmed_binding_count": {"type": "integer", "minimum": 0},
+    "confirmed_handler_count": {"type": "integer", "minimum": 0},
+    "entries": {"type": "object", "additionalProperties": True},
+})
+
+BUSINESS_FLOW_DEPENDENCY_GRAPH_SCHEMA: dict[str, Any] = _object({
+    "schema_version": {"const": 3},
+    "source_fingerprint": NONEMPTY_STRING,
+    "nodes": _array(_object({"entry": NONEMPTY_STRING, "functions": STRING_LIST})),
+    "shared_sources": STRING_LIST,
+})
+
+BUSINESS_FLOW_PROGRESS_SCHEMA: dict[str, Any] = _object({
+    "schema_version": {"const": 3},
+    "run_id": NONEMPTY_STRING,
+    "run_handle": NONEMPTY_STRING,
+    "phase": NONEMPTY_STRING,
+    "stage": NONEMPTY_STRING,
+    "status": {"type": "string", "enum": ["running", "completed", "failed"]},
+    "source_fingerprint": {"type": "string"},
+    "updated_at": NONEMPTY_STRING,
+    "error": {"type": ["string", "null"]},
+    "failure_log": {"type": ["string", "null"]},
+    "resumed": {"type": "boolean"},
+    "cache_entries": {"type": "integer", "minimum": 0},
+})
 
 BUSINESS_FLOW_DISCOVERY_SCHEMA["schema_version"] = BUSINESS_FLOW_SCHEMA_VERSION
 BUSINESS_FLOW_DISCOVERY_SCHEMA["contract"] = "business-flow.discovery"
@@ -1527,9 +1867,25 @@ BUSINESS_FLOW_INDEX_SCHEMA["schema_version"] = BUSINESS_FLOW_SCHEMA_VERSION
 BUSINESS_FLOW_INDEX_SCHEMA["contract"] = "business-flow.index"
 BUSINESS_FLOW_REPORT_SCHEMA["schema_version"] = BUSINESS_FLOW_SCHEMA_VERSION
 BUSINESS_FLOW_REPORT_SCHEMA["contract"] = "business-flow.report"
+for _schema in (
+    BUSINESS_FLOW_OWNERSHIP_SCHEMA,
+    BUSINESS_FLOW_MIGRATIONS_SCHEMA,
+    BUSINESS_FLOW_COMPARISON_SCHEMA,
+    BUSINESS_FLOW_EVIDENCE_CACHE_SCHEMA,
+    BUSINESS_FLOW_DEPENDENCY_GRAPH_SCHEMA,
+    BUSINESS_FLOW_PROGRESS_SCHEMA,
+):
+    _schema["schema_version"] = BUSINESS_FLOW_SCHEMA_VERSION
+BUSINESS_FLOW_OWNERSHIP_SCHEMA["contract"] = "business-flow.ownership"
+BUSINESS_FLOW_MIGRATIONS_SCHEMA["contract"] = "business-flow.migrations"
+BUSINESS_FLOW_COMPARISON_SCHEMA["contract"] = "business-flow.comparison"
+BUSINESS_FLOW_EVIDENCE_CACHE_SCHEMA["contract"] = "business-flow.evidence-cache"
+BUSINESS_FLOW_DEPENDENCY_GRAPH_SCHEMA["contract"] = "business-flow.dependency-graph"
+BUSINESS_FLOW_PROGRESS_SCHEMA["contract"] = "business-flow.progress"
 
 CONTRACT_SCHEMAS = {
     "api-test.design-rules": API_TEST_DESIGN_RULES_SCHEMA,
+    "api-test.design-generation-report": API_TEST_DESIGN_REPORT_SCHEMA,
     "api-test.logic": API_TEST_LOGIC_SCHEMA,
     "api-test.value-resolution": API_TEST_VALUE_RESOLUTION_SCHEMA,
     "api-test.version-lock": API_TEST_VERSION_LOCK_SCHEMA,
@@ -1537,6 +1893,12 @@ CONTRACT_SCHEMAS = {
     "business-flow.module-map": BUSINESS_FLOW_MODULE_MAP_SCHEMA,
     "business-flow.index": BUSINESS_FLOW_INDEX_SCHEMA,
     "business-flow.report": BUSINESS_FLOW_REPORT_SCHEMA,
+    "business-flow.ownership": BUSINESS_FLOW_OWNERSHIP_SCHEMA,
+    "business-flow.migrations": BUSINESS_FLOW_MIGRATIONS_SCHEMA,
+    "business-flow.comparison": BUSINESS_FLOW_COMPARISON_SCHEMA,
+    "business-flow.evidence-cache": BUSINESS_FLOW_EVIDENCE_CACHE_SCHEMA,
+    "business-flow.dependency-graph": BUSINESS_FLOW_DEPENDENCY_GRAPH_SCHEMA,
+    "business-flow.progress": BUSINESS_FLOW_PROGRESS_SCHEMA,
     "e2e.scenario": SCENARIO_SCHEMA,
     "e2e.workspace": WORKSPACE_SCHEMA,
     "e2e.config": CONFIG_SCHEMA,

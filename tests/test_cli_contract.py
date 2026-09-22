@@ -25,6 +25,33 @@ class CliContractTests(unittest.TestCase):
         self.assertIn("--openapi", result["data"]["options"])
         self.assertNotIn("domains", result["data"])
 
+    def test_design_understanding_command_is_registered_and_persisted(self) -> None:
+        code, schema = self.invoke("schema", "api-test.understand")
+        self.assertEqual(0, code, schema)
+        self.assertIn("--openapi", schema["data"]["options"])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            qa_root = root / "qa"
+            design = root / "design.md"
+            design.write_text("POST /things returns status SUCCESS.", encoding="utf-8")
+            spec = root / "openapi.json"
+            spec.write_text(json.dumps({
+                "openapi": "3.0.0",
+                "paths": {"/things": {"post": {"responses": {"200": {"description": "ok"}}}}},
+            }), encoding="utf-8")
+            code, initialized = self.invoke("api-test", "init", "--qa-root", str(qa_root), "--design-file", str(design))
+            self.assertEqual(0, code, initialized)
+            code, understood = self.invoke(
+                "api-test", "understand", "--qa-root", str(qa_root), "--openapi", str(spec), "--design-file", str(design),
+            )
+            self.assertEqual(0, code, understood)
+            self.assertTrue((qa_root / "constraints" / "design-rules.yaml").is_file())
+            self.assertTrue(understood["ok"])
+            self.assertEqual(
+                str((qa_root / "results" / "design-generation-report.json").resolve()),
+                understood["artifact_path"],
+            )
+
     def test_mock_data_commands_have_scoped_multi_module_contracts(self) -> None:
         code, generate = self.invoke("schema", "api-test.mock-data-generate")
         self.assertEqual(0, code)

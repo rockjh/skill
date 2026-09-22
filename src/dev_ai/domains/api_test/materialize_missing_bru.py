@@ -291,6 +291,8 @@ def append_assertion(lines: list[str], assertion: dict[str, Any]) -> None:
         lines.append(f"  {expression}: eq {json_value(assertion['eq'])}")
     if assertion.get("exists") is True:
         lines.append(f"  {expression}: exists")
+    if assertion.get("exists") is False:
+        lines.append(f"  {expression}: notExists")
     if "contains" in assertion:
         lines.append(f"  {expression}: contains {json_value(assertion['contains'])}")
     if "matches" in assertion:

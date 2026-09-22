@@ -268,6 +268,16 @@ class ConstraintGateTests(unittest.TestCase):
             self.assertTrue(any("[DESIGN-001]" in error and "must come from design" in error for error in errors), errors)
             self.assertTrue(any("[DESIGN-001]" in error and "non-design evidence" in error for error in errors), errors)
 
+    def test_design_gate_requires_logic_openapi_traceability(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, constraints, qa_root, module = generated_project(Path(directory))
+            logic_path = module / "logic.yaml"
+            document = yaml.safe_load(logic_path.read_text(encoding="utf-8"))
+            document["logic"][0].pop("openapi_operation")
+            logic_path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+            errors = constraints.validate_stage(qa_root, "generation")
+            self.assertTrue(any("must reference OpenAPI operation" in error for error in errors), errors)
+
     def test_generated_design_artifacts_match_scoped_schemas(self):
         from dev_ai.core.schema import get_schema, validate_schema
 
@@ -307,6 +317,8 @@ class ConstraintGateTests(unittest.TestCase):
             self.assertFalse(business["review_required"])
             self.assertNotIn("manual_confirmation", business)
             self.assertEqual({item["design_rule_id"] for item in logic}, {"THINGS_LIST_OK", "THINGS_LIST_BUSY"})
+            self.assertTrue(all(item["endpoint_id"] == business["endpoint_id"] for item in logic))
+            self.assertTrue(all(item["openapi_operation"] == "GET /things" for item in logic))
 
     def test_design_http_status_must_exist_in_openapi_responses(self):
         design_rules = load_script("design_rules")
@@ -541,7 +553,9 @@ class ConstraintGateTests(unittest.TestCase):
             self.assertEqual(cli.generate_command([
                 "--qa-root", str(root / "qa"), "--openapi", str(spec),
             ]), 2)
-            self.assertFalse((root / "qa").exists())
+            report = json.loads((root / "qa" / "results" / "design-generation-report.json").read_text(encoding="utf-8"))
+            self.assertEqual("blocked", report["status"])
+            self.assertIn("no design source", report["gate_failures"])
 
     def test_all_mandatory_rules_are_enabled_and_each_rejects_stage_reduction(self):
         constraints = load_script("qa_constraints")

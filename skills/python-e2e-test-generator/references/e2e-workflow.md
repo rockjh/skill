@@ -54,16 +54,16 @@ readiness:
 preconditions:
   - <design-defined-precondition>
 
-# 可构造性：每个前置和步骤都完整评估八类候选路径。
+# 可构造性：每个前置和步骤都完整评估 schema 定义的候选路径。
 constructability:
   preconditions:
     - id: <design-defined-precondition>
       data_ownership: <test_owned|environment_owned|not_data>
       constructible: true
-      candidates: <eight-candidate-matrix-from-dev-ai-schema>
+      candidates: <candidate-matrix-from-dev-ai-schema>
   steps:
     - step_id: <step-id>
-      candidates: <eight-candidate-matrix-from-dev-ai-schema>
+      candidates: <candidate-matrix-from-dev-ai-schema>
 
 # 运行依赖：类型和 ID 均来自工作区发现，不限定具体技术。
 integrations:
@@ -192,12 +192,12 @@ Schema rules:
 - `meta` contains non-empty `id`, `name`, `status`, and `actor`. `id` matches `[A-Z][A-Z0-9_]+`; `status` is `ready`, `pending_environment`, or `contract_blocked`.
 - `generation` contains `mode`, `owner`, `write_scope`, and nullable `degradation_reason`, following the delegation rules in [discovery-and-control-policy.md](discovery-and-control-policy.md).
 - `readiness.source_contract` and `readiness.safe_control` are `confirmed` or `blocked`; `runtime_configuration` and `test_data` are `confirmed` or `missing`. `blockers` is a unique list of non-sensitive references. Pending blockers use exact canonical `config:`, `credential:`, `connection:`, or `business_data:` environment-variable references derived from the active configuration path and must equal the real missing set; authorization is forbidden here. Contract blockers use source-bound `control:<category>` or `contract:<repository>#<anchor>` values.
-- `preconditions` is a non-empty unique list of design-defined statements. `constructability` maps every precondition and step in order and evaluates exactly `public_api`, `test_or_admin_api`, `database_control`, `messages`, `scheduled_jobs`, `mocks_and_faults`, `dynamic_configuration`, and `existing_test_data`. Each candidate records status, component, consumer source, control, side effect, real trigger, observation, isolation, cleanup, and source/runtime evidence. Candidate status is `usable`, `unusable`, or `not_found`; `not_applicable` cannot close the analysis.
+- `preconditions` is a non-empty unique list of design-defined statements. `constructability` maps every precondition and step in order and evaluates exactly the candidate kinds exposed by `dev-ai schema e2e.scenario`: `public_api`, `test_or_admin_api`, `database_control`, `messages`, `scheduled_jobs`, `mocks_and_faults`, `dynamic_configuration`, `existing_test_data`, `database_read`, and `observability`. Each candidate records status, component, consumer source, control, side effect, real trigger, observation, isolation, cleanup, and source/runtime evidence. Candidate status is `usable`, `unusable`, or `not_found`; `not_applicable` cannot close the analysis.
 - A constructible `test_owned` precondition has a usable controlled construction path and cannot be reported as missing environment data. Every usable write candidate maps to declared isolation and cleanup/restoration symbols.
 - `integrations.services` is a unique list of discovery service IDs. `components` contains unique `id`, discovered `type`, and boolean `required`; every item resolves to `discovery/workspace.yaml`.
 - `controls` contains exactly the categories defined by the discovery policy plus `decision`. Capability entries have exact non-empty `assessment`, `status`, `evidence`, and `planned_use`; source evidence must match the control's semantic category. `observability` also has `correlation_keys`, `business_evidence`, and `recovery`, which exactly equal the isolation keys, all step expectations, and all cleanup actions/verifications. `database_control.safety` is null when unused and otherwise retains the single-operation summary fields and adds a non-empty ordered `operations` list. Every operation has a unique ID, backward-only dependencies, source consumer, owned exact selector, `expected_rows: 1`, snapshot, mutation verification, restoration, and restoration verification symbols.
 - `isolation` contains exactly `namespace`, `correlation_keys`, `owned_resources`, `mutable_controls`, and `serial_lock`, which must be null. Every owned resource contains exact `kind`, `identity`, `cleanup`, `restore`, and `verify` symbols, all mapped into the cleanup contract. Every mutable control is also an owned resource identity. A write scenario has at least one owned resource, and every cross-scenario collision fails.
-- Steps have exact `id`, `action`, `control`, `side_effect`, `expect`, `status`, `status_reason`, `evidence`, `design_rule_id`, optional `protocol_ref`, optional async `phase`, and optional `data_ref`. Every business expectation traces to `design_rule_id`; every HTTP/RPC/message/task call traces to `protocol_ref`. IDs are unique; `side_effect` is `none`, `read`, or `write`. Static statuses are `executable`, `environment_missing`, `authorization_missing`, `control_gap`, or `product_gap`; `runtime_failure` is emitted only as runtime evidence. Executable/environment/authorization states require a source-confirmed usable execution candidate. Control/product gaps require all eight candidates to be closed by evidence.
+- Steps have exact `id`, `action`, `control`, `side_effect`, `expect`, `status`, `status_reason`, `evidence`, `design_rule_id`, optional `protocol_ref`, optional async `phase`, and optional `data_ref`. Every business expectation traces to `design_rule_id`; every HTTP/RPC/message/task call traces to `protocol_ref`. IDs are unique; `side_effect` is `none`, `read`, or `write`. Static statuses are `executable`, `environment_missing`, `authorization_missing`, `control_gap`, or `product_gap`; `runtime_failure` is emitted only as runtime evidence. Executable/environment/authorization states require a source-confirmed usable execution candidate. Control/product gaps require every candidate kind to be closed by evidence.
 - `data_ref`, when present, has exact form `业务数据.json#/<pointer>` and resolves by RFC 6901 only after selecting the active environment.
 - Every resolved `data_ref` subtree includes at least one protocol-valid non-placeholder literal. Environment placeholders are limited to pre-existing environment-owned data; scenario-owned unique strings are generated at runtime with `secrets` or `uuid` under protocol-defined format constraints.
 - `cleanup` contains non-empty `strategy`, unique `actions`, and unique `verifies`. Cleanup is source-confirmed, idempotent, and guaranteed by `finally`, a finalizer, `ExitStack`, or a context manager.

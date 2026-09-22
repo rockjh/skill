@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ast
 import configparser
+from functools import lru_cache
+import hashlib
 import http.client
 import ipaddress
 import json
@@ -13,6 +15,7 @@ import socket
 import subprocess
 import tomllib
 import urllib.parse
+from datetime import datetime, timezone
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -45,6 +48,7 @@ PROTOCOL_DIR_NAMES = (
     ("docs", "接口设计"),
 )
 PROTOCOL_SUFFIXES = {".json", ".yaml", ".yml", ".proto", ".graphql", ".graphqls"}
+SOURCE_PROTOCOL_SUFFIXES = {".py", ".java", ".kt", ".ts", ".tsx", ".js", ".jsx", ".go", ".cs"}
 INSTRUCTION_NAMES = ("AGENTS.md", "README.md", "README", "README.txt", "E2E_PLAN.md")
 
 
@@ -185,7 +189,7 @@ def discover_protocols(
     try:
         document = yaml.safe_load(workspace.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, yaml.YAMLError):
-        return discovery
+        document = {}
     services = document.get("configuration", {}).get("services", []) if isinstance(document, dict) else []
     configured: list[Path] = []
     for service in services if isinstance(services, list) else []:
@@ -197,12 +201,190 @@ def discover_protocols(
         if path.is_file() and path.suffix.casefold() in PROTOCOL_SUFFIXES:
             configured.append(path.resolve())
     if not configured:
+        roots_to_scan = [project_root, *_workspace_repository_roots(project_root)]
+        source_files = [
+            path.resolve()
+            for root in roots_to_scan
+            if root.is_dir()
+            for path in root.rglob("*")
+            if path.is_file()
+            and path.suffix.casefold() in {".proto", ".graphql", ".graphqls", *SOURCE_PROTOCOL_SUFFIXES}
+            and not any(part in SKIP_DIRS for part in path.parts)
+        ]
+        if source_files:
+            return DocumentDiscovery(tuple(dict.fromkeys([*discovery.files, *sorted(source_files)])), discovery.candidates, discovery.hints)
         return discovery
     return DocumentDiscovery(
         tuple(dict.fromkeys([*discovery.files, *configured])),
         tuple(dict.fromkeys([*discovery.candidates, *(path.parent for path in configured)])),
         discovery.hints,
     )
+
+
+RUNTIME_PROTOCOL_PATHS = (
+    "/openapi.json",
+    "/openapi.yaml",
+    "/openapi.yml",
+    "/v3/api-docs",
+    "/swagger.json",
+    "/swagger/v1/swagger.json",
+    "/asyncapi.json",
+    "/asyncapi.yaml",
+)
+
+
+def _safe_runtime_url(value: str) -> str:
+    """Drop credentials and query material before a URL reaches evidence."""
+
+    parsed = urllib.parse.urlsplit(value)
+    if not parsed.scheme or not parsed.hostname:
+        return "<invalid-url>"
+    netloc = parsed.hostname
+    if parsed.port:
+        netloc += f":{parsed.port}"
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+
+
+def configured_protocol_urls(project_root: Path) -> list[dict[str, str]]:
+    """Read protocol URLs from configuration without resolving credentials."""
+
+    workspace = project_root.resolve() / "discovery" / "workspace.yaml"
+    try:
+        document = yaml.safe_load(workspace.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError):
+        return []
+    configuration = document.get("configuration", {}) if isinstance(document, dict) else {}
+    services = configuration.get("services", []) if isinstance(configuration, dict) else []
+    found: list[dict[str, str]] = []
+    fields = ("openapi", "swagger", "asyncapi", "protocol", "contract", "base_url", "url")
+    for service in services if isinstance(services, list) else []:
+        if not isinstance(service, dict):
+            continue
+        service_id = str(service.get("id") or service.get("owner") or "service")
+        for field in fields:
+            value = service.get(field)
+            value = value.get("value") if isinstance(value, dict) else value
+            if isinstance(value, str) and value.startswith(("http://", "https://")):
+                safe_url = _safe_runtime_url(value)
+                if safe_url != "<invalid-url>":
+                    found.append({"service": service_id, "url": safe_url, "source_type": "service_config"})
+    unique = dict.fromkeys(tuple(item.items()) for item in found)
+    return [dict(item) for item in unique]
+
+
+def read_only_protocol_probe(
+    urls: Iterable[str | Mapping[str, Any]],
+    *,
+    timeout: float = 2.0,
+    allow_external: bool = False,
+) -> dict[str, Any]:
+    """Fetch formal protocol documents with GET only and classify failures."""
+
+    sources: list[dict[str, Any]] = []
+    documents: list[dict[str, Any]] = []
+    errors: list[str] = []
+    classifications: set[str] = set()
+    failure_details: list[dict[str, Any]] = []
+    now = datetime.now(timezone.utc).isoformat()
+    candidates: list[tuple[str, str | None, str]] = []
+    for item in urls:
+        if isinstance(item, Mapping):
+            raw_url, service = str(item.get("url", "")), str(item.get("service") or "")
+            source_type = str(item.get("source_type") or "runtime_url")
+        else:
+            raw_url, service = str(item), None
+            source_type = "runtime_url"
+        if not raw_url:
+            continue
+        parsed = urllib.parse.urlsplit(raw_url)
+        if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password or not parsed.hostname:
+            errors.append(f"runtime protocol URL rejected: {_safe_runtime_url(raw_url)}")
+            continue
+        if not allow_external and not _is_local_host(parsed.hostname):
+            errors.append(f"runtime protocol URL is not local: {_safe_runtime_url(raw_url)}")
+            classifications.add("environment_invalid")
+            failure_details.append({"url": _safe_runtime_url(raw_url), "classification": "environment_invalid", "reason": "non_local_auto_discovery"})
+            continue
+        path = parsed.path or ""
+        paths = (path,) if path and path != "/" else RUNTIME_PROTOCOL_PATHS
+        for candidate_path in paths:
+            target = urllib.parse.urlunsplit((parsed.scheme, parsed.hostname + (f":{parsed.port}" if parsed.port else ""), candidate_path, "", ""))
+            candidates.append((target, service, source_type))
+    for target, service, source_type in list(dict.fromkeys(candidates)):
+        parsed_target = urllib.parse.urlsplit(target)
+        try:
+            connection_type = http.client.HTTPSConnection if parsed_target.scheme == "https" else http.client.HTTPConnection
+            connection = connection_type(parsed_target.hostname, parsed_target.port or (443 if parsed_target.scheme == "https" else 80), timeout=timeout)
+            request_target = parsed_target.path or "/"
+            if parsed_target.query:
+                request_target += f"?{parsed_target.query}"
+            try:
+                connection.request("GET", request_target, headers={"Accept": "application/json, application/yaml, text/yaml"})
+            except TypeError:
+                connection.request("GET", request_target)
+            response = connection.getresponse()
+            status = int(response.status)
+            body = response.read(2_000_000)
+            try:
+                content_type = str(response.getheader("Content-Type", ""))
+            except TypeError:
+                content_type = str(response.getheader("Content-Type"))
+            connection.close()
+        except (OSError, ValueError, http.client.HTTPException, AttributeError) as exc:
+            errors.append(f"runtime protocol fetch failed: {target} ({type(exc).__name__})")
+            classifications.add("read_only_failed")
+            failure_details.append({"url": _safe_runtime_url(target), "classification": "read_only_failed", "reason": type(exc).__name__})
+            continue
+        if status in {401, 403}:
+            classifications.add("authentication_missing")
+            failure_details.append({"url": _safe_runtime_url(target), "classification": "authentication_missing", "status": status})
+            continue
+        if status < 200 or status >= 300 or not body:
+            classifications.add("read_only_failed")
+            failure_details.append({"url": _safe_runtime_url(target), "classification": "read_only_failed", "status": status})
+            continue
+        try:
+            parsed_body = json.loads(body.decode("utf-8-sig"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            try:
+                parsed_body = yaml.safe_load(body.decode("utf-8-sig"))
+            except (UnicodeDecodeError, yaml.YAMLError):
+                classifications.add("incomplete_protocol")
+                failure_details.append({"url": _safe_runtime_url(target), "classification": "incomplete_protocol", "reason": "unparseable_document"})
+                continue
+        if not isinstance(parsed_body, Mapping) or not (
+            isinstance(parsed_body.get("paths"), Mapping)
+            or isinstance(parsed_body.get("channels"), Mapping)
+            or parsed_body.get("swagger")
+            or parsed_body.get("openapi")
+            or parsed_body.get("asyncapi")
+        ):
+            classifications.add("incomplete_protocol")
+            failure_details.append({"url": _safe_runtime_url(target), "classification": "incomplete_protocol", "reason": "unsupported_shape"})
+            continue
+        suffix = ".yaml" if "yaml" in content_type.casefold() or target.casefold().endswith((".yaml", ".yml")) else ".json"
+        source = {
+            "source_type": source_type,
+            "service": service,
+            "url": target,
+            "format": suffix[1:],
+            "fetched_at": now,
+            "content_sha256": hashlib.sha256(body).hexdigest(),
+            "status": status,
+            "user_confirmed": bool(allow_external or source_type == "user_url"),
+        }
+        sources.append(source)
+        documents.append({"source": source, "content": body.decode("utf-8-sig")})
+        classifications.add("protocol_available")
+    if not sources and not classifications:
+        classifications.add("service_not_found")
+    return {
+        "sources": sources,
+        "documents": documents,
+        "errors": sorted(set(errors)),
+        "classifications": sorted(classifications),
+        "failure_details": failure_details,
+    }
 
 
 DISCOVERY_KEYS = {"schema_version", "inventory", "topology", "configuration", "runtime_probe", "gates"}
@@ -1115,7 +1297,7 @@ def _runtime_probe_errors(
 
     errors: list[str] = []
     required = {"requested", "outcome", "blockers", "listeners", "processes", "associations", "read_only_smoke"}
-    allowed = required | {"configuration_checks"}
+    allowed = required | {"configuration_checks", "component_probes", "protocol_candidates", "protocol_sources", "classifications", "failure_details"}
     if not isinstance(probe, dict) or not required.issubset(set(probe)) or set(probe) - allowed:
         errors.append(_error(path, "runtime-probe-schema", f"运行探测字段必须包含 {sorted(required)}，可选 configuration_checks", "runtime_probe:"))
         return errors
@@ -1132,6 +1314,15 @@ def _runtime_probe_errors(
         errors.append(_error(path, "runtime-probe-blocker", "blocked 探测必须记录原因", "blockers"))
     if outcome != "blocked" and blockers != []:
         errors.append(_error(path, "runtime-probe-blocker", "非 blocked 探测不得记录 blockers", "blockers"))
+    allowed_classifications = {
+        "protocol_available", "service_not_found", "protocol_unknown", "incomplete_protocol",
+        "authentication_missing", "read_only_failed", "environment_invalid",
+    }
+    if "classifications" in probe and (
+        not _strings(probe.get("classifications"), nonempty=False)
+        or any(str(item) not in allowed_classifications for item in probe.get("classifications", []))
+    ):
+        errors.append(_error(path, "runtime-probe-classification", "运行探测分类无效", "classifications"))
     for name in ("listeners", "processes", "associations", "read_only_smoke"):
         if not isinstance(probe.get(name), list):
             errors.append(_error(path, "runtime-probe-list", f"{name} 必须是列表", name))
@@ -1344,26 +1535,36 @@ def _is_local_host(host: str) -> bool:
     return bool(resolved) and resolved.issubset(local_addresses)
 
 
+@lru_cache(maxsize=1)
+def _windows_listener_owner_map() -> dict[int, set[int]]:
+    """Read Windows listener ownership once for the whole runtime probe."""
+
+    try:
+        result = subprocess.run(
+            ["netstat.exe", "-ano", "-p", "tcp"],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError:
+        return {}
+    owners: dict[int, set[int]] = {}
+    pattern = re.compile(r"(?im)^\\s*tcp\\s+\\S+:(\\d+)\\s+\\S+\\s+listening\\s+(\\d+)\\s*$")
+    for match in pattern.finditer(result.stdout):
+        port, pid = int(match.group(1)), int(match.group(2))
+        if 1 <= port <= 65535 and pid > 0:
+            owners.setdefault(port, set()).add(pid)
+    return owners
+
+
 def _listener_owner_pids(port: int) -> set[int]:
     """只读查询本机 TCP LISTEN 端口的拥有进程。"""
 
     try:
         if os.name == "nt":
-            result = subprocess.run(
-                [
-                    "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-                    f"Get-NetTCPConnection -State Listen -LocalPort {port} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess",
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
-            return {
-                int(line.strip()) for line in result.stdout.splitlines()
-                if re.fullmatch(r"[1-9][0-9]*", line.strip())
-            }
+            return set(_windows_listener_owner_map().get(port, set()))
         else:
             result = subprocess.run(
                 ["ss", "-ltnp", f"sport = :{port}"],
@@ -1378,6 +1579,23 @@ def _listener_owner_pids(port: int) -> set[int]:
         return set()
 
 
+@lru_cache(maxsize=1)
+def _local_listening_ports() -> list[int]:
+    """Enumerate loopback-capable local listeners without touching application state."""
+
+    try:
+        if os.name == "nt":
+            values = [str(port) for port in _windows_listener_owner_map()]
+        else:
+            result = subprocess.run(
+                ["ss", "-ltn"], check=False, capture_output=True, text=True, encoding="utf-8", errors="replace"
+            )
+            values = re.findall(r"(?:127\.0\.0\.1|\[::1\]|\*|0\.0\.0\.0|::):(\d+)", result.stdout)
+        return sorted({int(value.strip()) for value in values if re.fullmatch(r"[1-9][0-9]{0,4}", value.strip()) and 1 <= int(value.strip()) <= 65535})
+    except (OSError, ValueError):
+        return []
+
+
 def read_only_environment_probe(project_root: Path) -> dict[str, Any]:
     """主动读取本机监听、进程元数据和已配置的无副作用 HTTP 入口。"""
 
@@ -1389,11 +1607,29 @@ def read_only_environment_probe(project_root: Path) -> dict[str, Any]:
         workspace = {}
     configuration = workspace.get("configuration", {}) if isinstance(workspace, dict) else {}
     services = configuration.get("services", []) if isinstance(configuration, dict) else []
+    services = list(services) if isinstance(services, list) else []
+    declared_ports = {
+        int(item.get("port", {}).get("value"))
+        for item in services
+        if isinstance(item, dict)
+        and isinstance(item.get("port"), dict)
+        and str(item.get("port", {}).get("value", "")).isdigit()
+    }
+    discovered_only = not services
+    if discovered_only:
+        # Runtime discovery is bounded to keep an unconfigured workstation
+        # from turning a read-only probe into an unbounded port sweep.
+        for port in _local_listening_ports()[:32]:
+            if port not in declared_ports:
+                services.append({"id": f"runtime-{port}", "owner": f"runtime:{port}", "port": {"value": port}, "health": {"value": "/"}, "openapi": {"value": "/openapi.json"}})
     listeners: list[dict[str, Any]] = []
     processes: list[dict[str, Any]] = []
     associations: list[dict[str, Any]] = []
     read_only_smoke: list[dict[str, Any]] = []
+    component_probes: list[dict[str, Any]] = []
     configuration_checks: list[dict[str, Any]] = []
+    environment_invalid_detected = False
+    protocol_urls = configured_protocol_urls(project_root)
     seen_pids: set[int] = set()
     for service in services if isinstance(services, list) else []:
         if not isinstance(service, dict):
@@ -1458,7 +1694,7 @@ def read_only_environment_probe(project_root: Path) -> dict[str, Any]:
                     continue
                 target = f"http://127.0.0.1:{port}{endpoint}"
                 try:
-                    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2.0)
+                    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.1 if discovered_only else 2.0)
                     connection.request("HEAD", endpoint)
                     response = connection.getresponse()
                     response.read(256)
@@ -1467,6 +1703,43 @@ def read_only_environment_probe(project_root: Path) -> dict[str, Any]:
                 except (OSError, http.client.HTTPException) as exc:
                     result = f"error:{type(exc).__name__}"
                 read_only_smoke.append({"node": node, "method": "HEAD", "target_ref": target, "result": result})
+                if endpoint_name == "openapi":
+                    protocol_urls.append({"service": node, "url": target})
+    # Components are probed only when their configuration exposes an explicit
+    # local HTTP read endpoint; no database, cache, broker, or task write is
+    # inferred from a component declaration.
+    for collection, component_type in (("data_sources", "database"), ("middleware", "middleware"), ("controls", "control")):
+        items = configuration.get(collection, []) if isinstance(configuration, dict) else []
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            raw_endpoint = None
+            for field in ("read_only_url", "health", "url", "endpoint"):
+                value = item.get(field)
+                value = value.get("value") if isinstance(value, dict) else value
+                if isinstance(value, str) and value.startswith(("http://", "https://")):
+                    raw_endpoint = value
+                    break
+            if not raw_endpoint:
+                continue
+            parsed = urllib.parse.urlsplit(raw_endpoint)
+            if not parsed.hostname or not _is_local_host(parsed.hostname) or parsed.username or parsed.password:
+                component_probes.append({"id": str(item.get("id") or collection), "type": component_type, "target_ref": _safe_runtime_url(raw_endpoint), "method": "GET", "result": "environment_invalid"})
+                continue
+            request_target = parsed.path or "/"
+            if parsed.query:
+                request_target += f"?{parsed.query}"
+            try:
+                connection_type = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+                connection = connection_type(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80), timeout=2.0)
+                connection.request("GET", request_target, headers={"Accept": "application/json"})
+                response = connection.getresponse()
+                response.read(1024)
+                connection.close()
+                result = f"status:{response.status}"
+            except (OSError, http.client.HTTPException) as exc:
+                result = f"error:{type(exc).__name__}"
+            component_probes.append({"id": str(item.get("id") or collection), "type": component_type, "target_ref": _safe_runtime_url(raw_endpoint), "method": "GET", "result": result})
     sources = configuration.get("sources", []) if isinstance(configuration, dict) else []
     source_ids = {str(item.get("id")) for item in sources if isinstance(item, dict) and item.get("id")}
     precedence = [
@@ -1492,6 +1765,8 @@ def read_only_environment_probe(project_root: Path) -> dict[str, Any]:
                 )
                 for child in values
             )
+            if values and not resolved:
+                environment_invalid_detected = True
             item_sources = list(dict.fromkeys(effective_sources or precedence[-1:]))
             if not item_sources:
                 continue
@@ -1503,6 +1778,17 @@ def read_only_environment_probe(project_root: Path) -> dict[str, Any]:
                 "effective": "confirmed" if resolved else "unconfirmed",
                 "evidence": [f"runtime-source:{source_id}" for source_id in item_sources],
             })
+    protocol_probe = read_only_protocol_probe(protocol_urls, timeout=0.1 if discovered_only else 0.5)
+    classifications = list(protocol_probe.get("classifications", []))
+    if not listeners and not processes:
+        classifications.append("service_not_found")
+    if environment_invalid_detected or any(item.get("effective") == "unconfirmed" for item in configuration_checks):
+        classifications.append("environment_invalid")
+    config_file = project_root / "config" / "config.yaml"
+    if not config_file.is_file():
+        classifications.append("environment_invalid")
+    if not classifications:
+        classifications.append("protocol_unknown")
     return {
         "requested": True,
         "outcome": "completed",
@@ -1511,6 +1797,14 @@ def read_only_environment_probe(project_root: Path) -> dict[str, Any]:
         "processes": processes,
         "associations": associations,
         "read_only_smoke": read_only_smoke,
+        "component_probes": component_probes,
+        "protocol_candidates": [
+            {"service": item.get("service"), "url": item.get("url"), "source_type": item.get("source_type", "runtime_url")}
+            for item in protocol_urls
+        ],
+        "protocol_sources": protocol_probe["sources"],
+        "classifications": sorted(set(classifications)),
+        "failure_details": protocol_probe.get("failure_details", []),
         "configuration_checks": configuration_checks,
     }
 

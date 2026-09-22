@@ -94,6 +94,9 @@ def _summary(stdout: str, stderr: str, *, full: bool) -> dict[str, object]:
 
 
 def _artifact_path(domain: str, command: str, arguments: list[str], stdout: str) -> str:
+    if domain == "api-test" and command in {"understand", "generate"}:
+        path = _option_path(arguments, "--qa-root", "qa") / "results" / "design-generation-report.json"
+        return str(path) if path.is_file() else ""
     if domain == "e2e" and command == "run":
         path = _option_path(arguments, "--project", ".") / "artifacts" / "e2e-run.json"
         return str(path) if path.is_file() else ""

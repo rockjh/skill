@@ -7,6 +7,9 @@ import os
 import re
 import time
 import uuid
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -385,6 +388,345 @@ def record_business_entry(scenario: str) -> None:
     _emit_event("business_entered", scenario)
 
 
+def _protocol_operation(project_root: Path, protocol_ref: str) -> dict[str, Any]:
+    """Load one formally discovered operation without reading application code."""
+
+    path = project_root.resolve() / "discovery" / "protocol-rules.yaml"
+    try:
+        document = _load_yaml(path)
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise PreflightError(f"formal protocol artifact unavailable: {path}") from exc
+    operations = document.get("operations", [])
+    for operation in operations if isinstance(operations, list) else []:
+        if isinstance(operation, Mapping) and str(operation.get("id")) == str(protocol_ref):
+            return dict(operation)
+    raise PreflightError(f"formal protocol operation not found: {protocol_ref}")
+
+
+def _nested_value(value: Any, path: str) -> Any:
+    """Resolve a dotted or bracketed value from scenario-owned data."""
+
+    current = value
+    for token in re.findall(r"[^.\[\]]+|\[\d+\]", str(path)):
+        if token.startswith("["):
+            current = current[int(token[1:-1])]
+        elif isinstance(current, Mapping):
+            current = current[token]
+        else:
+            raise KeyError(path)
+    return current
+
+
+def _service_base_url(configuration: Mapping[str, Any], operation: Mapping[str, Any]) -> str:
+    """Resolve a service URL from preflight configuration without inventing one."""
+
+    services = configuration.get("services", {})
+    candidates: list[Any] = []
+    service_name = operation.get("service")
+    if isinstance(services, Mapping):
+        if service_name and service_name in services:
+            candidates.append(services[service_name])
+        candidates.extend(value for key, value in services.items() if key != service_name)
+    elif isinstance(services, list):
+        candidates.extend(services)
+    if not service_name and len(candidates) > 1:
+        raise PreflightError("formal HTTP operation is not bound to a unique configured service")
+    for item in candidates:
+        if isinstance(item, str) and item.startswith(("http://", "https://")):
+            parsed = urllib.parse.urlsplit(item)
+            if parsed.username or parsed.password:
+                raise PreflightError("service base URL must not contain embedded credentials")
+            return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
+        if isinstance(item, Mapping):
+            for key in ("base_url", "url", "endpoint"):
+                value = item.get(key)
+                if isinstance(value, str) and value.startswith(("http://", "https://")):
+                    parsed = urllib.parse.urlsplit(value)
+                    if parsed.username or parsed.password:
+                        raise PreflightError("service base URL must not contain embedded credentials")
+                    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
+    raise PreflightError("active environment has no resolved HTTP service base URL")
+
+
+def _graphql_protocol_request(
+    project_root: Path,
+    scenario_context: Mapping[str, Any],
+    operation: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    protocol_ref: str,
+    step_id: str,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    """Execute a GraphQL operation through its configured HTTP endpoint."""
+
+    configuration = scenario_context.get("configuration", {})
+    configuration = configuration if isinstance(configuration, Mapping) else {}
+    base_url = _service_base_url(configuration, operation)
+    route = str(operation.get("path") or "")
+    target = base_url + route
+    arguments = operation.get("arguments", []) if isinstance(operation.get("arguments"), list) else []
+    variables: dict[str, Any] = {}
+    definitions: list[str] = []
+    calls: list[str] = []
+    for argument in arguments:
+        if not isinstance(argument, Mapping):
+            continue
+        name = str(argument.get("name") or argument.get("path") or "")
+        if not name:
+            continue
+        variables[name] = payload.get(name)
+        graph_type = str(argument.get("type") or "String")
+        definitions.append(f"${name}: {graph_type}")
+        calls.append(f"{name}: ${name}")
+    fields = [
+        str(field.get("path") or field.get("name"))
+        for field in operation.get("response_fields", [])
+        if isinstance(field, Mapping) and (field.get("path") or field.get("name"))
+    ]
+    selection = " { " + " ".join(dict.fromkeys(fields)) + " }" if fields else ""
+    operation_type = str(operation.get("operation_type") or "query").casefold()
+    query = f"{operation_type}"
+    if definitions:
+        query += "(" + ", ".join(definitions) + ")"
+    query += " { " + str(operation.get("method") or operation.get("id"))
+    if calls:
+        query += "(" + ", ".join(calls) + ")"
+    query += selection + " }"
+    request_body = json.dumps({"query": query, "variables": variables}, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        target,
+        data=request_body,
+        method="POST",
+        headers={"Accept": "application/json", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            status = int(response.status)
+            raw_body = response.read(2_000_000)
+            response_headers = {str(key): str(value) for key, value in response.headers.items()}
+    except urllib.error.HTTPError as exc:
+        status = int(exc.code)
+        raw_body = exc.read(2_000_000)
+        response_headers = {str(key): str(value) for key, value in exc.headers.items()} if exc.headers else {}
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise PreflightError(f"protocol request failed: {type(exc).__name__}") from exc
+    text_body = raw_body.decode("utf-8", errors="replace")
+    try:
+        parsed_body: Any = json.loads(text_body) if text_body else None
+    except json.JSONDecodeError:
+        parsed_body = text_body
+    if not 200 <= status < 300:
+        raise AssertionError(f"GraphQL protocol status {status} is not successful for {protocol_ref}")
+    if isinstance(parsed_body, Mapping) and parsed_body.get("errors"):
+        raise AssertionError(f"GraphQL protocol returned errors for {protocol_ref}")
+    record_endpoint(
+        str(scenario_context.get("scenario", scenario_context.get("name", "scenario"))),
+        phase="business",
+        method="POST",
+        target_ref=urllib.parse.urlunsplit(urllib.parse.urlsplit(target)._replace(query="")),
+        status=status,
+        summary={"response_keys": sorted(parsed_body) if isinstance(parsed_body, Mapping) else type(parsed_body).__name__},
+        verified=True,
+        step_id=step_id,
+        protocol_ref=protocol_ref,
+        protocol_path=route or "/",
+    )
+    return {"status": status, "headers": response_headers, "body": parsed_body, "operation": operation, "target_ref": target}
+
+
+def invoke_protocol(
+    project_root: Path,
+    scenario_context: Mapping[str, Any],
+    protocol_ref: str,
+    payload: Mapping[str, Any] | None = None,
+    *,
+    step_id: str,
+    phase: str = "business",
+    timeout_seconds: float = 30.0,
+) -> dict[str, Any]:
+    """Execute one confirmed HTTP operation and return redaction-safe evidence."""
+
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+    operation = _protocol_operation(project_root, protocol_ref)
+    operation_kind = str(operation.get("kind", "http")).casefold()
+    if operation_kind == "graphql":
+        return _graphql_protocol_request(
+            project_root,
+            scenario_context,
+            operation,
+            payload if isinstance(payload, Mapping) else {},
+            protocol_ref=protocol_ref,
+            step_id=step_id,
+            timeout_seconds=timeout_seconds,
+        )
+    if operation_kind != "http":
+        raise PreflightError(f"protocol adapter unavailable for operation kind: {operation.get('kind')}")
+    method = str(operation.get("method", "GET")).upper()
+    route = str(operation.get("path", ""))
+    if method not in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE"} or not route.startswith("/"):
+        raise PreflightError(f"unsupported HTTP operation: {method} {route}")
+    context_configuration = scenario_context.get("configuration", {})
+    configuration = context_configuration if isinstance(context_configuration, Mapping) else {}
+    base_url = _service_base_url(configuration, operation)
+    data: Mapping[str, Any] = payload if isinstance(payload, Mapping) else {}
+    headers: dict[str, str] = {"Accept": "application/json"}
+    raw_headers = configuration.get("headers")
+    if isinstance(raw_headers, Mapping):
+        headers.update({str(key): str(value) for key, value in raw_headers.items() if isinstance(value, (str, int, float))})
+    query: dict[str, str] = {}
+    for parameter in operation.get("parameters", []) if isinstance(operation.get("parameters"), list) else []:
+        if not isinstance(parameter, Mapping):
+            continue
+        name = str(parameter.get("name", ""))
+        if not name:
+            continue
+        try:
+            value = _nested_value(data, str(parameter.get("path") or name))
+        except (KeyError, IndexError, TypeError, ValueError):
+            if parameter.get("required") is True:
+                raise PreflightError(f"missing required protocol parameter: {name}")
+            continue
+        location = str(parameter.get("in") or "query")
+        if location == "query":
+            query[name] = str(value)
+        elif location == "header":
+            headers[name] = str(value)
+        elif location == "path":
+            route = route.replace("{" + name + "}", urllib.parse.quote(str(value), safe=""))
+    body_value: Any = data.get("body", data)
+    if method in {"GET", "HEAD", "OPTIONS", "TRACE"}:
+        body_bytes = None
+    else:
+        body_bytes = json.dumps(body_value, ensure_ascii=False).encode("utf-8")
+        headers.setdefault("Content-Type", "application/json")
+    target = base_url + route
+    if query:
+        target += "?" + urllib.parse.urlencode(query)
+    request = urllib.request.Request(target, data=body_bytes, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            status = int(response.status)
+            raw_body = response.read(2_000_000)
+            response_headers = {str(key): str(value) for key, value in response.headers.items()}
+    except urllib.error.HTTPError as exc:
+        status = int(exc.code)
+        raw_body = exc.read(2_000_000)
+        response_headers = {str(key): str(value) for key, value in exc.headers.items()} if exc.headers else {}
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise PreflightError(f"protocol request failed: {type(exc).__name__}") from exc
+    text_body = raw_body.decode("utf-8", errors="replace")
+    try:
+        parsed_body: Any = json.loads(text_body) if text_body else None
+    except json.JSONDecodeError:
+        parsed_body = text_body
+    declared_codes = [str(value).upper() for value in operation.get("status_codes", [])]
+    verified = (
+        any(
+            code == str(status)
+            or code in {"DEFAULT", "XX"}
+            or len(code) == 3 and code[0].isdigit() and code[1:] == "XX" and str(status).startswith(code[0])
+            for code in declared_codes
+        )
+        if declared_codes else 200 <= status < 300
+    )
+    if not verified:
+        raise AssertionError(f"protocol status {status} is not declared for {protocol_ref}")
+    record_endpoint(
+        str(scenario_context.get("scenario", scenario_context.get("name", "scenario"))),
+        phase=phase,
+        method=method,
+        target_ref=urllib.parse.urlunsplit(urllib.parse.urlsplit(target)._replace(query="")),
+        status=status,
+        summary={"response_keys": sorted(parsed_body) if isinstance(parsed_body, Mapping) else type(parsed_body).__name__},
+        verified=True,
+        step_id=step_id,
+        protocol_ref=protocol_ref,
+        protocol_path=route,
+    )
+    return {"status": status, "headers": response_headers, "body": parsed_body, "operation": operation, "target_ref": target}
+
+
+def assert_business_expectations(result: Mapping[str, Any], expectations: Sequence[str]) -> bool:
+    """Evaluate simple design expressions against a real protocol result."""
+
+    body = result.get("body") if isinstance(result, Mapping) else None
+    for raw in expectations:
+        expression = str(raw).strip()
+        match = re.fullmatch(r"(?:response\.)?([A-Za-z_][\w.]*)\s*(?:==|=)\s*['\"]?([^'\"]+)['\"]?", expression)
+        if not match:
+            raise AssertionError(f"business expectation requires an adapter: {expression}")
+        field, expected = match.groups()
+        actual: Any
+        if field in {"status", "http_status"} and expected.isdigit():
+            actual = result.get("status")
+        else:
+            try:
+                actual = _nested_value(body, field)
+            except (KeyError, IndexError, TypeError, ValueError):
+                try:
+                    actual = _nested_value(body.get("data"), field) if isinstance(body, Mapping) else None
+                except (KeyError, IndexError, TypeError, ValueError):
+                    raise AssertionError(f"business expectation field missing: {field}")
+        if str(actual) != expected:
+            raise AssertionError(f"business expectation failed: {expression}; actual={_redact(actual)!r}")
+    return True
+
+
+def cleanup_scenario(project_root: Path, scenario_context: Mapping[str, Any], scenario: str) -> dict[str, Any]:
+    """Run declared protocol cleanup and emit restoration evidence."""
+
+    definition = scenario_context.get("definition", {})
+    isolation = definition.get("isolation", {}) if isinstance(definition, Mapping) else {}
+    resources = isolation.get("owned_resources", []) if isinstance(isolation, Mapping) else []
+    if not resources:
+        _emit_event("restoration", scenario, status="passed", resources=[])
+        return {"status": "passed", "resources": []}
+    if isinstance(scenario_context, dict) and scenario_context.get("_cleanup_done") is True:
+        _emit_event("restoration", scenario, status="passed", resources=[], repeated=True)
+        return {"status": "passed", "resources": [], "repeated": True}
+
+    restored: list[str] = []
+    try:
+        from .data import generate_request_data
+
+        namespace = str(isolation.get("namespace") or scenario)
+        for resource in resources:
+            if not isinstance(resource, Mapping):
+                raise PreflightError("scenario-owned resource declaration is invalid")
+            identity = str(resource.get("identity", "")).strip()
+            action = str(resource.get("cleanup", "")).strip()
+            if not identity or not action.startswith("protocol:"):
+                raise PreflightError("scenario-owned mutable resources require a formal protocol cleanup adapter")
+            protocol_ref = action.split(":", 1)[1].strip()
+            operation = _protocol_operation(project_root, protocol_ref)
+            payload = generate_request_data(operation, namespace=namespace)
+            result = invoke_protocol(
+                project_root,
+                scenario_context,
+                protocol_ref,
+                payload,
+                step_id=f"cleanup_{identity}",
+                phase="business",
+            )
+            restored.append(identity)
+            _emit_event(
+                "restoration_verification",
+                scenario,
+                resource=identity,
+                protocol_ref=protocol_ref,
+                status=result.get("status"),
+            )
+    except BaseException as exc:
+        _emit_event("restoration", scenario, status="failed", resources=restored, error=str(exc))
+        raise
+    if isinstance(scenario_context, dict):
+        scenario_context["_cleanup_done"] = True
+    _emit_event("restoration", scenario, status="passed", resources=restored)
+    return {"status": "passed", "resources": restored}
+
+
 def record_step(
     scenario: str,
     *,
@@ -407,6 +749,13 @@ def record_step(
     ):
         raise PreflightError("步骤证据引用必须是字符串序列")
     _emit_event("step", scenario, step_id=step_id, status=status, reason=reason, evidence=list(evidence))
+
+
+def report_control_gap(scenario: str, *, step_id: str, reason: str, evidence: Sequence[str] = ()) -> dict[str, Any]:
+    """Record a precise non-executable step without claiming business success."""
+
+    record_step(scenario, step_id=step_id, status="control_gap", reason=reason, evidence=evidence)
+    return {"status": "control_gap", "step_id": step_id}
 
 
 @contextmanager

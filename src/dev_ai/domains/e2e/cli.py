@@ -10,7 +10,7 @@ from pathlib import Path
 from ...core.errors import ExitCode
 from .assets import initialize
 from .contracts import generate_artifacts
-from .discovery import discover_documents, discover_protocols
+from .discovery import PROTOCOL_SUFFIXES, discover_documents, discover_protocols, read_only_environment_probe
 from .runner import ORDERED_GATES, check_gate, pytest_arg_errors, run_ordered
 from .source_versions import RULES_VERSION, source_version_results
 
@@ -22,16 +22,18 @@ def init_command(argv: list[str]) -> int:
     parser.add_argument("--design-file", action="append", type=Path, default=[])
     parser.add_argument("--openapi-root", action="append", type=Path, default=[])
     parser.add_argument("--openapi-file", action="append", type=Path, default=[])
+    parser.add_argument("--runtime-url", "--protocol-url", dest="runtime_urls", action="append", default=[])
     args = parser.parse_args(argv)
     project = args.project.resolve()
     changed = initialize(project)
-    if args.design_root or args.design_file or args.openapi_root or args.openapi_file:
+    if args.design_root or args.design_file or args.openapi_root or args.openapi_file or args.runtime_urls:
         result, errors = generate_artifacts(
             project,
             design_roots=args.design_root,
             design_files=args.design_file,
             openapi_roots=args.openapi_root,
             openapi_files=args.openapi_file,
+            runtime_urls=args.runtime_urls,
         )
         print(json.dumps(result, ensure_ascii=False))
         for error in errors:
@@ -56,15 +58,32 @@ def discover_command(argv: list[str]) -> int:
     parser.add_argument("--design-file", action="append", type=Path, default=[])
     parser.add_argument("--openapi-root", action="append", type=Path, default=[])
     parser.add_argument("--openapi-file", action="append", type=Path, default=[])
+    parser.add_argument("--runtime-url", "--protocol-url", dest="runtime_urls", action="append", default=[])
     args = parser.parse_args(argv)
     project = args.project.resolve()
     design = discover_documents(project, roots=args.design_root, files=args.design_file)
     protocol = discover_protocols(project, roots=args.openapi_root, files=args.openapi_file)
+    has_formal_protocol = any(path.suffix.casefold() in PROTOCOL_SUFFIXES for path in protocol.files)
+    runtime = read_only_environment_probe(project) if not has_formal_protocol and not (args.openapi_root or args.openapi_file or args.runtime_urls) else {}
+    if args.runtime_urls:
+        from .discovery import read_only_protocol_probe
+        probe = read_only_protocol_probe(
+            ({"url": value, "source_type": "user_url", "user_confirmed": True} for value in args.runtime_urls),
+            allow_external=True,
+        )
+        runtime = {
+            "protocol_sources": probe.get("sources", []),
+            "protocol_candidates": args.runtime_urls,
+            "classifications": probe.get("classifications", ["protocol_unknown"]),
+            "failure_details": probe.get("failure_details", []),
+        }
+    runtime_sources = runtime.get("protocol_sources", []) if isinstance(runtime, dict) else []
     print(json.dumps({
         "design": {"files": [str(path) for path in design.files], "candidates": [str(path) for path in design.candidates]},
-        "protocol": {"files": [str(path) for path in protocol.files], "candidates": [str(path) for path in protocol.candidates]},
+        "protocol": {"files": [str(path) for path in protocol.files], "candidates": [str(path) for path in protocol.candidates], "runtime_sources": runtime_sources},
+        "runtime": {"outcome": runtime.get("classifications", []) if isinstance(runtime, dict) else "not_requested", "protocol_candidates": runtime.get("protocol_candidates", []) if isinstance(runtime, dict) else []},
     }, ensure_ascii=False))
-    if not design.files or not protocol.files:
+    if not design.files or (not protocol.files and not runtime_sources):
         return int(ExitCode.NOT_FOUND)
     if not (args.design_root or args.design_file) and len(design.candidates) > 1:
         return int(ExitCode.AMBIGUOUS)
@@ -80,6 +99,7 @@ def generate_command(argv: list[str]) -> int:
     parser.add_argument("--design-file", action="append", type=Path, default=[])
     parser.add_argument("--openapi-root", action="append", type=Path, default=[])
     parser.add_argument("--openapi-file", action="append", type=Path, default=[])
+    parser.add_argument("--runtime-url", "--protocol-url", dest="runtime_urls", action="append", default=[])
     args = parser.parse_args(argv)
     result, errors = generate_artifacts(
         args.project.resolve(),
@@ -87,6 +107,7 @@ def generate_command(argv: list[str]) -> int:
         design_files=args.design_file,
         openapi_roots=args.openapi_root,
         openapi_files=args.openapi_file,
+        runtime_urls=args.runtime_urls,
     )
     print(json.dumps(result, ensure_ascii=False))
     for error in errors:

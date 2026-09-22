@@ -29,8 +29,12 @@ def input_summary(document: dict[str, Any]) -> dict[str, Any]:
     """Build a stable summary for parsed design or protocol documents."""
 
     documents = document.get("documents", []) if isinstance(document.get("documents"), list) else []
+    allowed = (
+        "path", "sha256", "version", "source_type", "service", "url", "format",
+        "fetched_at", "content_sha256", "user_confirmed",
+    )
     normalized = [
-        {key: item.get(key) for key in ("path", "sha256", "version") if key in item}
+        {key: item.get(key) for key in allowed if key in item}
         for item in documents if isinstance(item, dict)
     ]
     count_key = "rule_count" if document.get("source") == "design" else "operation_count"
@@ -164,6 +168,10 @@ def generation_lock_errors(project_root: Path, lock: Any) -> list[str]:
             if not isinstance(item, dict) or not item.get("path") or not item.get("sha256"):
                 errors.append(f"version-lock.yaml {kind} document entry is invalid")
                 continue
+            if item.get("source_type") in {"runtime_url", "service_config"}:
+                if not item.get("url") or not item.get("content_sha256"):
+                    errors.append(f"version-lock.yaml {kind} runtime source metadata is incomplete")
+                continue
             path = Path(str(item["path"]))
             path = path if path.is_absolute() else project_root / path
             actual = _sha256(path)
@@ -172,7 +180,14 @@ def generation_lock_errors(project_root: Path, lock: Any) -> list[str]:
             elif actual != item["sha256"]:
                 errors.append(f"locked {kind} document changed: {path}")
         normalized = [
-            {key: item.get(key) for key in ("path", "sha256", "version") if key in item}
+            {
+                key: item.get(key)
+                for key in (
+                    "path", "sha256", "version", "source_type", "service", "url", "format",
+                    "fetched_at", "content_sha256", "user_confirmed",
+                )
+                if key in item
+            }
             for item in documents if isinstance(item, dict)
         ]
         digest = hashlib.sha256(json.dumps(normalized, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()

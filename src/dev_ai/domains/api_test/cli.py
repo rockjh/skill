@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
 import subprocess
@@ -16,7 +17,13 @@ sys.dont_write_bytecode = True
 
 from ...core.redaction import redact
 from .execution_config import initialize_execution_layout
-from .design_rules import apply_to_contracts, build_rules, discover, summary as design_summary
+from .design_rules import (
+    apply_to_contracts,
+    build_rules,
+    discover,
+    understanding_errors,
+    summary as design_summary,
+)
 from .materialize_missing_bru import materialize
 from .mock_data import command as mock_data_operation
 from .mock_data import derive_mock_data_contracts, write_discovery
@@ -38,6 +45,7 @@ from .qa_paths import (
     EXECUTION,
     GLOBAL_RESULTS,
     LOGS,
+    RESULTS,
 )
 from .constraints import (
     ensure_rule_library,
@@ -46,6 +54,7 @@ from .constraints import (
     worker_snapshot_path,
     write_worker_snapshot,
 )
+from .manifest_io import load_data
 from .value_resolution import (
     apply_environment_values,
     write_value_resolutions,
@@ -140,9 +149,20 @@ def init_command(argv: list[str]) -> int:
             "version": 1,
             "source": "design",
             "documents": [],
+            "parser_diagnostics": [],
             "rules": [],
+            "understanding": [],
+            "mapping": {"items": [], "counts": {
+                "exact": 0, "parameter_alias": 0, "semantic_candidate": 0,
+                "design_without_openapi": 0, "openapi_without_design": 0, "multiple_candidates": 0,
+            }},
             "exclusions": [],
+            "flows": [],
+            "flow_candidates": [],
             "manual_confirmations": [],
+            "understanding_status": "incomplete",
+            "design_fingerprint": "0" * 64,
+            "openapi_fingerprint": "",
             "coverage": {"openapi_endpoints": 0, "documented_endpoints": 0, "excluded_endpoints": 0},
         },
         qa_root / CONTRACTS / "fixtures" / "generated" / "manifest.yaml": {"version": 1, "fixtures": []},
@@ -164,6 +184,188 @@ def init_command(argv: list[str]) -> int:
         changed.append(version_lock)
     print(f"initialized {qa_root} ({len(changed)} file(s) changed)")
     return 0
+
+
+def _design_fingerprint(files: list[Path] | tuple[Path, ...]) -> str:
+    values = []
+    for path in files:
+        values.append(hashlib.sha256(path.read_bytes()).hexdigest())
+    return hashlib.sha256("".join(values).encode("utf-8")).hexdigest()
+
+
+def _write_design_understanding(qa_root: Path, document: dict[str, object]) -> Path:
+    path = qa_root / CONSTRAINTS / "design-rules.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(render_manifest(document, path), encoding="utf-8")
+    return path
+
+
+def _design_report(
+    qa_root: Path,
+    design_rules: dict[str, object],
+    *,
+    status: str,
+    failures: list[str] | None = None,
+    execution: str = "not_started",
+) -> Path | None:
+    mapping = design_rules.get("mapping", {}) if isinstance(design_rules.get("mapping"), dict) else {}
+    counts = mapping.get("counts", {}) if isinstance(mapping, dict) and isinstance(mapping.get("counts"), dict) else {}
+    formal_cases: list[dict[str, object]] = []
+    protocol_cases: list[dict[str, object]] = []
+    pending_case_records: list[dict[str, object]] = []
+    contracts = qa_root / CONTRACTS / "modules"
+    if contracts.is_dir():
+        for module_dir in contracts.glob("*/"):
+            cases_path = module_dir / "cases.yaml"
+            if not cases_path.is_file():
+                continue
+            try:
+                document = load_data(cases_path)
+            except (OSError, ValueError, SystemExit):
+                # The generation gate already reports malformed manifests; the
+                # audit report must remain writable even when one case file is
+                # unreadable.
+                continue
+            for case in document.get("cases", []) if isinstance(document, dict) else []:
+                if not isinstance(case, dict):
+                    continue
+                waiting = case.get("review_required") is True or bool(case.get("manual_confirmation"))
+                record = {
+                    "id": str(case.get("id", "")),
+                    "endpoint_id": str(case.get("endpoint_id", "")),
+                    "scenario": str(case.get("scenario", "")),
+                    "source": str(case.get("source", "")),
+                    "design_rule_ids": list(case.get("design_rule_ids", [])) if isinstance(case.get("design_rule_ids"), list) else [],
+                    "bru": str(case.get("bru", case.get("bru_file", case.get("file_name", "")))),
+                }
+                if waiting:
+                    record["reason"] = case.get("review_reason") or case.get("manual_confirmation")
+                    pending_case_records.append(record)
+                elif case.get("source") == "design":
+                    formal_cases.append(record)
+                elif case.get("source") == "openapi":
+                    protocol_cases.append(record)
+    confirmations = design_rules.get("manual_confirmations", []) if isinstance(design_rules.get("manual_confirmations"), list) else []
+    pending_confirmations = len(confirmations)
+    uncovered = {
+        key: int(counts.get(key, 0) or 0)
+        for key in ("design_without_openapi", "openapi_without_design", "multiple_candidates")
+    }
+    failure_text = "; ".join(dict.fromkeys(str(item) for item in (failures or []) if str(item).strip()))
+    understanding_rows = design_rules.get("understanding", []) if isinstance(design_rules.get("understanding"), list) else []
+    capability_terms = (
+        "concurrent", "concurrency", "bounded final-state polling", "fault injection",
+        "runner", "execution mechanism",
+    )
+    unsupported_rows = [
+        {
+            "rule_id": item.get("rule_id"),
+            "unknown": list(item.get("unknown", [])) if isinstance(item.get("unknown"), list) else [],
+            "design_source": item.get("design_source"),
+        }
+        for item in understanding_rows
+        if isinstance(item, dict)
+        and item.get("can_generate") is False
+        and any(
+            term in " ".join(str(value).casefold() for value in item.get("unknown", []))
+            for term in capability_terms
+        )
+    ]
+    flow_candidates = design_rules.get("flow_candidates", []) if isinstance(design_rules.get("flow_candidates"), list) else []
+    pending_candidates = [
+        item for item in flow_candidates
+        if isinstance(item, dict) and item.get("can_generate") is False
+    ]
+    mapping_items = mapping.get("items", []) if isinstance(mapping.get("items"), list) else []
+    uncovered_items = [
+        item for item in mapping_items
+        if isinstance(item, dict) and item.get("category") in uncovered
+    ]
+    # Pending cases are intentionally excluded: they are candidates awaiting
+    # confirmation, not executable tests that merely have not run yet.
+    unexecuted = [*formal_cases, *protocol_cases]
+    report = {
+        "version": 1,
+        "source": "design",
+        "status": status,
+        "execution": execution,
+        "matrix_path": str(qa_root / CONSTRAINTS / "design-rules.yaml"),
+        "formal_tests": formal_cases,
+        "protocol_tests": protocol_cases,
+        "pending_cases": pending_case_records,
+        "pending_confirmations": confirmations,
+        "pending_flow_candidates": pending_candidates,
+        "unsupported": unsupported_rows,
+        "uncovered_mapping": uncovered_items,
+        "unexecuted": unexecuted,
+        "gate_failures": list(dict.fromkeys(str(item) for item in (failures or []) if str(item).strip())),
+    }
+    report_path: Path | None = None
+    try:
+        report_path = qa_root / RESULTS / "design-generation-report.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(redact(report), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        report_path = None
+    formal = len(formal_cases)
+    protocol = len(protocol_cases)
+    pending_cases = len(pending_case_records)
+    unsupported = len(unsupported_rows)
+    print(
+        "design_understanding "
+        f"status={status} rules={len(design_rules.get('rules', [])) if isinstance(design_rules.get('rules'), list) else 0} "
+        f"formal_cases={formal} protocol_cases={protocol} pending_cases={pending_cases} "
+        f"pending_confirmations={pending_confirmations} "
+        f"flow_candidates={len(pending_candidates)} "
+        f"unsupported={unsupported} uncovered={json.dumps(uncovered, ensure_ascii=False, sort_keys=True)} execution={execution} unexecuted={len(unexecuted)}"
+    )
+    if failure_text:
+        print(f"gate_failures={failure_text}")
+    print(f"formal_test_ids={json.dumps([item.get('id') for item in formal_cases], ensure_ascii=False)}")
+    print(f"protocol_test_ids={json.dumps([item.get('id') for item in protocol_cases], ensure_ascii=False)}")
+    print(f"pending_confirmation_ids={json.dumps([item.get('rule_id') for item in confirmations if isinstance(item, dict)], ensure_ascii=False)}")
+    print(f"unsupported_ids={json.dumps([item.get('rule_id') for item in unsupported_rows], ensure_ascii=False)}")
+    print(f"unexecuted_ids={json.dumps([item.get('id') for item in unexecuted], ensure_ascii=False)}")
+    if report_path:
+        print(f"report={report_path}")
+    return report_path
+
+
+def understand_command(argv: list[str]) -> int:
+    """Complete and persist the design-understanding phase."""
+
+    parser = argparse.ArgumentParser(prog="dev-ai api-test understand")
+    qa_root_argument(parser)
+    parser.add_argument("--openapi", type=Path)
+    parser.add_argument("--design-root", action="append", type=Path, default=[])
+    parser.add_argument("--design-file", action="append", type=Path, default=[])
+    args = parser.parse_args(argv)
+    qa_root = args.qa_root.resolve()
+    design = discover(qa_root.parent, design_roots=args.design_root, design_files=args.design_file)
+    if not design.files:
+        print("ERROR: design documents are required; provide --design-root/--design-file", file=sys.stderr)
+        _design_report(qa_root, {}, status="blocked", failures=["no design source"])
+        return 2
+    source_spec = args.openapi.resolve() if args.openapi else next(
+        (path for path in (qa_root / CONTRACTS / "openapi.json", qa_root / CONTRACTS / "openapi.yaml", qa_root / CONTRACTS / "openapi.yml") if path.is_file()),
+        None,
+    )
+    if source_spec is None or not source_spec.is_file():
+        print("ERROR: a valid local OpenAPI contract is required for design understanding", file=sys.stderr)
+        _design_report(qa_root, {}, status="blocked", failures=["OpenAPI contract is missing"])
+        return 2
+    try:
+        source_document = load_document(source_spec)
+        manifest = extract(source_spec, source_document)
+        document, errors = build_rules(qa_root.parent, design.files, manifest, qa_root=qa_root)
+    except (OSError, ValueError, TypeError, SystemExit) as exc:
+        print(f"ERROR: cannot complete design understanding: {exc}", file=sys.stderr)
+        _design_report(qa_root, {}, status="blocked", failures=[str(exc)])
+        return 2
+    _write_design_understanding(qa_root, document)
+    failures = [*errors, *understanding_errors(document)]
+    _design_report(qa_root, document, status="complete" if not failures else "blocked", failures=failures)
+    return 2 if failures else 0
 
 
 def generate_command(argv: list[str]) -> int:
@@ -190,10 +392,12 @@ def generate_command(argv: list[str]) -> int:
             "ERROR: design documents are required; provide --design-root/--design-file. Candidates:\n" + candidates,
             file=sys.stderr,
         )
+        _design_report(qa_root, {}, status="blocked", failures=["no design source"])
         return 2
     if not args.design_root and not args.design_file and len(design.candidates) > 1:
         candidates = "\n".join(f"  - {path}" for path in design.candidates)
         print("ERROR: multiple design roots found; choose one with --design-root:\n" + candidates, file=sys.stderr)
+        _design_report(qa_root, {}, status="blocked", failures=["multiple design roots require an explicit selector"])
         return 2
     initialize_execution_layout(qa_root, local_scripts=False)
     ensure_rule_library(qa_root)
@@ -228,26 +432,49 @@ def generate_command(argv: list[str]) -> int:
             fetch_command.extend(["--path", value])
         fetch_code = run_child(fetch_command)
         if fetch_code:
+            _design_report(qa_root, {}, status="blocked", failures=[f"OpenAPI fetch failed with exit code {fetch_code}"])
             return fetch_code
     if not source_spec.is_file():
-        parser.error(f"offline OpenAPI document does not exist: {source_spec}")
+        message = f"offline OpenAPI document does not exist: {source_spec}"
+        print(f"ERROR: {message}", file=sys.stderr)
+        _design_report(qa_root, {}, status="blocked", failures=[message])
+        return 2
     saved_spec = contracts / ("openapi.yaml" if source_spec.suffix.lower() in {".yaml", ".yml"} else "openapi.json")
     if source_spec != saved_spec.resolve() and (not saved_spec.is_file() or source_spec.read_bytes() != saved_spec.read_bytes()):
         shutil.copy2(source_spec, saved_spec)
-    source_document = load_document(saved_spec)
-    manifest = extract(saved_spec, source_document)
-    design_rules, design_errors = build_rules(
-        qa_root.parent,
-        design.files,
-        manifest,
-        qa_root=qa_root,
-    )
+    try:
+        source_document = load_document(saved_spec)
+        manifest = extract(saved_spec, source_document)
+    except (OSError, ValueError, TypeError, SystemExit) as exc:
+        message = f"invalid OpenAPI contract: {exc}"
+        print(f"ERROR: {message}", file=sys.stderr)
+        _design_report(qa_root, {}, status="blocked", failures=[message])
+        return 2
     design_path = qa_root / CONSTRAINTS / "design-rules.yaml"
-    design_path.parent.mkdir(parents=True, exist_ok=True)
-    design_path.write_text(render_manifest(design_rules, design_path), encoding="utf-8")
+    existing_design = load_data(design_path) if design_path.is_file() else {}
+    current_fingerprint = _design_fingerprint(design.files)
+    reusable = (
+        isinstance(existing_design, dict)
+        and existing_design.get("understanding_status") == "complete"
+        and existing_design.get("design_fingerprint") == current_fingerprint
+        and str(existing_design.get("openapi_fingerprint", "")) == str(manifest.get("source", {}).get("sha256", ""))
+    )
+    if reusable:
+        design_rules = existing_design
+        design_errors = understanding_errors(design_rules)
+    else:
+        design_rules, design_errors = build_rules(
+            qa_root.parent,
+            design.files,
+            manifest,
+            qa_root=qa_root,
+        )
+        _write_design_understanding(qa_root, design_rules)
+        design_errors = [*design_errors, *understanding_errors(design_rules)]
     if design_errors:
         for error in design_errors:
             print(f"ERROR: {error}", file=sys.stderr)
+        _design_report(qa_root, design_rules, status="blocked", failures=design_errors)
         return 2
     if args.source_root:
         missing = [str(path) for path in args.source_root if not path.is_dir()]
@@ -267,36 +494,42 @@ def generate_command(argv: list[str]) -> int:
         module_map.parent.mkdir(parents=True, exist_ok=True)
         module_map.write_text(render_manifest(generate_module_map(manifest), module_map), encoding="utf-8")
         print(f"created {module_map}; review Tag ownership before relying on generated coverage")
-    summary = write_partitioned(
-        manifest,
-        module_map,
-        contracts / "modules",
-        seed_cases=not args.no_seed_cases,
-        incremental=args.incremental,
-        coverage_profile=coverage_profile,
-        design_sha256=design_summary(design_rules)["sha256"],
-    )
-    apply_to_contracts(contracts, design_rules)
-    if (contracts / "generation-state.yaml").is_file():
-        refresh_generation_state_cases(contracts)
-    derive_mock_data_contracts(qa_root)
-    if (contracts / "generation-state.yaml").is_file():
-        refresh_generation_state_cases(contracts)
-    write_value_resolutions(qa_root)
-    materialize(contracts, qa_root / BRUNO, execution_config_path=qa_root / EXECUTION / "config.yaml")
-    write_value_resolutions(qa_root)
-    write_qa_lock(contracts)
-    version_lock = contracts / "version-lock.yaml"
-    if version_lock.is_file():
-        lock = load_document(version_lock)
-        if isinstance(lock, dict):
-            lock = dict(lock)
-            lock["openapi"] = {
-                "file": str(saved_spec.relative_to(contracts)),
-                "sha256": manifest.get("source", {}).get("sha256"),
-            }
-            lock["design"] = design_summary(design_rules)
-            version_lock.write_text(render_manifest(lock, version_lock), encoding="utf-8")
+    try:
+        summary = write_partitioned(
+            manifest,
+            module_map,
+            contracts / "modules",
+            seed_cases=not args.no_seed_cases,
+            incremental=args.incremental,
+            coverage_profile=coverage_profile,
+            design_sha256=design_summary(design_rules)["sha256"],
+        )
+        apply_to_contracts(contracts, design_rules)
+        if (contracts / "generation-state.yaml").is_file():
+            refresh_generation_state_cases(contracts)
+        derive_mock_data_contracts(qa_root)
+        if (contracts / "generation-state.yaml").is_file():
+            refresh_generation_state_cases(contracts)
+        write_value_resolutions(qa_root)
+        materialize(contracts, qa_root / BRUNO, execution_config_path=qa_root / EXECUTION / "config.yaml")
+        write_value_resolutions(qa_root)
+        write_qa_lock(contracts)
+        version_lock = contracts / "version-lock.yaml"
+        if version_lock.is_file():
+            lock = load_document(version_lock)
+            if isinstance(lock, dict):
+                lock = dict(lock)
+                lock["openapi"] = {
+                    "file": str(saved_spec.relative_to(contracts)),
+                    "sha256": manifest.get("source", {}).get("sha256"),
+                }
+                lock["design"] = design_summary(design_rules)
+                version_lock.write_text(render_manifest(lock, version_lock), encoding="utf-8")
+    except (OSError, TypeError, ValueError, SystemExit) as exc:
+        message = f"generation failed: {exc}"
+        print(f"ERROR: {message}", file=sys.stderr)
+        _design_report(qa_root, design_rules, status="failed", failures=[message])
+        return 2
     constraint_errors = [
         *validate_stage(qa_root, "generation"),
         *validate_stage(qa_root, "materialization"),
@@ -304,7 +537,42 @@ def generate_command(argv: list[str]) -> int:
     if constraint_errors:
         for error in dict.fromkeys(constraint_errors):
             print(f"ERROR: {error}", file=sys.stderr)
+        _design_report(qa_root, design_rules, status="blocked", failures=constraint_errors)
         return 2
+    generated_cases = 0
+    protocol_cases = 0
+    pending_cases = 0
+    for module_dir in sorted((contracts / "modules").glob("*/")):
+        case_path = module_dir / "cases.yaml"
+        if not case_path.is_file():
+            continue
+        case_document = load_document(case_path)
+        for case in case_document.get("cases", []) if isinstance(case_document, dict) else []:
+            if not isinstance(case, dict):
+                continue
+            is_pending = case.get("review_required") is True or case.get("manual_confirmation")
+            if case.get("source") == "design" and not is_pending:
+                generated_cases += 1
+            elif case.get("source") == "openapi":
+                protocol_cases += 1
+            if is_pending:
+                pending_cases += 1
+    pending_rules = len(design_rules.get("manual_confirmations", []))
+    flow_candidates = len(design_rules.get("flow_candidates", []))
+    mapping_counts = design_rules.get("mapping", {}).get("counts", {}) if isinstance(design_rules.get("mapping"), dict) else {}
+    uncovered = {
+        key: int(mapping_counts.get(key, 0) or 0)
+        for key in ("design_without_openapi", "openapi_without_design", "multiple_candidates")
+    }
+    print(
+        "design_understanding "
+        "status=complete "
+        f"rules={len(design_rules.get('rules', []))} "
+        f"formal_cases={generated_cases} protocol_cases={protocol_cases} "
+        f"pending_cases={pending_cases} pending_confirmations={pending_rules} flow_candidates={sum(1 for item in design_rules.get('flow_candidates', []) if isinstance(item, dict) and not item.get('can_generate'))} "
+        f"unsupported={sum(1 for item in design_rules.get('understanding', []) if isinstance(item, dict) and item.get('can_generate') is False)} "
+        f"uncovered={json.dumps(uncovered, ensure_ascii=False, sort_keys=True)} execution=not_started unexecuted=all"
+    )
     print(
         f"generated endpoints={len(manifest['endpoints'])} changed_modules={len(summary['changed_modules'])} "
         f"skipped_modules={len(summary['skipped_modules'])}"
@@ -313,9 +581,18 @@ def generate_command(argv: list[str]) -> int:
         print(f"REVIEW: remove the .bru file for deleted endpoint {endpoint_id}", file=sys.stderr)
     for case_id in summary["manual_review_cases"]:
         print(f"REVIEW: preserved manually modified case {case_id}", file=sys.stderr)
+    _design_report(qa_root, design_rules, status="complete", execution="not_started")
     if is_loopback_openapi(source_document):
         print("OpenAPI came from a running local service; starting the required execution attempt")
-        return run_command(["--qa-root", str(qa_root)])
+        execution_code = run_command(["--qa-root", str(qa_root)])
+        _design_report(
+            qa_root,
+            design_rules,
+            status="complete" if execution_code == 0 else "failed",
+            execution="completed" if execution_code == 0 else "failed",
+            failures=[] if execution_code == 0 else [f"execution failed with exit code {execution_code}"],
+        )
+        return execution_code
     return 0
 
 
@@ -653,7 +930,7 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(prog="dev-ai api-test")
     commands = (
-        "init", "generate", "materialize", "check", "run", "preflight", "reconcile",
+        "init", "understand", "generate", "materialize", "check", "run", "preflight", "reconcile",
         "aggregate", "worker-start", "worker-check", "mock-data-generate", "mock-data-clean", "scripts",
     )
     parser.add_argument("command", nargs="?", choices=commands)
@@ -665,6 +942,8 @@ def main(argv: list[str] | None = None) -> int:
     command, remainder = argv[0], argv[1:]
     if command == "init":
         return init_command(remainder)
+    if command == "understand":
+        return understand_command(remainder)
     if command == "generate":
         return generate_command(remainder)
     if command == "materialize":

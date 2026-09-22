@@ -1,6 +1,6 @@
 {
   "name": "@seres/dev-ai",
-  "version": "6.6.0",
+  "version": "6.7.0",
   "description": "npm installer for the dev-ai Python runtime and skills",
   "license": "UNLICENSED",
   "bin": {

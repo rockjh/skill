@@ -308,7 +308,7 @@ class ForwardProjectTests(unittest.TestCase):
         entries = []
         for name in (
             "public_api", "test_or_admin_api", "mocks_and_faults", "dynamic_configuration",
-            "scheduled_jobs", "messages", "database_control",
+            "scheduled_jobs", "messages", "database_read", "database_control", "observability",
         ):
             extra = "\n    safety: null" if name == "database_control" else ""
             entries.append(
@@ -319,6 +319,7 @@ class ForwardProjectTests(unittest.TestCase):
         for kind in (
             "public_api", "test_or_admin_api", "database_control", "messages",
             "scheduled_jobs", "mocks_and_faults", "dynamic_configuration", "existing_test_data",
+            "database_read", "observability",
         ):
             status = "usable" if kind == "existing_test_data" else "not_found"
             candidates.append(
@@ -332,6 +333,8 @@ class ForwardProjectTests(unittest.TestCase):
                 "          observation: observe_outcome\n"
                 "          isolation: query-key\n"
                 "          cleanup: verify-no-mutation\n"
+                "          impact: none\n"
+                "          recovery: verify-query-key\n"
                 "          evidence: [repo#SourceAnchor]"
             )
         candidate_matrix = "\n".join(candidates)
@@ -360,7 +363,7 @@ class ForwardProjectTests(unittest.TestCase):
               blockers: []
             # 业务前置：查询键属于当前环境测试数据。
             preconditions: [测试查询键已配置]
-            # 可构造性：前置和步骤均已穷尽八类候选路径。
+            # 可构造性：前置和步骤均已穷尽十类候选路径。
             constructability:
               preconditions:
                 - id: 测试查询键已配置

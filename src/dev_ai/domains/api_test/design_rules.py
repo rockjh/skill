@@ -1,9 +1,9 @@
 """Design-document discovery, parsing, and OpenAPI coverage mapping.
 
-Design documents are deliberately treated as opaque reviewed text.  The
-parser extracts only auditable section boundaries and a few explicit scalar
-markers; it never attempts to infer business behaviour from source code or
-runtime responses.
+Design documents remain the only business authority.  The parser keeps explicit
+markers when present, and otherwise extracts conservative semantic candidates
+from reviewed prose/code while retaining quotes, evidence levels, and unknowns;
+it never infers business behaviour from source code or runtime responses.
 """
 
 from __future__ import annotations
@@ -22,6 +22,26 @@ from .manifest_io import load_data
 HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE")
 METHOD_PATH_RE = re.compile(
     r"(?im)^\s*(?:#{1,6}\s*)?(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE)\s+(`?/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%{}-]*`?)\s*$"
+)
+# Natural-language designs commonly put the operation in a sentence (or in a
+# curl example) instead of using a heading.  The fallback is deliberately
+# conservative: it only creates a candidate when an HTTP verb is followed by a
+# path, and never invents a request body or a business result.
+INLINE_METHOD_PATH_RE = re.compile(
+    r"(?i)\b(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE)\s+"
+    r"(?:\|\s*)?(?:(?:https?://[^/\s|]+))?(`?/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%{}-]+`?)"
+)
+TABLE_METHOD_PATH_RE = re.compile(
+    r"(?i)\|\s*(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE)\s*\|\s*"
+    r"(`?/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%{}-]+`?)"
+)
+PATH_PARAMETER_RE = re.compile(r"\{([^{}]+)\}")
+DESIGN_VERSION_RE = re.compile(
+    r"(?im)^\s*(?:api\s+version|design\s+version|接口版本|设计版本)\s*[:：=]\s*([A-Za-z0-9_.-]+)\s*$"
+)
+STATUS_ASSERTION_RE = re.compile(
+    r"(?i)(?:status|state|状态)\s*(?:is|becomes?|changes?\s+to|=|:|为|变为|变成|更新为)?\s*"
+    r"([A-Za-z][A-Za-z0-9_-]*|[\u3400-\u4dbf\u4e00-\u9fff]{1,24})"
 )
 MARKER_RE = {
     "rule_id": re.compile(r"(?im)^\s*(?:rule[_ ]?id|规则\s*id)\s*[:：]\s*([A-Za-z0-9_.:-]+)"),
@@ -43,6 +63,7 @@ MARKER_RE = {
     "flow": re.compile(r"(?im)^\s*(?:test[_ ]?flow|flow|测试流程|自动化流程)\s*[:：=]\s*(.+?)\s*$"),
 }
 ASSERTION_RE = re.compile(r"(?im)^\s*(?:assert|assertion|断言)\s*[:：]\s*(\$[^=:\s]+)\s*(?:=|equals|等于)\s*(.+?)\s*$")
+ABSENT_ASSERTION_RE = re.compile(r"(?im)^\s*(?:assert\s+absent|absence|不存在)\s*[:：]\s*(\$[^\s]+)\s*$")
 EXCLUSION_RE = re.compile(r"(?im)^\s*(?:exclude|exclusion|排除)\s*[:：]\s*((?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE)\s+/\S+)")
 
 
@@ -164,15 +185,255 @@ def discover(
     return DesignDiscovery(tuple(dict.fromkeys(files)), tuple(existing), tuple())
 
 
-def _section_records(path: Path) -> list[dict[str, Any]]:
+def _clean_route(route: str) -> str:
+    cleaned = route.strip("`'\"").rstrip(".,;:)\"'")
+    return re.split(r"[?#]", cleaned, 1)[0] or "/"
+
+
+def _natural_sentences(content: str) -> list[str]:
+    values = re.split(r"(?:\r?\n|(?<=[.!?。！？；;]))", content)
+    return [re.sub(r"\s+", " ", value).strip(" -*\t") for value in values if value.strip()]
+
+
+def _semantic_fields(content: str) -> dict[str, Any]:
+    """Extract only business facts stated in prose.
+
+    This is intentionally a lossy candidate extractor.  It records the source
+    sentence and leaves unsupported details unknown; OpenAPI still owns all
+    transport shape and the generation gate decides whether a candidate is
+    executable.
+    """
+
+    sentences = _natural_sentences(content)
+    status_values = []
+    for match in STATUS_ASSERTION_RE.finditer(content):
+        value = match.group(1).strip()
+        if value.casefold() not in {
+            "is", "to", "and", "or", "from", "change", "changes", "changed",
+            "become", "becomes", "became", "updated", "update",
+        }:
+            status_values.append(value)
+    status_values = list(dict.fromkeys(status_values))
+    http_statuses = []
+    for match in re.finditer(
+        r"(?i)(?:\bHTTP(?:\s+status|\s+code)?\s*[:=]?\s*|\breturns?\s+|\u8fd4\u56de\s*)([1-5]\d{2})\b",
+        content,
+    ):
+        http_statuses.append(int(match.group(1)))
+    http_statuses = list(dict.fromkeys(http_statuses))
+    transitions = [
+        f"{match.group(1)} -> {match.group(2)}"
+        for match in re.finditer(
+            r"(?i)(?:from|由|从)\s*([A-Za-z][A-Za-z0-9_-]*|[\u3400-\u4dbf\u4e00-\u9fff]{1,24})\s*"
+            r"(?:to|到|->|变为|变成)\s*([A-Za-z][A-Za-z0-9_-]*|[\u3400-\u4dbf\u4e00-\u9fff]{1,24})",
+            content,
+        )
+    ]
+    codes: list[Any] = []
+    for match in re.finditer(
+        r"(?i)(?:business\s+(?:error\s+)?code|error\s+code|业务(?:错误)?码)\s*(?:is|=|:|为)?\s*([A-Za-z0-9_.-]+)",
+        content,
+    ):
+        raw = match.group(1).rstrip(".,;:)]}")
+        try:
+            codes.append(_typed_value(raw))
+        except ValueError:
+            codes.append(raw)
+    def matching(*terms: str) -> list[str]:
+        def searchable(sentence: str) -> str:
+            # Endpoint names such as `/records/retry` must not turn an
+            # otherwise ordinary operation into a retry/idempotency rule.
+            return re.sub(r"(?:https?://|/)[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%{}-]*", " ", sentence).casefold()
+
+        return [sentence for sentence in sentences if any(term in searchable(sentence) for term in terms)]
+
+    preconditions = matching("precondition", "before", "when", "only if", "前置", "前提", "当")
+    errors = matching("error", "fail", "failed", "reject", "invalid", "错误", "失败", "拒绝")
+    request_meaning = matching(
+        "request field", "request parameter", "payload", "business id", "业务标识", "请求字段", "请求参数"
+    )
+    side_effects = matching("side effect", "write", "persist", "database", "external call", "落库", "写入", "外部调用")
+    negative_constraints = [
+        sentence for sentence in side_effects
+        if re.search(r"(?i)(?:\b(?:no|without|never|not|does not)\b|不会|不落库|不写入|不重复写入|不产生重复|无任何|不得)", sentence)
+    ]
+    idempotency = matching("idempotent", "duplicate", "repeat", "same key", "幂等", "重复")
+    retries = matching("retry", "retries", "again", "重试")
+    concurrency = matching("concurrent", "parallel", "simultaneous", "并发", "同时")
+    asynchronous = matching("async", "asynchronous", "poll", "eventually", "异步", "轮询", "最终")
+    consistency = matching("consistent", "consistency", "atomic", "same transaction", "一致", "原子", "同一事务")
+    success = matching("success", "successful", "completed", "created", "accepted", "成功", "完成", "创建")
+    signals = [
+        *preconditions, *request_meaning, *errors, *side_effects, *idempotency, *retries,
+        *concurrency, *asynchronous, *consistency, *success, *status_values, *http_statuses, *codes,
+    ]
+    scenario = "business_error" if errors and not success else "success"
+    if idempotency or retries or concurrency:
+        scenario = "safety"
+    assertions = [{"path": "$.status", "equals": value} for value in status_values]
+    if codes:
+        assertions.append({"path": "$.code", "equals": codes[0]})
+    candidate_assertions: list[dict[str, Any]] = [
+        {"kind": "response", "assertion": dict(assertion), "executable": True}
+        for assertion in assertions
+    ]
+    for match in re.finditer(r"(?i)(?:does not return|without response field|不存在字段)\s*(\$\.[A-Za-z0-9_.-]+)", content):
+        assertion = {"path": match.group(1).rstrip(".,;:)") , "exists": False}
+        assertions.append(assertion)
+        candidate_assertions.append({"kind": "response", "assertion": assertion, "executable": True})
+    candidate_assertions.extend(
+        {
+            "kind": "negative_side_effect",
+            "expectation": sentence,
+            "observable_boundary": None,
+            "executable": False,
+        }
+        for sentence in negative_constraints
+    )
+    candidate_assertions.extend(
+        {
+            "kind": "idempotency",
+            "expectation": sentence,
+            "request_count": 2,
+            "executable": False,
+        }
+        for sentence in idempotency
+    )
+    candidate_assertions.extend(
+        _retry_candidate_assertion(sentence)
+        for sentence in retries
+    )
+    return {
+        "preconditions": preconditions,
+        "request_meaning": request_meaning,
+        "success_results": success,
+        "business_errors": errors,
+        "side_effects": side_effects,
+        "negative_constraints": negative_constraints,
+        "idempotency": idempotency,
+        "retries": retries,
+        "concurrency": concurrency,
+        "async_notes": asynchronous,
+        "consistency": consistency,
+        "states": status_values,
+        "transitions": list(dict.fromkeys(transitions)),
+        "assertions": assertions,
+        "candidate_assertions": candidate_assertions,
+        "business_codes": codes,
+        "http_statuses": http_statuses,
+        "scenario": scenario,
+        "signals": signals,
+    }
+
+
+def _retry_candidate_assertion(sentence: str) -> dict[str, Any]:
+    """Normalize only retry facts that are stated without ambiguity."""
+
+    lowered = sentence.casefold()
+    assertion: dict[str, Any] = {
+        "kind": "retry",
+        "expectation": sentence,
+        "executable": False,
+    }
+    state_matches = re.findall(
+        r"(?i)(?:reset(?:s|ted)?(?:\s+the\s+step)?\s+to|set\s+to|重置为|置为|更新为|变为)\s*"
+        r"([A-Za-z][A-Za-z0-9_-]*|[\u3400-\u4dbf\u4e00-\u9fff]{1,24})",
+        sentence,
+    )
+    if state_matches:
+        assertion["state_changes"] = [{
+            "subject": (
+                "first_failed_step"
+                if "first failed" in lowered or "第一个失败" in sentence
+                else "documented_retry_target"
+            ),
+            "to": state,
+        } for state in dict.fromkeys(state_matches)]
+    successful_steps = any(
+        value in lowered for value in ("previous successful", "already successful", "successful steps")
+    ) or any(value in sentence for value in ("前面成功", "之前成功", "已成功", "成功步骤"))
+    not_reexecuted = any(
+        value in lowered for value in ("not rerun", "not re-run", "do not execute again", "not execute again")
+    ) or any(value in sentence for value in ("不重复执行", "不再执行"))
+    if successful_steps and not_reexecuted:
+        assertion["successful_steps_unchanged"] = True
+        assertion["successful_steps_not_reexecuted"] = True
+    return assertion
+
+
+def _rule_id(path: Path, method: str, route: str, line: int, content: str) -> str:
+    digest = hashlib.sha256(f"{path}:{method} {route}:{line}:{content}".encode("utf-8")).hexdigest()[:12]
+    return "DESIGN-" + digest
+
+
+def _unknown_design_id(item: dict[str, Any]) -> str:
+    category = str(item.get("category") or "design_without_openapi")
+    return "UNKNOWN-DESIGN-" + hashlib.sha256(
+        (str(item.get("path", "")) + category).encode("utf-8")
+    ).hexdigest()[:12]
+
+
+def _inline_body_start(text: str, start: int) -> int:
+    """Keep inline endpoint evidence to its containing sentence."""
+
+    boundaries = [text.rfind(value, 0, start) for value in ("\n", ".", "。", "!", "！", "?", "？", ";", "；")]
+    return max(boundaries, default=-1) + 1
+
+
+def _ordered_endpoint_context(text: str, start: int) -> bool:
+    """Return whether the endpoint is part of an explicitly ordered sequence."""
+
+    line_start = text.rfind("\n", 0, start) + 1
+    prefix = text[line_start:start]
+    if re.search(
+        r"(?i)^\s*(?:\d+[.)]|\|\s*\d+\s*\||[-*]\s*(?:\[[ xX]\]\s*)?(?:step\s*)?\d*|"
+        r"step\s+\d+|curl\b|步骤\s*\d+|[^\r\n]*?(?:-->>|->>|--?>|=>))",
+        prefix,
+    ):
+        return True
+    return bool(re.search(
+        r"(?i)(?:\b(?:first|second|then|next|after|finally|subsequently)\b|第一步|第二步|然后|随后|接着|最后)",
+        prefix,
+    ))
+
+
+def _section_records(path: Path, *, include_inline: bool = True) -> list[dict[str, Any]]:
     text = path.read_text(encoding="utf-8", errors="strict")
-    matches = list(METHOD_PATH_RE.finditer(text))
+    heading_matches = list(METHOD_PATH_RE.finditer(text))
+    match_records: list[tuple[re.Match[str], bool]] = [(match, False) for match in heading_matches]
+    if include_inline:
+        inline_matches = [*INLINE_METHOD_PATH_RE.finditer(text), *TABLE_METHOD_PATH_RE.finditer(text)]
+        seen_spans: set[tuple[int, int]] = set()
+        seen_operations: list[tuple[int, int, str, str]] = []
+        for match in sorted(inline_matches, key=lambda value: value.start()):
+            if (match.start(), match.end()) in seen_spans:
+                continue
+            seen_spans.add((match.start(), match.end()))
+            operation = (match.group(1).upper(), _clean_route(match.group(2)))
+            if any(
+                existing_start <= match.start() < existing_end
+                and existing_method == operation[0]
+                and existing_path == operation[1]
+                for existing_start, existing_end, existing_method, existing_path in seen_operations
+            ):
+                continue
+            seen_operations.append((match.start(), match.end(), operation[0], operation[1]))
+            if any(
+                match.start() >= heading.start() and match.end() <= heading.end()
+                for heading in heading_matches
+            ):
+                continue
+            match_records.append((match, True))
+    match_records.sort(key=lambda item: item[0].start())
     records: list[dict[str, Any]] = []
-    for section_index, match in enumerate(matches):
+    for section_index, (match, inline) in enumerate(match_records):
         method = match.group(1).upper()
-        route = match.group(2).strip("`")
+        route = _clean_route(match.group(2))
         body_start = match.end()
-        body_end = matches[section_index + 1].start() if section_index + 1 < len(matches) else len(text)
+        if inline:
+            # Keep the sentence containing the endpoint as evidence.
+            body_start = _inline_body_start(text, match.start())
+        body_end = match_records[section_index + 1][0].start() if section_index + 1 < len(match_records) else len(text)
         body = text[body_start:body_end]
         rule_matches = list(MARKER_RE["rule_id"].finditer(body))
         chunks: list[tuple[str, str | None, int]] = []
@@ -194,7 +455,7 @@ def _section_records(path: Path) -> list[dict[str, Any]]:
             codes = []
             for value in MARKER_RE["business_code"].finditer(content):
                 try:
-                    codes.append(_typed_value(value.group(1).strip()))
+                    codes.append(_typed_value(value.group(1).strip().rstrip(".,;:)]}")))
                 except ValueError as exc:
                     marker_errors.append(f"invalid Business code: {exc}")
             statuses = [int(value.group(1)) for value in MARKER_RE["http_status"].finditer(content)]
@@ -230,6 +491,8 @@ def _section_records(path: Path) -> list[dict[str, Any]]:
                     marker_errors.append(f"invalid Assert value for {assertion.group(1).strip()}: {exc}")
                     continue
                 assertions.append({"path": assertion.group(1).strip(), "equals": expected})
+            for assertion in ABSENT_ASSERTION_RE.finditer(content):
+                assertions.append({"path": assertion.group(1).strip(), "exists": False})
             request_match = MARKER_RE["request"].search(content)
             request: dict[str, Any] | None = None
             if request_match:
@@ -243,7 +506,39 @@ def _section_records(path: Path) -> list[dict[str, Any]]:
                     else:
                         marker_errors.append("Request must be a YAML/JSON object")
             flows = _flow_values(content, marker_errors)
-            title = rule_id or section_title
+            semantic = _semantic_fields(content)
+            explicit = bool(
+                scenario_match or request_match or assertions or statuses or codes
+                or any(MARKER_RE[name].search(content) for name in (
+                    "condition", "async", "transition", "side_effect", "idempotency",
+                    "retry", "concurrency", "external_failure", "flow",
+                ))
+            )
+            if not explicit:
+                scenario = semantic["scenario"]
+                states = semantic["states"]
+                statuses = semantic["http_statuses"]
+                assertions = semantic["assertions"]
+                codes = semantic["business_codes"]
+                is_async = bool(semantic["async_notes"])
+                if is_async and len(states) >= 2:
+                    acceptance = [states[0]]
+                    final = [states[-1]]
+            semantic_side_effects = semantic["side_effects"]
+            semantic_idempotency = semantic["idempotency"]
+            semantic_retries = semantic["retries"]
+            semantic_concurrency = semantic["concurrency"]
+            marker_side_effects = [value.group(1).strip() for value in MARKER_RE["side_effect"].finditer(content)]
+            marker_idempotency = [value.group(1).strip() for value in MARKER_RE["idempotency"].finditer(content)]
+            marker_retries = [value.group(1).strip() for value in MARKER_RE["retry"].finditer(content)]
+            marker_concurrency = [value.group(1).strip() for value in MARKER_RE["concurrency"].finditer(content)]
+            evidence_level = "explicit" if explicit else ("derived" if semantic["signals"] else "unknown")
+            candidate_assertions = list(semantic["candidate_assertions"])
+            for assertion in assertions:
+                candidate = {"kind": "response", "assertion": dict(assertion), "executable": True}
+                if candidate not in candidate_assertions:
+                    candidate_assertions.append(candidate)
+            title = rule_id or next(iter(_natural_sentences(content)), section_title)[:120]
             records.append({
                 "id": rule_id,
                 "method": method,
@@ -255,18 +550,40 @@ def _section_records(path: Path) -> list[dict[str, Any]]:
                 "business_codes": codes,
                 "http_statuses": statuses,
                 "states": states,
-                "transitions": [value.group(1).strip() for value in MARKER_RE["transition"].finditer(content)],
-                "side_effects": [value.group(1).strip() for value in MARKER_RE["side_effect"].finditer(content)],
-                "idempotency": [value.group(1).strip() for value in MARKER_RE["idempotency"].finditer(content)],
-                "retries": [value.group(1).strip() for value in MARKER_RE["retry"].finditer(content)],
-                "concurrency": [value.group(1).strip() for value in MARKER_RE["concurrency"].finditer(content)],
+                "transitions": [value.group(1).strip() for value in MARKER_RE["transition"].finditer(content)] or semantic["transitions"],
+                "side_effects": marker_side_effects or semantic_side_effects,
+                "negative_constraints": semantic["negative_constraints"],
+                "idempotency": marker_idempotency or semantic_idempotency,
+                "retries": marker_retries or semantic_retries,
+                "concurrency": marker_concurrency or semantic_concurrency,
                 "external_failures": [value.group(1).strip() for value in MARKER_RE["external_failure"].finditer(content)],
                 "async": is_async,
                 "acceptance_statuses": acceptance,
                 "final_statuses": final,
                 "assertions": assertions,
+                "candidate_assertions": candidate_assertions,
                 "request": request,
                 "request_declared": request_match is not None,
+                "evidence_level": evidence_level,
+                "derivation": (
+                    "Converted stated business sentences into candidate fields; no transport or business value was invented."
+                    if not explicit and semantic["signals"] else ""
+                ),
+                "understanding": {
+                    "preconditions": semantic["preconditions"],
+                    "request_meaning": (
+                        [{"request": request}] if isinstance(request, dict) else semantic["request_meaning"]
+                    ),
+                    "success_results": semantic["success_results"],
+                    "business_errors": semantic["business_errors"],
+                    "side_effects": semantic["side_effects"],
+                    "idempotency": semantic["idempotency"],
+                    "retries": semantic["retries"],
+                    "concurrency": semantic["concurrency"],
+                    "async": semantic["async_notes"],
+                    "consistency": semantic["consistency"],
+                    "negative_constraints": semantic["negative_constraints"],
+                },
                 "_flows": flows,
                 "marker_errors": marker_errors,
                 "section_line": section_line,
@@ -278,7 +595,10 @@ def _section_records(path: Path) -> list[dict[str, Any]]:
                     "line": text[:offset].count("\n") + 1,
                     "endpoint_scope": [f"{method} {route}"],
                     "confidence": "high",
+                    "quote": content[:2000],
+                    "evidence_level": evidence_level,
                 },
+                "_ordered": _ordered_endpoint_context(text, match.start()),
             })
     return records
 
@@ -474,7 +794,7 @@ def _normalize_flows(sections: list[dict[str, Any]]) -> tuple[list[dict[str, Any
     errors: list[str] = []
     seen: dict[str, str] = {}
     rule_flow: dict[str, str] = {}
-    allowed_flow = {"id", "mode", "steps", "cleanup"}
+    allowed_flow = {"id", "mode", "steps", "cleanup", "final_status", "data_transfer"}
     allowed_step = {"rule_id", "operation", "capture", "capture_path", "uses", "assert_absent"}
     for declaring_rule, declaration in declarations:
         unknown = sorted(str(key) for key in declaration if key not in allowed_flow)
@@ -550,7 +870,11 @@ def _normalize_flows(sections: list[dict[str, Any]]) -> tuple[list[dict[str, Any
                     f"design flow {flow_id} step {index} request does not use captured value(s): "
                     + ", ".join(missing_request)
                 )
-            step: dict[str, Any] = {"rule_id": rule_id, "operation": operation}
+            step: dict[str, Any] = {
+                "rule_id": rule_id,
+                "operation": operation,
+                "business_assertions": list(rule.get("candidate_assertions", rule.get("assertions", []))),
+            }
             if capture_paths:
                 step["capture"] = list(capture_paths)
                 step["capture_paths"] = capture_paths
@@ -560,7 +884,8 @@ def _normalize_flows(sections: list[dict[str, Any]]) -> tuple[list[dict[str, Any
                 if not isinstance(raw_step["assert_absent"], str) or not raw_step["assert_absent"].startswith("$"):
                     errors.append(f"design flow {flow_id} step {index} assert_absent needs a JSON path")
                 elif not any(
-                    item.get("path") == raw_step["assert_absent"] and item.get("equals", object()) is None
+                    item.get("path") == raw_step["assert_absent"]
+                    and (item.get("equals", object()) is None or item.get("exists") is False)
                     for item in rule.get("assertions", []) if isinstance(item, dict)
                 ):
                     errors.append(
@@ -569,15 +894,53 @@ def _normalize_flows(sections: list[dict[str, Any]]) -> tuple[list[dict[str, Any
                 step["assert_absent"] = raw_step["assert_absent"]
             steps.append(step)
             captured.update(capture_paths)
+        declared_transfer = declaration.get("data_transfer")
+        if declared_transfer is not None and not isinstance(declared_transfer, list):
+            errors.append(f"design flow {flow_id} data_transfer must be a list")
+            declared_transfer = None
         normalized: dict[str, Any] = {
             "id": flow_id,
             "mode": mode,
             "source": "design",
             "design_rule_ids": [str(step.get("rule_id")) for step in steps],
             "steps": steps,
+            "business_assertions": [
+                assertion
+                for step in steps
+                for assertion in step.get("business_assertions", [])
+                if isinstance(assertion, dict)
+            ],
+            "data_transfer": copy.deepcopy(declared_transfer) if declared_transfer is not None else [
+                {"captures": step.get("capture_paths", {}), "uses": step.get("uses", [])}
+                for step in steps
+                if step.get("capture_paths") or step.get("uses")
+            ],
         }
-        if str(declaration.get("cleanup", "")).strip():
-            normalized["cleanup"] = str(declaration["cleanup"]).strip()
+        last_rule = rules.get(str(steps[-1].get("rule_id")), {}) if steps else {}
+        final_status = str(declaration.get("final_status", "")).strip()
+        if not final_status:
+            final_status = str((last_rule.get("final_statuses") or last_rule.get("states") or [""])[-1]).strip()
+        if not final_status:
+            final_status = next(
+                (
+                    str(item.get("assertion", {}).get("equals"))
+                    for item in steps[-1].get("business_assertions", [])
+                    if isinstance(item, dict)
+                    and item.get("kind") == "response"
+                    and str(item.get("assertion", {}).get("path", "")).casefold() == "$.status"
+                    and "equals" in item.get("assertion", {})
+                ),
+                "",
+            )
+        if final_status:
+            normalized["final_status"] = final_status
+        cleanup = str(declaration.get("cleanup", "")).strip()
+        methods = [str(rules.get(str(step.get("rule_id")), {}).get("method", "")).upper() for step in steps]
+        if not cleanup and methods and all(method in {"GET", "HEAD", "OPTIONS"} for method in methods):
+            cleanup = "not required: all flow operations are read-only"
+        if not cleanup and any(method in {"POST", "PUT", "PATCH", "DELETE"} for method in methods):
+            errors.append(f"design flow {flow_id} must declare a cleanup action for mutating operations")
+        normalized["cleanup"] = cleanup
         fingerprint = repr(normalized)
         if flow_id in seen and seen[flow_id] != fingerprint:
             errors.append(f"conflicting design flow declarations for {flow_id}")
@@ -597,6 +960,193 @@ def _request_variables(value: Any) -> set[str]:
     return set()
 
 
+def _natural_flow_candidates(sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Turn unlabelled ordered calls into auditable flow candidates.
+
+    A candidate is executable when order, assertions, and data dependencies are
+    explicit enough to run without inventing captures.  Otherwise it remains a
+    concrete pending candidate.
+    """
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for section in sections:
+        grouped.setdefault(str(section.get("evidence", {}).get("file", "")), []).append(section)
+    candidates: list[dict[str, Any]] = []
+    for source, values in grouped.items():
+        operations = []
+        seen: set[str] = set()
+        ordered_values = [item for item in values if item.get("_ordered") is True]
+        if len(ordered_values) < 2:
+            continue
+        for item in sorted(ordered_values, key=lambda value: int(value.get("section_line", 0))):
+            operation = f"{item.get('method')} {item.get('path')}"
+            if operation in seen:
+                continue
+            seen.add(operation)
+            operations.append(item)
+        if len(operations) < 2:
+            continue
+        candidate_id = "FLOW-CANDIDATE-" + hashlib.sha256(
+            f"{source}:{','.join(str(item.get('id')) for item in operations)}".encode("utf-8")
+        ).hexdigest()[:12]
+        unknown: list[str] = []
+        for item in operations[1:]:
+            if PATH_PARAMETER_RE.findall(str(item.get("path", ""))):
+                unknown.append("step-to-step data transfer")
+        if any(not item.get("assertions") for item in operations):
+            unknown.append("business assertions")
+        final_status = str((operations[-1].get("final_statuses") or operations[-1].get("states") or [""])[-1]).strip()
+        if not final_status:
+            unknown.append("final status")
+        mutating = any(str(item.get("method", "")).upper() in {"POST", "PUT", "PATCH", "DELETE"} for item in operations)
+        cleanup = ""
+        if mutating:
+            unknown.append("owned test-data isolation and cleanup action")
+        else:
+            cleanup = "not required: all ordered operations are read-only"
+        can_generate = not unknown
+        candidates.append({
+            "id": candidate_id,
+            "name": f"ordered design calls in {Path(source).name or 'design'}",
+            "source": source,
+            "evidence_level": "derived",
+            "steps": [
+                {
+                    "order": index,
+                    "rule_id": item.get("id"),
+                    "operation": f"{item.get('method')} {item.get('path')}",
+                    "business_assertions": list(item.get("assertions", [])),
+                }
+                for index, item in enumerate(operations, start=1)
+            ],
+            "data_transfer": [],
+            "final_status": final_status,
+            "cleanup": cleanup,
+            "unknown": list(dict.fromkeys(unknown)),
+            "can_generate": can_generate,
+        })
+    return candidates
+
+
+def _path_shape(path: str) -> str:
+    return PATH_PARAMETER_RE.sub("{}", str(path).rstrip("/")) or "/"
+
+
+def _semantic_tokens(value: Any) -> set[str]:
+    """Return conservative ASCII and CJK business-name tokens."""
+
+    text = str(value or "").casefold()
+    tokens = set(re.findall(r"[A-Za-z][A-Za-z0-9]{2,}", text))
+    for chunk in re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]{2,}", text):
+        tokens.add(chunk)
+        tokens.update(chunk[index:index + 2] for index in range(len(chunk) - 1))
+    return {token for token in tokens if token}
+
+
+def _endpoint_semantic_tokens(endpoint: dict[str, Any]) -> set[str]:
+    value = " ".join(
+        str(endpoint.get(key) or "")
+        for key in ("operation_id", "summary", "description", "path")
+    )
+    return _semantic_tokens(value)
+
+
+def _semantic_operation_records(
+    path: Path,
+    text: str,
+    endpoints: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Create semantic candidates when prose names an operation but no route.
+
+    A candidate is accepted only for a unique token match. Ties and weak
+    matches are returned as auditable unresolved mapping records instead of
+    silently selecting an OpenAPI operation.
+    """
+
+    design_tokens = _semantic_tokens(text)
+    scored = []
+    for endpoint in endpoints:
+        overlap = design_tokens & _endpoint_semantic_tokens(endpoint)
+        if overlap:
+            scored.append((len(overlap), endpoint, overlap))
+    if not scored:
+        return [], [{"category": "design_without_openapi", "path": str(path), "quote": text[:2000], "candidates": []}]
+    best = max(score for score, _, _ in scored)
+    winners = [(endpoint, overlap) for score, endpoint, overlap in scored if score == best]
+    if best < 2:
+        return [], [{"category": "design_without_openapi", "path": str(path), "quote": text[:2000], "candidates": []}]
+    if len(winners) != 1:
+        return [], [{
+            "category": "multiple_candidates",
+            "path": str(path),
+            "quote": text[:2000],
+            "candidates": [
+                {"endpoint_id": str(endpoint.get("id", "")), "operation": f"{endpoint.get('method')} {endpoint.get('path')}"}
+                for endpoint, _ in winners
+            ],
+        }]
+    endpoint, overlap = winners[0]
+    semantic = _semantic_fields(text)
+    line = 1
+    record = {
+        "id": _rule_id(path, str(endpoint.get("method")), str(endpoint.get("path")), line, text),
+        "method": str(endpoint.get("method", "")).upper(),
+        "path": str(endpoint.get("path", "")),
+        "title": next(iter(_natural_sentences(text)), str(endpoint.get("summary") or endpoint.get("operation_id") or "semantic candidate"))[:120],
+        "content": text.strip(),
+        "scenario": semantic["scenario"],
+        "condition": " ".join(semantic["preconditions"][:1]),
+        "business_codes": semantic["business_codes"],
+        "http_statuses": semantic["http_statuses"],
+        "states": semantic["states"],
+        "transitions": semantic["transitions"],
+        "side_effects": semantic["side_effects"],
+        "negative_constraints": semantic["negative_constraints"],
+        "idempotency": semantic["idempotency"],
+        "retries": semantic["retries"],
+        "concurrency": semantic["concurrency"],
+        "external_failures": [],
+        "async": bool(semantic["async_notes"]),
+        "acceptance_statuses": [],
+        "final_statuses": [],
+        "assertions": semantic["assertions"],
+        "candidate_assertions": semantic["candidate_assertions"],
+        "request": None,
+        "request_declared": False,
+        "evidence_level": "derived" if semantic["signals"] else "unknown",
+        "_semantic_candidate": True,
+        "derivation": f"Unique semantic candidate matched OpenAPI tokens: {', '.join(sorted(overlap))}.",
+        "understanding": {
+            "preconditions": semantic["preconditions"],
+            "request_meaning": semantic["request_meaning"],
+            "success_results": semantic["success_results"],
+            "business_errors": semantic["business_errors"],
+            "side_effects": semantic["side_effects"],
+            "idempotency": semantic["idempotency"],
+            "retries": semantic["retries"],
+            "concurrency": semantic["concurrency"],
+            "async": semantic["async_notes"],
+            "consistency": semantic["consistency"],
+            "negative_constraints": semantic["negative_constraints"],
+        },
+        "_flows": [],
+        "marker_errors": [],
+        "section_line": line,
+        "section_sha256": hashlib.sha256(text.strip().encode("utf-8")).hexdigest(),
+        "evidence": {
+            "source_kind": "design",
+            "file": str(path),
+            "symbol": "semantic candidate",
+            "line": line,
+            "endpoint_scope": [f"{endpoint.get('method')} {endpoint.get('path')}"],
+            "confidence": "medium",
+            "quote": text[:2000],
+            "evidence_level": "derived" if semantic["signals"] else "unknown",
+        },
+    }
+    return [record], []
+
+
 def build_rules(
     project_root: Path,
     files: Iterable[Path],
@@ -610,30 +1160,107 @@ def build_rules(
     files = tuple(path.resolve() for path in files)
     sections: list[dict[str, Any]] = []
     documents: list[dict[str, Any]] = []
+    unresolved_documents: list[dict[str, Any]] = []
+    endpoint_preview = [item for item in manifest.get("endpoints", []) if isinstance(item, dict)]
     for path in files:
         try:
             content = path.read_bytes()
+            marker_parsed = _section_records(path, include_inline=False)
             parsed = _section_records(path)
+            text = content.decode("utf-8")
+            if not parsed:
+                parsed, semantic_unresolved = _semantic_operation_records(path, text, endpoint_preview)
+            else:
+                semantic_unresolved = []
         except (OSError, UnicodeDecodeError, ValueError) as exc:
             return {}, [f"cannot read design document {path}: {exc}"]
+        marker_count = len({(item.get("method"), item.get("path"), item.get("section_line")) for item in marker_parsed})
+        semantic_record_count = len(parsed) + len(semantic_unresolved)
+        marker_operations = sorted({f"{item.get('method')} {item.get('path')}" for item in marker_parsed})
+        semantic_operations = sorted({f"{item.get('method')} {item.get('path')}" for item in parsed})
         documents.append({
             "path": str(path),
             "sha256": hashlib.sha256(content).hexdigest(),
-            "sections": len({(item.get("method"), item.get("path"), item.get("section_line")) for item in parsed}),
+            "design_version": next((match.group(1) for match in DESIGN_VERSION_RE.finditer(text)), None),
+            "sections": marker_count,
+            "semantic_rules": semantic_record_count,
+            "parser_gap": semantic_record_count > marker_count,
+            "marker_operations": marker_operations,
+            "semantic_operations": semantic_operations,
+            "semantic_only_operations": sorted(set(semantic_operations) - set(marker_operations))
+            or (["unmapped design prose"] if semantic_unresolved else []),
+            "understanding": "unknown" if not parsed else (
+                "semantic" if semantic_unresolved or any(item.get("evidence_level") != "explicit" for item in parsed) else "marker"
+            ),
         })
+        if not parsed:
+            unresolved_documents.extend(
+                semantic_unresolved
+                or [{"path": str(path), "quote": text[:2000], "category": "design_without_openapi", "candidates": []}]
+            )
         for item in parsed:
             item["id"] = item["id"] or "DESIGN-" + hashlib.sha256(
                 f"{path}:{item['method']} {item['path']}:{item.get('section_line')}:{item.get('section_sha256')}".encode("utf-8")
             ).hexdigest()[:12]
             sections.append(item)
     flows, flow_errors = _normalize_flows(sections)
+    flow_candidates = _natural_flow_candidates(sections) if not flows else []
+    for candidate in flow_candidates:
+        if not candidate.get("can_generate"):
+            continue
+        flow_steps = [
+            {
+                "rule_id": step.get("rule_id"),
+                "operation": str(step.get("operation", "")).casefold(),
+                "business_assertions": [
+                    {"kind": "response", "assertion": dict(item), "executable": True}
+                    for item in step.get("business_assertions", [])
+                    if isinstance(item, dict)
+                ],
+            }
+            for step in candidate.get("steps", [])
+        ]
+        generated_flow = {
+            "id": candidate.get("id"),
+            "mode": "sequential",
+            "source": "design",
+            "design_rule_ids": [str(step.get("rule_id")) for step in flow_steps],
+            "steps": flow_steps,
+            "business_assertions": [
+                assertion for step in flow_steps for assertion in step.get("business_assertions", [])
+            ],
+            "data_transfer": list(candidate.get("data_transfer", [])),
+            "final_status": candidate.get("final_status", ""),
+        }
+        if candidate.get("cleanup"):
+            generated_flow["cleanup"] = str(candidate.get("cleanup"))
+        flows.append(generated_flow)
     endpoints = [item for item in manifest.get("endpoints", []) if isinstance(item, dict)]
     endpoint_keys = {
         f"{str(item.get('method', '')).upper()} {item.get('path')}": str(item.get("id", ""))
         for item in endpoints
     }
+    endpoint_by_id = {str(item.get("id")): item for item in endpoints if item.get("id")}
+    endpoint_shapes: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for endpoint in endpoints:
+        endpoint_shapes.setdefault(
+            (str(endpoint.get("method", "")).upper(), _path_shape(str(endpoint.get("path", "")))),
+            [],
+        ).append(endpoint)
     exclusions = _explicit_exclusions(project_root, files, qa_root)
     errors: list[str] = list(flow_errors)
+    design_versions = {
+        str(item.get("design_version"))
+        for item in documents
+        if str(item.get("design_version", "")).strip()
+    }
+    if len(design_versions) > 1:
+        errors.append("design documents declare conflicting versions: " + ", ".join(sorted(design_versions)))
+    openapi_version = str(manifest.get("source", {}).get("api_version", "")).strip()
+    if openapi_version and design_versions and openapi_version not in design_versions:
+        errors.append(
+            f"design/OpenAPI version conflict: design={','.join(sorted(design_versions))} OpenAPI={openapi_version}"
+        )
     excluded_keys = {
         f"{str(item.get('method', '')).upper()} {item.get('path')}"
         for item in exclusions
@@ -672,13 +1299,74 @@ def build_rules(
         elif _approved_exclusion(item) and str(item.get("reason", "")).strip():
             errors.append("approved exclusion does not match an OpenAPI endpoint")
     by_key: dict[str, list[dict[str, Any]]] = {}
+    mapping: list[dict[str, Any]] = []
+    mapped_endpoint_ids: set[str] = set()
+    conflicting_operations: list[tuple[str, list[dict[str, Any]]]] = []
+    conflicting_keys: set[str] = set()
     for section in sections:
         key = f"{section['method']} {section['path']}"
         by_key.setdefault(key, []).append(section)
-        if key not in endpoint_keys:
+        exact = endpoint_keys.get(key)
+        aliases: list[dict[str, Any]] = []
+        if not exact:
+            aliases = endpoint_shapes.get((section["method"], _path_shape(section["path"])), [])
+        if exact:
+            category = "semantic_candidate" if section.get("_semantic_candidate") else "exact"
+            endpoint_id = exact
+            alias_map: dict[str, str] = {}
+        elif len(aliases) == 1:
+            category = "parameter_alias"
+            endpoint_id = str(aliases[0].get("id"))
+            design_names = PATH_PARAMETER_RE.findall(section["path"])
+            openapi_names = PATH_PARAMETER_RE.findall(str(aliases[0].get("path")))
+            alias_map = dict(zip(design_names, openapi_names))
+        elif len(aliases) > 1:
+            category = "multiple_candidates"
+            endpoint_id = None
+            alias_map = {}
+        else:
+            category = "design_without_openapi"
+            endpoint_id = None
+            alias_map = {}
+        if endpoint_id:
+            mapped_endpoint_ids.add(endpoint_id)
+        section["_mapping"] = {
+            "category": category,
+            "design_operation": key,
+            "openapi_operation": (
+                f"{endpoint_by_id[endpoint_id].get('method')} {endpoint_by_id[endpoint_id].get('path')}"
+                if endpoint_id in endpoint_by_id else None
+            ),
+            "endpoint_id": endpoint_id,
+            "parameter_aliases": alias_map,
+        }
+        if category == "design_without_openapi":
+            same_path_methods = [
+                f"{item.get('method')} {item.get('path')}"
+                for item in endpoints
+                if str(item.get("path")) == section["path"]
+                and str(item.get("method", "")).upper() != section["method"]
+            ]
+            if same_path_methods:
+                section["_mapping"]["note"] = (
+                    "HTTP method differs from OpenAPI candidates: " + ", ".join(same_path_methods)
+                )
+            elif any(
+                _path_shape(str(item.get("path", ""))) == _path_shape(section["path"])
+                for item in endpoints
+            ):
+                section["_mapping"]["note"] = "path structure is present only under a different OpenAPI operation"
+        mapping.append({
+            "rule_id": section.get("id"),
+            **section["_mapping"],
+        })
+        if category == "design_without_openapi":
             errors.append(f"design contract drift: {key} is not present in OpenAPI")
+        elif category == "multiple_candidates":
+            errors.append(f"design operation {key} has multiple OpenAPI candidates")
     for key in endpoint_keys:
-        if key not in by_key and key not in excluded_keys:
+        endpoint_id = endpoint_keys[key]
+        if endpoint_id not in mapped_endpoint_ids and key not in excluded_keys:
             errors.append(f"missing design documentation for OpenAPI endpoint {key}")
     for key, values in by_key.items():
         fingerprints = {str(item.get("section_sha256", "")) for item in values}
@@ -689,6 +1377,58 @@ def build_rules(
     rules_by_id = {str(section["id"]): section for section in sections}
     rules = []
     manual_confirmations: list[dict[str, Any]] = []
+    for key, values in by_key.items():
+        fingerprints = {str(item.get("section_sha256", "")) for item in values}
+        files_for_key = {str(item.get("evidence", {}).get("file", "")) for item in values}
+        if len(fingerprints) > 1 and len(files_for_key) > 1:
+            conflicting_operations.append((key, values))
+            conflicting_keys.add(key)
+    for key, values in conflicting_operations:
+        first = values[0] if values else {}
+        evidence = first.get("evidence") if isinstance(first.get("evidence"), dict) else {
+            "source_kind": "design", "file": "design", "symbol": key, "line": 1,
+            "endpoint_scope": [key], "confidence": "low",
+        }
+        conflict_id = "DESIGN-CONFLICT-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+        manual_confirmations.append({
+            "rule_id": conflict_id,
+            "reasons": ["multiple selected design documents describe the same operation differently"],
+            "evidence": evidence,
+            "related_interface": key,
+            "business_rule": conflict_id,
+            "design_quote": "\n---\n".join(
+                str(item.get("evidence", {}).get("quote", item.get("content", ""))[:1000])
+                for item in values
+            ),
+            "current_derivation": "The operation is mapped, but the selected design documents disagree; no version was chosen.",
+            "ambiguity": "The conflicting design descriptions may represent different contract versions or incompatible business expectations.",
+            "impact": "The generator cannot choose a single business assertion, state, or side-effect expectation safely.",
+            "options": [
+                "select the authoritative design document/version",
+                "merge the documents after resolving the conflict",
+                "remove or explicitly exclude the obsolete document",
+            ],
+        })
+    if len(design_versions) > 1 or (openapi_version and design_versions and openapi_version not in design_versions):
+        first_document = documents[0] if documents else {"path": "design", "sha256": "0" * 64}
+        version_id = "DESIGN-VERSION-CONFLICT"
+        manual_confirmations.append({
+            "rule_id": version_id,
+            "reasons": ["design and contract versions cannot be matched uniquely"],
+            "evidence": {
+                "source_kind": "design", "file": str(first_document.get("path", "design")),
+                "symbol": "version declaration", "line": 1, "endpoint_scope": ["design documents"],
+                "confidence": "high", "quote": ", ".join(sorted(design_versions)),
+                "evidence_level": "unknown",
+            },
+            "related_interface": "all versioned operations",
+            "business_rule": version_id,
+            "design_quote": ", ".join(sorted(design_versions)),
+            "current_derivation": f"OpenAPI API version is {openapi_version or 'unspecified'}.",
+            "ambiguity": "The documents and OpenAPI may describe different API versions.",
+            "impact": "Endpoint mappings and business assertions may target the wrong contract version.",
+            "options": ["select design documents for the OpenAPI version", "provide the matching OpenAPI contract"],
+        })
     flows_by_rule: dict[str, list[dict[str, Any]]] = {}
     for flow in flows:
         for step in flow.get("steps", []):
@@ -696,12 +1436,24 @@ def build_rules(
     for section in sections:
         section = dict(section)
         key = f"{section['method']} {section['path']}"
-        section["endpoint_id"] = endpoint_keys.get(key)
+        section["endpoint_id"] = section.get("_mapping", {}).get("endpoint_id")
+        section["mapping_category"] = section.get("_mapping", {}).get("category", "design_without_openapi")
+        section["matched_operation"] = section.get("_mapping", {}).get("openapi_operation")
+        section["parameter_aliases"] = section.get("_mapping", {}).get("parameter_aliases", {})
         confirmation_reasons: list[str] = []
 
         def require_confirmation(reason: str) -> None:
             confirmation_reasons.append(reason)
             errors.append(f"design rule {section['id']} {reason}")
+
+        if section["mapping_category"] in {"multiple_candidates", "design_without_openapi"}:
+            require_confirmation(
+                str(section.get("_mapping", {}).get("note") or "cannot uniquely match the design operation to an OpenAPI operation")
+            )
+        if key in conflicting_keys:
+            require_confirmation("multiple selected design documents describe this operation differently")
+        if section.get("evidence_level") == "unknown":
+            require_confirmation("design prose does not state enough business facts to form a safe expectation")
 
         if section["id"] in rule_ids:
             errors.append(f"duplicate design rule ID: {section['id']}")
@@ -718,6 +1470,22 @@ def build_rules(
             require_confirmation("must declare an explicit Request mapping for its business branch")
         if not section.get("assertions"):
             require_confirmation("must declare at least one explicit business-result Assert")
+        if section.get("scenario") == "business_error" and not section.get("business_codes"):
+            require_confirmation("business error code is not defined by the design")
+        if section.get("scenario") == "business_error" and not section.get("http_statuses"):
+            require_confirmation("business error HTTP status is not defined by the design")
+        if section.get("negative_constraints") and not any(
+            isinstance(item, dict)
+            and item.get("kind") == "response"
+            and item.get("assertion", {}).get("exists") is False
+            for item in section.get("candidate_assertions", [])
+        ) and not any(
+            isinstance(step, dict) and step.get("assert_absent")
+            for flow in flows
+            for step in flow.get("steps", [])
+            if str(step.get("rule_id")) == str(section.get("id"))
+        ):
+            require_confirmation("negative side effect has no reviewed observable absence boundary")
         if isinstance(endpoint, dict):
             for request_error in _request_shape_errors(section, endpoint):
                 errors.append(
@@ -779,28 +1547,257 @@ def build_rules(
                 "requires authorized fault injection and verified restoration; a flow step label is not execution evidence"
             )
         if confirmation_reasons:
+            pending = {
+                "related_interface": section.get("matched_operation") or f"{section['method']} {section['path']}",
+                "business_rule": section["id"],
+                "design_quote": section.get("evidence", {}).get("quote", section.get("content", "")[:1000]),
+                "current_derivation": section.get("derivation") or section.get("condition") or section.get("title"),
+                "ambiguity": "; ".join(dict.fromkeys(confirmation_reasons)),
+                "impact": "business assertion, flow executability, or endpoint mapping cannot be determined safely",
+                "options": ["confirm the documented expectation", "revise the design document with the missing fact"],
+            }
             section["manual_confirmation"] = {
                 "required": True,
                 "reasons": list(dict.fromkeys(confirmation_reasons)),
+                **pending,
             }
             manual_confirmations.append({
                 "rule_id": section["id"],
                 "reasons": list(dict.fromkeys(confirmation_reasons)),
                 "evidence": section["evidence"],
+                **pending,
             })
+        section.pop("_mapping", None)
+        section.pop("_semantic_candidate", None)
+        section.pop("_ordered", None)
         rules.append(section)
+    # Retain the reverse side of the mapping even when a contract operation has
+    # no design text.  This lets reports distinguish a real omission from a
+    # parser format difference.
+    for key, endpoint_id in endpoint_keys.items():
+        if endpoint_id not in mapped_endpoint_ids and key not in excluded_keys:
+            mapping.append({
+                "rule_id": None,
+                "category": "openapi_without_design",
+                "design_operation": None,
+                "openapi_operation": key,
+                "endpoint_id": endpoint_id,
+                "parameter_aliases": {},
+            })
+            manual_confirmations.append({
+                "rule_id": f"OPENAPI-ONLY-{endpoint_id}",
+                "reasons": ["OpenAPI operation has no design rule or approved exclusion"],
+                "evidence": next(
+                    (
+                        endpoint.get("evidence")
+                        for endpoint in endpoints
+                        if str(endpoint.get("id")) == endpoint_id and isinstance(endpoint.get("evidence"), dict)
+                    ),
+                    {
+                        "source_kind": "openapi", "file": "openapi", "symbol": key, "line": 1,
+                        "endpoint_scope": [key], "confidence": "high",
+                    },
+                ),
+                "related_interface": key,
+                "business_rule": f"OPENAPI-ONLY-{endpoint_id}",
+                "design_quote": "No design text was found for this OpenAPI operation.",
+                "current_derivation": "No design rule was found for this OpenAPI operation.",
+                "ambiguity": "The operation may be undocumented, excluded, or from another contract version.",
+                "impact": "Protocol-only coverage must not be counted as business coverage.",
+                "options": ["add the operation to the design", "add an approved exclusion", "confirm the contract version"],
+            })
+    for candidate in flow_candidates:
+        first_rule = next((item for item in sections if str(item.get("id")) == str(candidate.get("steps", [{}])[0].get("rule_id"))), {})
+        evidence = first_rule.get("evidence", {
+            "source_kind": "design", "file": str(candidate.get("source", "design")), "symbol": str(candidate.get("id")),
+            "line": 1, "endpoint_scope": ["design flow"], "confidence": "medium",
+        })
+        if candidate.get("can_generate"):
+            continue
+        reasons = ["ordered design calls need explicit captures, final convergence, and cleanup before execution"]
+        errors.append(f"design flow candidate {candidate.get('id')} requires confirmation")
+        manual_confirmations.append({
+            "rule_id": str(candidate.get("id")),
+            "reasons": reasons,
+            "evidence": evidence,
+            "related_interface": ", ".join(str(step.get("operation")) for step in candidate.get("steps", [])),
+            "business_rule": str(candidate.get("id")),
+            "design_quote": str(evidence.get("quote", "")),
+            "current_derivation": "Ordered calls were recognized, but no executable capture/convergence contract was stated.",
+            "ambiguity": "; ".join(candidate.get("unknown", [])),
+            "impact": "independent requests would not prove the documented business flow",
+            "options": ["add a reviewed Test Flow with captures and cleanup", "confirm that the calls are independent"],
+        })
+    actionable_unresolved: list[dict[str, Any]] = []
+    for item in unresolved_documents:
+        if endpoints and all(
+            f"{str(endpoint.get('method', '')).upper()} {endpoint.get('path')}" in excluded_keys
+            for endpoint in endpoints
+        ):
+            continue
+        if not endpoints and re.search(r"(?i)(?:no\s+api\s+operations?|no\s+endpoints?|无接口|无业务规则)", item["quote"]):
+            continue
+        actionable_unresolved.append(item)
+    # Preserve unresolved design-side mappings as first-class audit records.
+    # A parser gap must not disappear merely because no executable rule exists.
+    for item in actionable_unresolved:
+        unknown_id = _unknown_design_id(item)
+        category = str(item.get("category") or "design_without_openapi")
+        candidates = item.get("candidates", []) if isinstance(item.get("candidates"), list) else []
+        mapping.append({
+            "rule_id": unknown_id,
+            "category": category,
+            "design_operation": None,
+            "openapi_operation": None,
+            "endpoint_id": None,
+            "parameter_aliases": {},
+            "candidates": candidates,
+        })
+    mapping_counts = {
+        category: sum(1 for item in mapping if item.get("category") == category)
+        for category in (
+            "exact", "parameter_alias", "semantic_candidate", "design_without_openapi",
+            "openapi_without_design", "multiple_candidates",
+        )
+    }
+    for item in actionable_unresolved:
+        unknown_id = _unknown_design_id(item)
+        category = str(item.get("category") or "design_without_openapi")
+        candidates = item.get("candidates", []) if isinstance(item.get("candidates"), list) else []
+        candidate_operations = [
+            str(candidate.get("operation"))
+            for candidate in candidates
+            if isinstance(candidate, dict) and candidate.get("operation")
+        ]
+        evidence = {
+            "source_kind": "design", "file": item["path"], "symbol": "unmapped design document",
+            "line": 1, "endpoint_scope": ["design document"], "confidence": "low",
+            "quote": item["quote"], "evidence_level": "unknown",
+        }
+        manual_confirmations.append({
+            "rule_id": unknown_id,
+            "reasons": [
+                "multiple semantic OpenAPI candidates cannot be selected uniquely"
+                if category == "multiple_candidates"
+                else "no HTTP operation or unique semantic OpenAPI candidate was identified"
+            ],
+            "evidence": evidence,
+            "related_interface": ", ".join(candidate_operations) or "unknown",
+            "business_rule": unknown_id,
+            "design_quote": item["quote"],
+            "current_derivation": (
+                "Several OpenAPI operations matched the design wording; no operation was selected."
+                if category == "multiple_candidates"
+                else "No safe operation mapping was found; no business expectation was invented."
+            ),
+            "ambiguity": (
+                "multiple OpenAPI operations are equally plausible: " + ", ".join(candidate_operations)
+                if candidate_operations
+                else "the document may describe an operation without naming a route or OpenAPI operation"
+            ),
+            "impact": "business rules cannot be attached to executable API cases",
+            "options": (
+                ["select one of the candidate OpenAPI operations", "revise the design with the exact operation"]
+                if category == "multiple_candidates"
+                else ["identify the interface in the design", "confirm the matching OpenAPI operation"]
+            ),
+        })
+    understanding = [
+        {
+            "rule_id": rule.get("id"),
+            "business_name": rule.get("title"),
+            "design_source": rule.get("evidence"),
+            "design_summary": rule.get("content", "")[:2000],
+            "candidate_http_method": rule.get("method"),
+            "candidate_url_path": rule.get("path"),
+            "matched_openapi_operation": rule.get("matched_operation"),
+            "preconditions": rule.get("understanding", {}).get("preconditions", []),
+            "request_meaning": rule.get("understanding", {}).get("request_meaning", []),
+            "success_result": rule.get("understanding", {}).get("success_results", []),
+            "state_changes": rule.get("states", []) + rule.get("transitions", []),
+            "business_errors": rule.get("understanding", {}).get("business_errors", []),
+            "side_effects": rule.get("side_effects", []),
+            "idempotency": rule.get("idempotency", []),
+            "retries": rule.get("retries", []),
+            "concurrency": rule.get("concurrency", []),
+            "async": rule.get("understanding", {}).get("async", []),
+            "consistency": rule.get("understanding", {}).get("consistency", []),
+            "negative_constraints": rule.get("understanding", {}).get("negative_constraints", []),
+            "candidate_assertions": rule.get("candidate_assertions", []),
+            "evidence_level": rule.get("evidence_level", "unknown"),
+            "derivation": rule.get("derivation", ""),
+            "unknown": list(dict.fromkeys(
+                [item for item in [
+                    "business assertion" if not rule.get("assertions") else "",
+                    "request business meaning"
+                    if rule.get("scenario") != "success" and not rule.get("request_declared") else "",
+                ] if item]
+                + ([
+                    str(reason)
+                    for reason in rule.get("manual_confirmation", {}).get("reasons", [])
+                    if str(reason).strip()
+                ] if isinstance(rule.get("manual_confirmation"), dict) else [])
+                + (["unique OpenAPI mapping"] if rule.get("mapping_category") in {"multiple_candidates", "design_without_openapi"} else [])
+            )),
+            "can_generate": not bool(rule.get("manual_confirmation")),
+        }
+        for rule in rules
+    ]
+    understanding.extend({
+        "rule_id": _unknown_design_id(item),
+        "business_name": Path(item["path"]).stem,
+        "design_source": {"source_kind": "design", "file": item["path"], "symbol": "unmapped design document", "line": 1, "endpoint_scope": ["design document"], "confidence": "low", "quote": item["quote"], "evidence_level": "unknown"},
+        "design_summary": item["quote"],
+        "candidate_http_method": None,
+        "candidate_url_path": None,
+        "matched_openapi_operation": None,
+        "preconditions": [], "request_meaning": [], "success_result": [], "state_changes": [],
+        "business_errors": [], "side_effects": [], "idempotency": [], "retries": [], "concurrency": [],
+        "async": [], "consistency": [], "negative_constraints": [], "evidence_level": "unknown",
+        "candidate_assertions": [],
+        "derivation": "No safe operation mapping was found; no business expectation was invented.",
+        "unknown": [
+            "OpenAPI operation selection" if item.get("category") == "multiple_candidates" else "HTTP operation",
+            "OpenAPI mapping", "business assertions",
+        ], "can_generate": False,
+    } for item in actionable_unresolved)
     return {
         "version": 1,
         "source": "design",
         "documents": documents,
+        "parser_diagnostics": [
+            {
+                "path": item.get("path"),
+                "marker_sections": item.get("sections", 0),
+                "semantic_rules": item.get("semantic_rules", 0),
+                "parser_gap": item.get("parser_gap") is True,
+                "marker_operations": item.get("marker_operations", []),
+                "semantic_operations": item.get("semantic_operations", []),
+                "semantic_only_operations": item.get("semantic_only_operations", []),
+                "explanation": (
+                    "semantic extraction found business content outside fixed markers"
+                    if item.get("parser_gap") else "marker parser and semantic pass agree"
+                ),
+            }
+            for item in documents
+        ],
         "rules": rules,
+        "understanding": understanding,
+        "mapping": {"items": mapping, "counts": mapping_counts},
         "flows": flows,
+        "flow_candidates": flow_candidates,
         "exclusions": exclusions,
         "manual_confirmations": manual_confirmations,
+        "understanding_status": "blocked" if errors or manual_confirmations else "complete",
+        "design_fingerprint": hashlib.sha256(
+            "".join(str(item.get("sha256", "")) for item in documents).encode("utf-8")
+        ).hexdigest(),
+        "openapi_fingerprint": str(manifest.get("source", {}).get("sha256", "")),
         "coverage": {
             "openapi_endpoints": len(endpoints),
-            "documented_endpoints": len({key for key in by_key if key in endpoint_keys}),
+            "documented_endpoints": len(mapped_endpoint_ids),
             "excluded_endpoints": len(excluded_keys),
+            "mapped_endpoints": len(mapped_endpoint_ids),
         },
     }, sorted(dict.fromkeys(errors))
 
@@ -815,7 +1812,98 @@ def summary(document: dict[str, Any]) -> dict[str, Any]:
             for item in document.get("documents", []) if isinstance(item, dict)
         ],
         "rule_count": len(document.get("rules", [])) if isinstance(document.get("rules"), list) else 0,
+        "mapping_counts": dict(document.get("mapping", {}).get("counts", {}))
+        if isinstance(document.get("mapping"), dict) else {},
+        "unknown_count": sum(
+            1 for item in document.get("understanding", [])
+            if isinstance(item, dict) and item.get("unknown")
+        ) if isinstance(document.get("understanding"), list) else 0,
+        "understanding_status": document.get("understanding_status", "incomplete"),
+        "design_fingerprint": document.get("design_fingerprint", ""),
+        "openapi_fingerprint": document.get("openapi_fingerprint", ""),
     }
+
+
+UNDERSTANDING_FIELDS = {
+    "rule_id", "business_name", "design_source", "design_summary", "candidate_http_method",
+    "candidate_url_path", "matched_openapi_operation", "preconditions", "request_meaning",
+    "success_result", "state_changes", "business_errors", "side_effects", "idempotency",
+    "retries", "concurrency", "async", "consistency", "negative_constraints",
+    "candidate_assertions", "evidence_level", "derivation", "unknown", "can_generate",
+}
+MAPPING_CATEGORIES = {
+    "exact", "parameter_alias", "semantic_candidate", "design_without_openapi",
+    "openapi_without_design", "multiple_candidates",
+}
+
+
+def understanding_errors(document: dict[str, Any]) -> list[str]:
+    """Validate the persisted design-understanding phase before generation."""
+
+    errors: list[str] = []
+    if not isinstance(document, dict):
+        return ["design understanding artifact must be an object"]
+    if document.get("source") != "design":
+        errors.append("design understanding artifact must declare source: design")
+    if document.get("understanding_status") != "complete":
+        errors.append("design understanding phase is not complete")
+    rules = [item for item in document.get("rules", []) if isinstance(item, dict)]
+    matrix = [item for item in document.get("understanding", []) if isinstance(item, dict)]
+    rules_by_id = {str(item.get("id")): item for item in rules if item.get("id")}
+    matrix_by_id = {str(item.get("rule_id")): item for item in matrix if item.get("rule_id")}
+    for rule_id in sorted(set(rules_by_id) - set(matrix_by_id)):
+        errors.append(f"design rule {rule_id} has no understanding matrix row")
+    for rule_id in sorted(set(matrix_by_id) - set(rules_by_id)):
+        if not rule_id.startswith("UNKNOWN-DESIGN-"):
+            errors.append(f"understanding matrix row {rule_id} has no design rule")
+    for rule_id, item in matrix_by_id.items():
+        missing = sorted(field for field in UNDERSTANDING_FIELDS if field not in item)
+        if missing:
+            errors.append(f"understanding matrix row {rule_id} is missing: {', '.join(missing)}")
+        if item.get("evidence_level") not in {"explicit", "derived", "unknown"}:
+            errors.append(f"understanding matrix row {rule_id} has invalid evidence level")
+        if item.get("can_generate") is False and not item.get("unknown"):
+            errors.append(f"non-executable understanding row {rule_id} has no unknowns")
+    mapping = document.get("mapping") if isinstance(document.get("mapping"), dict) else {}
+    items = [item for item in mapping.get("items", []) if isinstance(item, dict)]
+    counts = mapping.get("counts") if isinstance(mapping.get("counts"), dict) else {}
+    actual_counts = {category: sum(1 for item in items if item.get("category") == category) for category in MAPPING_CATEGORIES}
+    for category in MAPPING_CATEGORIES:
+        try:
+            declared_count = int(counts.get(category, -1))
+        except (TypeError, ValueError):
+            declared_count = -1
+        if declared_count != actual_counts[category]:
+            errors.append(f"mapping count for {category} is inconsistent with mapping items")
+    for item in items:
+        if item.get("category") not in MAPPING_CATEGORIES:
+            errors.append(f"mapping item has invalid category: {item.get('category')}")
+    confirmations = [item for item in document.get("manual_confirmations", []) if isinstance(item, dict)]
+    confirmation_ids = {str(item.get("rule_id")) for item in confirmations}
+    for item in confirmations:
+        for field in ("rule_id", "reasons", "evidence", "related_interface", "business_rule", "design_quote", "current_derivation", "ambiguity", "impact", "options"):
+            if not item.get(field):
+                errors.append(f"manual confirmation {item.get('rule_id', '<unknown>')} is missing {field}")
+    for candidate in document.get("flow_candidates", []) if isinstance(document.get("flow_candidates"), list) else []:
+        if isinstance(candidate, dict) and candidate.get("can_generate") is False and str(candidate.get("id")) not in confirmation_ids:
+            errors.append(f"flow candidate {candidate.get('id')} has no manual confirmation")
+    for rule_id, rule in rules_by_id.items():
+        if rule.get("manual_confirmation") and rule_id not in confirmation_ids:
+            errors.append(f"design rule {rule_id} has no top-level manual confirmation")
+    for rule_id, item in matrix_by_id.items():
+        if item.get("can_generate") is False and rule_id not in confirmation_ids:
+            errors.append(f"non-executable understanding row {rule_id} has no manual confirmation")
+    for flow in document.get("flows", []) if isinstance(document.get("flows"), list) else []:
+        if not isinstance(flow, dict):
+            continue
+        for field in ("business_assertions", "data_transfer", "final_status"):
+            if field not in flow:
+                errors.append(f"design flow {flow.get('id', '<unknown>')} is missing {field}")
+        if not str(flow.get("final_status", "")).strip():
+            errors.append(f"design flow {flow.get('id', '<unknown>')} has no final status")
+        if not str(flow.get("cleanup", "")).strip():
+            errors.append(f"design flow {flow.get('id', '<unknown>')} has no cleanup action")
+    return list(dict.fromkeys(errors))
 
 
 def apply_to_contracts(contracts_root: Path, document: dict[str, Any]) -> list[Path]:
@@ -991,6 +2079,13 @@ def apply_to_contracts(contracts_root: Path, document: dict[str, Any]) -> list[P
             for selected in candidates:
                 rule_id = str(selected["id"])
                 scenario = str(selected.get("scenario", "success"))
+                endpoint = next(
+                    (
+                        item for item in endpoint_doc.get("endpoints", [])
+                        if isinstance(item, dict) and str(item.get("id")) == endpoint_id
+                    ),
+                    {},
+                )
                 previous = existing_design_cases.get(rule_id)
                 case = copy.deepcopy(previous or template)
                 stable_rule = re.sub(r"[^A-Za-z0-9]+", "_", rule_id).strip("_").upper() or "DESIGN"
@@ -1007,6 +2102,8 @@ def apply_to_contracts(contracts_root: Path, document: dict[str, Any]) -> list[P
                 case["source"] = "design"
                 case["design_rule_ids"] = [str(selected["id"])]
                 case["design_evidence"] = [selected["evidence"]]
+                case["design_evidence_level"] = str(selected.get("evidence_level", "unknown"))
+                case["business_assertions"] = list(selected.get("candidate_assertions", selected.get("assertions", [])))
                 flow_step = flow_steps_by_rule.get(rule_id)
                 if flow_step and isinstance(flow_step.get("capture_paths"), dict):
                     case["captures"] = copy.deepcopy(flow_step["capture_paths"])
@@ -1071,6 +2168,8 @@ def apply_to_contracts(contracts_root: Path, document: dict[str, Any]) -> list[P
                     "id": rule_id,
                     "status": "confirmed",
                     "source": "design",
+                    "endpoint_id": endpoint_id,
+                    "openapi_operation": f"{endpoint.get('method')} {endpoint.get('path')}",
                     "source_symbol": f"{selected['evidence']['file']}:{selected['evidence']['line']}",
                     "condition": selected.get("condition") or selected["title"],
                     "expected_http_status": (selected.get("http_statuses") or [None])[0],
@@ -1086,6 +2185,10 @@ def apply_to_contracts(contracts_root: Path, document: dict[str, Any]) -> list[P
                     "acceptance_status": (selected.get("acceptance_statuses") or [None])[0],
                     "final_status": (selected.get("final_statuses") or [None])[0],
                     "design_rule_id": rule_id,
+                    "evidence_level": str(selected.get("evidence_level", "unknown")),
+                    "evidence_quote": str(selected.get("evidence", {}).get("quote", selected.get("content", "")[:2000])),
+                    "derivation": str(selected.get("derivation", "")),
+                    "business_assertions": list(selected.get("candidate_assertions", selected.get("assertions", []))),
                     "evidence": [selected["evidence"]],
                     "case_ids": [],
                 })
@@ -1163,8 +2266,12 @@ def apply_to_contracts(contracts_root: Path, document: dict[str, Any]) -> list[P
                 raise ValueError(f"design flow {flow.get('id')} has no generated case for rule {rule_id}")
             step_owner, case_id = case_locations[rule_id]
             owner = owner or step_owner
-            rendered_step = {"operation": step.get("operation"), "case_id": case_id}
-            for field in ("capture", "uses", "assert_absent"):
+            rendered_step = {
+                "operation": step.get("operation"),
+                "case_id": case_id,
+                "business_assertions": list(step.get("business_assertions", [])),
+            }
+            for field in ("capture", "capture_paths", "uses", "assert_absent"):
                 if field in step:
                     rendered_step[field] = copy.deepcopy(step[field])
             steps.append(rendered_step)
@@ -1173,6 +2280,9 @@ def apply_to_contracts(contracts_root: Path, document: dict[str, Any]) -> list[P
             "source": "design",
             "design_rule_ids": [str(step.get("rule_id")) for step in flow.get("steps", [])],
             "steps": steps,
+            "business_assertions": list(flow.get("business_assertions", [])),
+            "data_transfer": list(flow.get("data_transfer", [])),
+            "final_status": str(flow.get("final_status", "")),
         }
         if flow.get("cleanup"):
             rendered_flow["cleanup"] = flow["cleanup"]

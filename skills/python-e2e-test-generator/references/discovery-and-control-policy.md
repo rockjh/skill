@@ -235,9 +235,9 @@ Allowed outcomes are `completed` or `blocked` when requested, and `not_requested
 
 ## Per-item constructability
 
-For every precondition and business step, evaluate exactly these paths before blocking: public business API, approved test/admin API, database control, messages, scheduled jobs, mocks/fault injection, dynamic configuration, and existing test data. Each result records the owning component, consuming source, candidate control, side effect, real trigger, observable result, isolation, cleanup/restoration, and source or runtime evidence. Status is `usable`, `unusable`, or `not_found`; omission and `not_applicable` do not prove unavailability.
+For every precondition and business step, evaluate exactly these paths before blocking: public business API, approved test/admin API, database control, messages, scheduled jobs, mocks/fault injection, dynamic configuration, existing test data, database read, and observability. Each result records the owning component, consuming source, candidate control, side effect, real trigger, observable result, isolation, cleanup/restoration, and source or runtime evidence. Status is `usable`, `unusable`, or `not_found`; omission and `not_applicable` do not prove unavailability.
 
-Classify safely generatable data as `test_owned` and `constructible`. Such data must use a controlled usable path and cannot become an environment placeholder or `business_data:` blocker. Any write used to probe a capability is itself a controlled write: declare an exact run-owned key, register cleanup before the write, capture evidence immediately, restore on exceptions, and verify no residue. Only a complete evidence-backed closure of all eight paths for every affected item permits `contract_blocked`.
+Classify safely generatable data as `test_owned` and `constructible`. Such data must use a controlled usable path and cannot become an environment placeholder or `business_data:` blocker. Any write used to probe a capability is itself a controlled write: declare an exact run-owned key, register cleanup before the write, capture evidence immediately, restore on exceptions, and verify no residue. Only a complete evidence-backed closure of all ten paths for every affected item permits `contract_blocked`.
 
 ## Scenario control matrix
 
@@ -269,7 +269,7 @@ The checker enforces:
 - every planned control maps to a step, assertion, precondition, or cleanup action;
 - `ready` requires `safe_control_path: true`, usable observability, non-empty correlation/recovery, resolved runtime configuration, and isolated test data;
 - `pending_environment` requires a complete source contract and safe control path; its blocker set must exactly equal the active environment mappings/placeholders or business-data placeholders that are currently missing;
-- `contract_blocked` requires `safe_control_path: false`, matching readiness/decision blockers, and source-backed `unusable` or `not_found` results for every candidate API, test/admin, mock/fault, dynamic-configuration, job, message, and database-control path. `not_applicable` cannot close this matrix. Each blocker is either `control:<category>` bound to an unavailable source-backed capability or `contract:<repository>#<anchor>`; it is invalid merely because no HTTP endpoint exists;
+- `contract_blocked` requires `safe_control_path: false`, matching readiness/decision blockers, and source-backed `unusable` or `not_found` results for every candidate API, test/admin, mock/fault, dynamic-configuration, job, message, database-read, database-control, and observability path. `not_applicable` cannot close this matrix. Each blocker is either `control:<category>` bound to an unavailable source-backed capability or `contract:<repository>#<anchor>`; it is invalid merely because no HTTP endpoint exists;
 - a scenario with control SQL cannot execute unless all SQL-control fields below are present and the separate per-run authorization gate passes.
 
 ## Scenario assignment and isolation

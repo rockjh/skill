@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import tempfile
+from datetime import datetime, timezone
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -39,11 +40,17 @@ from .discovery import (
     _semantic_evidence,
     _strings,
     _walk_files,
+    PROTOCOL_SUFFIXES,
+    SOURCE_PROTOCOL_SUFFIXES,
     discover_documents,
     discover_protocols,
     discovery_errors,
+    configured_protocol_urls,
+    read_only_protocol_probe,
 )
 from .source_versions import build_generation_lock, generation_lock_errors, input_summary
+from .context import build_context, classify_rule
+from .materialize import materialize_scenarios
 
 
 HTTP_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE"}
@@ -52,6 +59,7 @@ METHOD_PATH_RE = re.compile(
     r"(?im)^\s*(?:#{1,6}\s*)?(?:[-*]\s*)?(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE)\s+(`?/[^\s`]*`?)\s*$"
 )
 DESIGN_MARKERS = {
+    "not_applicable": r"not[ _-]?applicable|n/?a|涓嶉€傜敤|涓嶉渶瑕?",
     "rule_id": r"rule[_ ]?id|规则\s*id|规则编号",
     "participant": r"participant|参与方和服务边界|参与方|服务|调用方|下游|service",
     "state": r"state|状态|最终状态",
@@ -150,12 +158,24 @@ def parse_design_documents(files: Iterable[Path]) -> dict[str, Any]:
             ]
             calls.extend({"kind": "message", "event": event} for event in events)
             calls.extend({"kind": "task", "task": task} for task in tasks)
+            prose_context = build_context({"calls": calls}, body=body)
+            if not participants:
+                participants = list(prose_context.get("participants", []))
+            # Preserve prose facts at the rule level so downstream logic and
+            # reports can trace retries, idempotency, async behavior, and
+            # recovery without requiring marker-style input.
+            prose_idempotency = list(prose_context.get("idempotency", []))
+            prose_retries = list(prose_context.get("retries", []))
+            prose_async_behavior = list(prose_context.get("async_behaviors", []))
+            prose_recovery = list(prose_context.get("recovery", []))
             cross_service = len(set(participants)) >= 2 or bool(re.search(r"跨服务|下游|消息|事件|异步|cross[- ]service", body, re.I))
             assertions = _values("assertion", body)
-            states = _values("state", body)
+            states = _values("state", body) or list(prose_context.get("states", []))
             codes = _values("business_code", body)
             final_statuses = _values("final", body)
             side_effects = _values("side_effect", body)
+            not_applicable = bool(re.search(r"(?im)^\s*(?:not[ _-]?applicable|n/?a|涓嶉€傜敤|涓嶉渶瑕?)(?:\s*[:=]\s*(?:true|yes|1|鏄殑)?)?\s*$", body))
+            not_applicable = not_applicable or bool(re.search(r"(?im)^\s*(?:不适用|不需要)(?:\s*[:=]\s*(?:true|yes|1|是)?)?\s*$", body))
             has_business_contract = (
                 len(set(participants)) >= 2
                 and bool(
@@ -169,11 +189,21 @@ def parse_design_documents(files: Iterable[Path]) -> dict[str, Any]:
                     or _values("branch", body)
                 )
             )
+            has_any_evidence = bool(
+                participants or method or route or events or tasks or assertions or states or final_statuses or side_effects or codes
+            )
+            rule_status = (
+                "not_applicable" if not_applicable
+                else "confirmed" if has_business_contract
+                else "manual_confirmation" if has_any_evidence
+                else "missing_evidence"
+            )
             rules.append({
                 "id": rule_id,
                 "title": title,
                 "type": "cross_service" if cross_service else "business",
-                "manual_confirmation": not has_business_contract,
+                "manual_confirmation": rule_status == "manual_confirmation",
+                "status": rule_status,
                 "method": method,
                 "path": route,
                 "event": (events or [None])[0],
@@ -191,12 +221,12 @@ def parse_design_documents(files: Iterable[Path]) -> dict[str, Any]:
                 "assertions": assertions,
                 "final_result": list(dict.fromkeys([*assertions, *states])),
                 "side_effects": side_effects,
-                "idempotency": _values("idempotency", body),
-                "retries": _values("retry", body),
+                "idempotency": list(dict.fromkeys([*_values("idempotency", body), *prose_idempotency])),
+                "retries": list(dict.fromkeys([*_values("retry", body), *prose_retries])),
                 "concurrency": _values("concurrency", body),
-                "async_behavior": _values("async_behavior", body),
+                "async_behavior": list(dict.fromkeys([*_values("async_behavior", body), *prose_async_behavior])),
                 "cleanup": _values("cleanup", body),
-                "recovery": _values("recovery", body),
+                "recovery": list(dict.fromkeys([*_values("recovery", body), *prose_recovery])),
                 "async": bool(re.search(r"异步|asynchronous|async", body, re.I)),
                 "section": title,
                 "line": line,
@@ -204,6 +234,7 @@ def parse_design_documents(files: Iterable[Path]) -> dict[str, Any]:
                 "protocol_refs": [],
                 "source": {"source_kind": "design", "file": str(path), "section": title, "line": line},
             })
+            rules[-1]["context"] = build_context(rules[-1], body=body)
     by_id: dict[str, str] = {}
     by_entry: dict[tuple[str, str, str], tuple[str, str]] = {}
     for rule in rules:
@@ -211,6 +242,10 @@ def parse_design_documents(files: Iterable[Path]) -> dict[str, Any]:
         digest = str(rule["section_sha256"])
         if rule_id in by_id and by_id[rule_id] != digest:
             errors.append(f"conflicting design documents for rule ID {rule_id}")
+            rule["status"] = "conflict"
+            for previous in rules:
+                if previous is not rule and str(previous.get("id")) == rule_id:
+                    previous["status"] = "conflict"
         by_id[rule_id] = digest
         entry = (
             str(rule.get("method") or "").upper(),
@@ -220,6 +255,14 @@ def parse_design_documents(files: Iterable[Path]) -> dict[str, Any]:
         source_file = str(rule.get("source", {}).get("file", "")) if isinstance(rule.get("source"), dict) else ""
         if entry[1] and entry in by_entry and by_entry[entry][1] != source_file and by_entry[entry][0] != digest:
             errors.append(f"conflicting design documents for {entry[2]} {entry[0]} {entry[1]}")
+            rule["status"] = "conflict"
+            for previous in rules:
+                if previous is not rule and str(previous.get("source", {}).get("file", "")) == by_entry[entry][1] and (
+                    str(previous.get("method") or "").upper(),
+                    str(previous.get("path") or previous.get("event") or previous.get("task") or ""),
+                    "http" if previous.get("path") else "event" if previous.get("event") else "task" if previous.get("task") else "",
+                ) == entry:
+                    previous["status"] = "conflict"
         by_entry[entry] = (digest, source_file)
     if not rules:
         errors.append("design documents contain no recognized business-flow or cross-service sections")
@@ -469,6 +512,52 @@ def _graphql_operations(text: str, path: Path) -> list[dict[str, Any]]:
     return operations
 
 
+def _source_protocol_operations(text: str, path: Path) -> list[dict[str, Any]]:
+    """Extract transport entry definitions from SDK/controller source.
+
+    This is deliberately limited to explicit HTTP route declarations and
+    client calls. It supplies a low-priority invocation shape; business
+    expectations still come exclusively from design documents.
+    """
+
+    operations: list[dict[str, Any]] = []
+    patterns = (
+        re.compile(r"(?im)@(?:\w+\.)?(get|post|put|patch|delete|head|options)\s*\(\s*['\"]([^'\"]+)['\"]"),
+        re.compile(r"(?im)@(?:Get|Post|Put|Patch|Delete|Request)Mapping\s*\(\s*['\"]([^'\"]+)['\"]"),
+        re.compile(r"(?im)\b(?:requests|client|http|fetch)\.(get|post|put|patch|delete)\s*\(\s*['\"]([^'\"]+)['\"]"),
+    )
+    for index, pattern in enumerate(patterns):
+        for match in pattern.finditer(text):
+            groups = match.groups()
+            if index == 1:
+                method, route = "GET", groups[0]
+                annotation = match.group(0).casefold()
+                method = next((candidate for candidate in ("GET", "POST", "PUT", "PATCH", "DELETE") if candidate.casefold() in annotation), method)
+            else:
+                method, route = groups[0].upper(), groups[1]
+            if not route.startswith("/"):
+                continue
+            line = text[:match.start()].count("\n") + 1
+            operation_id = f"{path.stem}:{method}:{route}:{line}"
+            operations.append({
+                "id": operation_id,
+                "kind": "http",
+                "method": method,
+                "path": route,
+                "parameters": [],
+                "request_body": {"required": False, "content": {}},
+                "request_fields": [],
+                "response_fields": [],
+                "status_codes": [],
+                "responses": {},
+                "source": {"source_kind": "protocol", "file": str(path), "operation": operation_id},
+            })
+    unique: dict[tuple[str, str], dict[str, Any]] = {}
+    for operation in operations:
+        unique.setdefault((str(operation["method"]), str(operation["path"])), operation)
+    return list(unique.values())
+
+
 def parse_protocol_documents(files: Iterable[Path]) -> dict[str, Any]:
     """Extract formal transport contracts without assigning business outcomes."""
 
@@ -486,7 +575,24 @@ def parse_protocol_documents(files: Iterable[Path]) -> dict[str, Any]:
         version = None
         if isinstance(document, Mapping):
             version = document.get("openapi") or document.get("asyncapi") or document.get("swagger")
-        documents.append({"path": str(path), "sha256": hashlib.sha256(raw).hexdigest(), "version": str(version) if version else None})
+        content_sha256 = hashlib.sha256(raw).hexdigest()
+        try:
+            fetched_at = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
+        except OSError:
+            fetched_at = None
+        source_type = "source_definition" if path.suffix.casefold() in SOURCE_PROTOCOL_SUFFIXES else "file"
+        documents.append({
+            "path": str(path),
+            "sha256": content_sha256,
+            "version": str(version) if version else None,
+            "source_type": source_type,
+            "service": None,
+            "url": None,
+            "format": path.suffix.lstrip(".").casefold() or "text",
+            "fetched_at": fetched_at,
+            "content_sha256": content_sha256,
+            "user_confirmed": False,
+        })
         if isinstance(document, Mapping) and isinstance(document.get("paths"), Mapping):
             operations.extend(_openapi_operations(document, path))
         elif isinstance(document, Mapping) and isinstance(document.get("channels"), Mapping):
@@ -495,6 +601,8 @@ def parse_protocol_documents(files: Iterable[Path]) -> dict[str, Any]:
             operations.extend(_proto_operations(document, path))
         elif isinstance(document, str) and path.suffix.casefold() in {".graphql", ".graphqls"}:
             operations.extend(_graphql_operations(document, path))
+        elif isinstance(document, str) and path.suffix.casefold() in {".py", ".java", ".kt", ".ts", ".tsx", ".js", ".jsx", ".go", ".cs"}:
+            operations.extend(_source_protocol_operations(document, path))
         else:
             errors.append(f"formal protocol document has unsupported shape: {path}")
     ids: dict[str, str] = {}
@@ -505,7 +613,144 @@ def parse_protocol_documents(files: Iterable[Path]) -> dict[str, Any]:
         ids[str(operation["id"])] = identity
     if not operations:
         errors.append("formal protocol documents contain no HTTP, RPC, message, task, or GraphQL operations")
-    return {"version": 1, "source": "protocol", "documents": documents, "operations": operations, "errors": sorted(set(errors))}
+    merged, conflicts = merge_protocol_operations(operations)
+    return {
+        "version": 1,
+        "source": "protocol",
+        "documents": documents,
+        "operations": merged,
+        "sources": documents,
+        "conflicts": conflicts,
+        "errors": sorted(set(errors)),
+    }
+
+
+def _protocol_identity(operation: Mapping[str, Any]) -> tuple[str, str, str]:
+    """Use transport identity so an operationId change cannot hide a conflict."""
+
+    kind = str(operation.get("kind", ""))
+    address = str(
+        operation.get("path")
+        or operation.get("channel")
+        or operation.get("event")
+        or operation.get("service")
+        or operation.get("id", "")
+    )
+    method = str(operation.get("method") or operation.get("direction") or "").upper()
+    return kind, method, address
+
+
+def merge_protocol_operations(
+    operations: Iterable[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Merge compatible protocol sources while retaining every disagreement."""
+
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for raw in operations:
+        if isinstance(raw, Mapping):
+            grouped.setdefault(_protocol_identity(raw), []).append(dict(raw))
+    merged: list[dict[str, Any]] = []
+    conflicts: list[dict[str, Any]] = []
+    for identity, candidates in grouped.items():
+        result = dict(candidates[0])
+        result["merge_classification"] = "auto_merge"
+        sources = [item.get("source") for item in candidates if isinstance(item.get("source"), Mapping)]
+        local_conflicts: list[dict[str, Any]] = []
+        for candidate in candidates[1:]:
+            for field, value in candidate.items():
+                if field in {"source", "sources", "conflicts"}:
+                    continue
+                current = result.get(field)
+                if current in (None, "", [], {}):
+                    result[field] = value
+                    result["merge_classification"] = "supplement"
+                elif value in (None, "", [], {}) or current == value:
+                    continue
+                elif isinstance(current, list) and isinstance(value, list):
+                    result[field] = list(dict.fromkeys([*current, *value]))
+                elif isinstance(current, Mapping) and isinstance(value, Mapping):
+                    merged_value, nested_conflicts = _merge_protocol_mapping(
+                        current,
+                        value,
+                        field=field,
+                        identity=identity,
+                        result=result,
+                        candidate=candidate,
+                    )
+                    result[field] = merged_value
+                    local_conflicts.extend(nested_conflicts)
+                else:
+                    result["merge_classification"] = "needs_manual_confirmation"
+                    local_conflicts.append({
+                        "field": field,
+                        "identity": list(identity),
+                        "values": [current, value],
+                        "sources": [
+                            item.get("source", {}).get("file")
+                            for item in (result, candidate)
+                            if isinstance(item.get("source"), Mapping)
+                        ],
+                        "classification": "unusable" if field in {"kind", "method", "path", "channel", "event"} else "needs_manual_confirmation",
+                    })
+        if sources:
+            result["sources"] = sources
+        if local_conflicts:
+            result["conflicts"] = local_conflicts
+            conflicts.extend(local_conflicts)
+        merged.append(result)
+    return merged, conflicts
+
+
+def _merge_protocol_mapping(
+    current: Mapping[str, Any],
+    incoming: Mapping[str, Any],
+    *,
+    field: str,
+    identity: tuple[str, str, str],
+    result: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    prefix: str = "",
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Deep-merge protocol mappings and retain nested scalar disagreements."""
+
+    merged = dict(current)
+    conflicts: list[dict[str, Any]] = []
+    for key, value in incoming.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        if key not in merged or merged[key] in (None, "", [], {}):
+            merged[key] = value
+            continue
+        existing = merged[key]
+        if existing == value or value in (None, "", [], {}):
+            continue
+        if isinstance(existing, Mapping) and isinstance(value, Mapping):
+            nested, nested_conflicts = _merge_protocol_mapping(
+                existing,
+                value,
+                field=field,
+                identity=identity,
+                result=result,
+                candidate=candidate,
+                prefix=path,
+            )
+            merged[key] = nested
+            conflicts.extend(nested_conflicts)
+            continue
+        if isinstance(existing, list) and isinstance(value, list):
+            merged[key] = list(dict.fromkeys([*existing, *value]))
+            continue
+        conflicts.append({
+            "field": f"{field}.{path}",
+            "identity": list(identity),
+            "values": [existing, value],
+            "sources": [
+                item.get("source", {}).get("file")
+                for item in (result, candidate)
+                if isinstance(item.get("source"), Mapping)
+            ],
+            "classification": "needs_manual_confirmation",
+        })
+    return merged, conflicts
 
 
 _EXPECTATION_FIELD_RE = re.compile(
@@ -682,6 +927,9 @@ def map_design_to_protocol(design: dict[str, Any], protocols: dict[str, Any], ex
     errors = [str(value) for value in design.get("errors", [])] + [str(value) for value in protocols.get("errors", [])]
     operations = [item for item in protocols.get("operations", []) if isinstance(item, dict)]
     for rule in (item for item in design.get("rules", []) if isinstance(item, dict)):
+        if rule.get("status") == "not_applicable":
+            rule["protocol_refs"] = []
+            continue
         if rule.get("async") and (not rule.get("acceptance_statuses") or not rule.get("final_statuses")):
             errors.append(f"async design rule {rule.get('id')} must declare acceptance and final status")
         calls = rule.get("calls", []) if isinstance(rule.get("calls"), list) else []
@@ -805,6 +1053,7 @@ def _logic(design: Mapping[str, Any]) -> dict[str, Any]:
         logic.append({
             "id": f"LOGIC_{rule.get('id')}", "source": "design", "design_rule_id": rule.get("id"),
             "title": rule.get("title"), "participants": rule.get("participants", []),
+            "status": rule.get("status", classify_rule(rule)), "context": rule.get("context", {}),
             "protocol_refs": rule.get("protocol_refs", []), "preconditions": rule.get("preconditions", []),
             "states": rule.get("states", []), "transitions": rule.get("transitions", []),
             "branches": rule.get("branches", []), "exceptions": rule.get("exceptions", []),
@@ -831,11 +1080,14 @@ def _scenario_plan(design: Mapping[str, Any], exclusions: Iterable[dict[str, Any
             {
                 "id": str(rule.get("id")), "title": rule.get("title"), "participants": rule.get("participants", []),
                 "design_rule_ids": [str(rule.get("id"))], "protocol_refs": rule.get("protocol_refs", []),
+                "status": "contract_blocked" if rule.get("status") in {"conflict", "manual_confirmation", "missing_evidence"} else "ready",
+                "blockers": [] if rule.get("status") == "confirmed" else [f"design:{rule.get('status', 'missing_evidence')}"],
+                "context": rule.get("context", {}),
                 "required_coverage": {
                     key: rule.get(key, []) for key in ("preconditions", "transitions", "branches", "exceptions", "final_result", "side_effects")
                 },
             }
-            for rule in design.get("rules", []) if isinstance(rule, dict) and str(rule.get("id")) not in excluded_ids
+            for rule in design.get("rules", []) if isinstance(rule, dict) and str(rule.get("id")) not in excluded_ids and rule.get("status") != "not_applicable"
         ],
     }
 
@@ -867,6 +1119,50 @@ def _write_artifacts(documents: Mapping[Path, str]) -> None:
             source.unlink(missing_ok=True)
 
 
+def _runtime_protocol_documents(project_root: Path) -> tuple[list[Path], dict[str, Any]]:
+    """Fetch loopback contracts into ephemeral files for the existing parser."""
+
+    urls = configured_protocol_urls(project_root)
+    try:
+        workspace = yaml.safe_load((project_root / "discovery" / "workspace.yaml").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError):
+        workspace = {}
+    environment_probe: dict[str, Any] = {}
+    runtime_requested = isinstance(workspace, Mapping) and workspace.get("runtime_probe", {}).get("requested") is True
+    # A missing static protocol is exactly the case where a running service
+    # must be probed. The probe is read-only and bounded even when the
+    # workspace template has not yet been marked requested.
+    if not urls:
+        from .discovery import read_only_environment_probe
+        environment_probe = read_only_environment_probe(project_root)
+        urls = list(environment_probe.get("protocol_candidates", [])) if isinstance(environment_probe, Mapping) else []
+    if not urls:
+        services = workspace.get("configuration", {}).get("services", []) if isinstance(workspace, Mapping) else []
+        for service in services if isinstance(services, list) else []:
+            if not isinstance(service, Mapping):
+                continue
+            port = service.get("port", {}).get("value") if isinstance(service.get("port"), Mapping) else None
+            endpoint = service.get("openapi", {}).get("value") if isinstance(service.get("openapi"), Mapping) else None
+            if isinstance(endpoint, str) and endpoint.startswith("/"):
+                try:
+                    urls.append({"service": str(service.get("id") or service.get("owner") or "service"), "url": f"http://127.0.0.1:{int(port)}{endpoint}"})
+                except (TypeError, ValueError):
+                    continue
+    probe = read_only_protocol_probe(urls)
+    if environment_probe:
+        probe["environment_probe"] = environment_probe
+    files: list[Path] = []
+    for item in probe.get("documents", []):
+        if not isinstance(item, Mapping) or not isinstance(item.get("content"), str):
+            continue
+        source = item.get("source", {}) if isinstance(item.get("source"), Mapping) else {}
+        suffix = ".yaml" if source.get("format") == "yaml" else ".json"
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=suffix, prefix="dev-ai-e2e-runtime-", delete=False) as stream:
+            stream.write(str(item["content"]))
+            files.append(Path(stream.name))
+    return files, probe
+
+
 def generate_artifacts(
     project_root: Path,
     *,
@@ -874,12 +1170,39 @@ def generate_artifacts(
     design_files: Iterable[Path] = (),
     openapi_roots: Iterable[Path] = (),
     openapi_files: Iterable[Path] = (),
+    runtime_urls: Iterable[str] = (),
 ) -> tuple[dict[str, Any], list[str]]:
     """Validate every authority input, then atomically write generation artifacts."""
 
     project_root = project_root.resolve()
     design_discovery = discover_documents(project_root, roots=design_roots, files=design_files)
     protocol_discovery = discover_protocols(project_root, roots=openapi_roots, files=openapi_files)
+    runtime_protocol_files: list[Path] = []
+    runtime_probe: dict[str, Any] = {}
+    has_formal_protocol = any(path.suffix.casefold() in PROTOCOL_SUFFIXES for path in protocol_discovery.files)
+    if runtime_urls:
+        runtime_probe = read_only_protocol_probe(
+            ({"url": value, "source_type": "user_url", "user_confirmed": True} for value in runtime_urls),
+            allow_external=True,
+        )
+        runtime_protocol_files = []
+        for item in runtime_probe.get("documents", []):
+            if not isinstance(item, Mapping) or not isinstance(item.get("content"), str):
+                continue
+            suffix = ".yaml" if str(item.get("source", {}).get("format")) == "yaml" else ".json"
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=suffix, prefix="dev-ai-e2e-runtime-", delete=False) as stream:
+                stream.write(str(item["content"]))
+                runtime_protocol_files.append(Path(stream.name))
+        if runtime_protocol_files:
+            protocol_discovery = type(protocol_discovery)(tuple(runtime_protocol_files), (), ())
+    elif not has_formal_protocol and not (openapi_roots or openapi_files):
+        runtime_protocol_files, runtime_probe = _runtime_protocol_documents(project_root)
+        if runtime_protocol_files:
+            protocol_discovery = type(protocol_discovery)(
+                tuple(runtime_protocol_files),
+                tuple(dict.fromkeys([*protocol_discovery.candidates, *(path.parent for path in runtime_protocol_files)])),
+                protocol_discovery.hints,
+            )
     errors: list[str] = []
     if not design_discovery.files:
         candidates = ", ".join(map(str, design_discovery.candidates)) or "none"
@@ -892,14 +1215,64 @@ def generate_artifacts(
     if not (openapi_roots or openapi_files) and len(protocol_discovery.candidates) > 1:
         errors.append("multiple protocol roots found; choose one with --openapi-root/--openapi-file: " + ", ".join(map(str, protocol_discovery.candidates)))
     design = parse_design_documents(design_discovery.files) if design_discovery.files else {"version": 1, "source": "design", "documents": [], "rules": [], "errors": []}
-    protocols = parse_protocol_documents(protocol_discovery.files) if protocol_discovery.files else {"version": 1, "source": "protocol", "documents": [], "operations": [], "errors": []}
+    protocols = parse_protocol_documents(protocol_discovery.files) if protocol_discovery.files else {"version": 1, "source": "protocol", "documents": [], "operations": [], "sources": [], "conflicts": [], "errors": []}
+    for runtime_file in runtime_protocol_files:
+        runtime_file.unlink(missing_ok=True)
+    if runtime_probe:
+        protocols["runtime_sources"] = runtime_probe.get("sources", [])
+        protocols["runtime_errors"] = runtime_probe.get("errors", [])
+        protocols["runtime_classifications"] = runtime_probe.get("classifications", [])
+        protocols["runtime_failure_details"] = runtime_probe.get("failure_details", [])
+        runtime_sources = runtime_probe.get("sources", []) if isinstance(runtime_probe.get("sources"), list) else []
+        for index, document in enumerate(protocols.get("documents", [])):
+            if not isinstance(document, dict) or index >= len(runtime_sources) or not isinstance(runtime_sources[index], Mapping):
+                continue
+            source = runtime_sources[index]
+            document.update({
+                "path": str(source.get("url") or document.get("path")),
+                "source_type": source.get("source_type", "runtime_url"),
+                "service": source.get("service"),
+                "url": source.get("url"),
+                "format": source.get("format"),
+                "fetched_at": source.get("fetched_at"),
+                "content_sha256": source.get("content_sha256"),
+                "user_confirmed": source.get("user_confirmed", False),
+            })
+        for operation in protocols.get("operations", []):
+            if not isinstance(operation, dict):
+                continue
+            source = operation.get("source")
+            if isinstance(source, dict) and runtime_sources:
+                runtime = next(
+                    (
+                        runtime_sources[index]
+                        for index, path in enumerate(runtime_protocol_files)
+                        if str(source.get("file")) == str(path) and index < len(runtime_sources)
+                    ),
+                    runtime_sources[0],
+                )
+                source["file"] = str(runtime.get("url") or source.get("file"))
+                if runtime.get("service") and not operation.get("service"):
+                    operation["service"] = runtime.get("service")
     exclusions, exclusion_errors = _read_exclusions(project_root)
     errors.extend(exclusion_errors)
     errors.extend(map_design_to_protocol(design, protocols, exclusions))
+    if protocols.get("conflicts"):
+        conflict_identity = {
+            tuple(item.get("identity", []))
+            for item in protocols["conflicts"] if isinstance(item, Mapping) and isinstance(item.get("identity"), list)
+        }
+        for rule in design.get("rules", []) if isinstance(design.get("rules"), list) else []:
+            refs = set(str(item) for item in rule.get("protocol_refs", [])) if isinstance(rule, Mapping) else set()
+            affected = any(
+                tuple(_protocol_identity(operation)) in conflict_identity
+                for operation in protocols.get("operations", [])
+                if isinstance(operation, Mapping) and str(operation.get("id")) in refs
+            )
+            if affected and isinstance(rule, dict):
+                rule["status"] = "conflict"
     errors.extend(_workspace_participant_errors(project_root, design))
-    manual = [str(rule.get("id")) for rule in design.get("rules", []) if isinstance(rule, dict) and rule.get("manual_confirmation")]
-    if manual:
-        errors.append("design rules require manual_confirmation: " + ", ".join(manual))
+    manual = [str(rule.get("id")) for rule in design.get("rules", []) if isinstance(rule, dict) and rule.get("status") in {"manual_confirmation", "conflict", "missing_evidence"}]
 
     value_path = project_root / "config" / "value-resolution.yaml"
     if value_path.is_file():
@@ -926,12 +1299,16 @@ def generate_artifacts(
     result = {
         "design": {"files": [str(path) for path in design_discovery.files], "candidates": [str(path) for path in design_discovery.candidates], "summary": input_summary(design)},
         "protocol": {"files": [str(path) for path in protocol_discovery.files], "candidates": [str(path) for path in protocol_discovery.candidates], "summary": input_summary(protocols)},
+        "runtime_probe": runtime_probe,
         "coverage": {"design_rules": len(design.get("rules", [])), "protocol_operations": len(protocols.get("operations", [])), "planned_scenarios": len(plan["scenarios"]), "manual_confirmation": manual, "errors": sorted(set(errors))},
         "artifacts": [],
     }
     if errors:
         return result, sorted(set(errors))
 
+    # Materialize first so the version lock fingerprints the generated scenario
+    # data and cleanup contract in the same generation transaction.
+    scenario_files, scenario_blockers = materialize_scenarios(project_root, design, protocols, plan)
     lock = build_generation_lock(project_root, design, protocols, value_resolution=value_resolution, previous=previous)
     documents = {
         discovery_dir / "design-rules.yaml": _render_yaml("保存人工审查设计文档提取的业务规则；规则来源只能是 design", design),
@@ -944,9 +1321,11 @@ def generate_artifacts(
     if exclusions:
         documents[discovery_dir / "exclusions.yaml"] = _render_yaml("保存经用户确认的排除入口、原因、影响范围和人工补测要求", {"exclusions": exclusions})
     _write_artifacts(documents)
+    if scenario_blockers:
+        result["materialization_blockers"] = scenario_blockers
     for legacy in (project_root / "source-rules.yaml", discovery_dir / "source-rules.yaml"):
         legacy.unlink(missing_ok=True)
-    result["artifacts"] = [str(path) for path in documents]
+    result["artifacts"] = [str(path) for path in documents] + [str(path) for path in scenario_files]
     return result, []
 
 
@@ -1360,7 +1739,10 @@ def _control_errors(
             required |= {"correlation_keys", "business_evidence", "recovery"}
         if name == "database_control":
             required |= {"safety"}
-        if not isinstance(item, dict) or set(item) != required:
+        enriched = required | {"component", "trigger", "impact", "observation", "isolation", "cleanup", "recovery"}
+        if name == "observability":
+            enriched |= {"correlation_keys", "business_evidence"}
+        if not isinstance(item, dict) or (set(item) != required and set(item) != enriched):
             errors.append(_error(path, "control-entry-schema", f"控制类别结构无效: {name}", f"{name}:"))
             continue
         status = item.get("status")
@@ -1487,14 +1869,14 @@ def _constructability_errors(
     isolation: Any,
     cleanup: Any,
 ) -> list[str]:
-    """校验每个前置和步骤都已穷尽八类构造路径。"""
+    """Validate the complete constructability matrix for every item."""
 
     errors: list[str] = []
     if not _exact_keys(path, value, {"preconditions", "steps"}, "constructability-schema", errors):
         return errors
     candidate_keys = {
         "kind", "status", "component", "consumer_source", "control", "side_effect", "trigger",
-        "observation", "isolation", "cleanup", "evidence",
+        "observation", "isolation", "cleanup", "impact", "recovery", "evidence",
     }
     isolation_refs = set(str(item) for item in isolation.get("correlation_keys", [])) if isinstance(isolation, Mapping) else set()
     if isinstance(isolation, Mapping):
@@ -1526,7 +1908,8 @@ def _constructability_errors(
                 errors.append(_error(path, "constructability-candidate-status", f"候选路径状态无效: {owner}/{kind}", "status:"))
             if candidate.get("side_effect") not in {"none", "read", "write"}:
                 errors.append(_error(path, "constructability-side-effect", f"候选路径副作用无效: {owner}/{kind}", "side_effect:"))
-            for field in candidate_keys - {"kind", "status", "side_effect", "evidence"}:
+            required_candidate_fields = candidate_keys - {"kind", "status", "side_effect", "evidence"}
+            for field in required_candidate_fields:
                 if not isinstance(candidate.get(field), str) or not candidate[field].strip():
                     errors.append(_error(path, "constructability-candidate-value", f"候选路径字段不得为空: {owner}/{kind}.{field}", f"{field}:"))
             evidence = candidate.get("evidence")
@@ -1670,6 +2053,8 @@ def _scenario_errors(
     expected_meta_keys = {"id", "name", "status", "actor"}
     if isinstance(meta, dict) and "participants" in meta:
         expected_meta_keys.add("participants")
+    if isinstance(meta, dict) and "context" in meta:
+        expected_meta_keys.add("context")
     if _exact_keys(path, meta, expected_meta_keys, "scenario-meta", errors):
         if not isinstance(meta.get("id"), str) or not ID_RE.fullmatch(meta["id"]):
             errors.append(_error(path, "scenario-id", "场景 ID 格式无效", "id:"))
@@ -1718,7 +2103,7 @@ def _scenario_errors(
     for step in steps:
         allowed_step_keys = {
             "id", "action", "control", "side_effect", "expect", "data_ref", "status", "status_reason", "evidence",
-            "design_rule_id", "protocol_ref", "phase",
+            "design_rule_id", "protocol_ref", "phase", "async",
         }
         required_step_keys = {"id", "action", "control", "side_effect", "expect"}
         if not isinstance(step, dict) or not required_step_keys.issubset(set(step)) or set(step) - allowed_step_keys:
@@ -1748,6 +2133,22 @@ def _scenario_errors(
 
         if "phase" in step and step.get("phase") not in {"request", "message_acceptance", "processing", "final_business", "side_effect"}:
             errors.append(_error(path, "step-phase", f"invalid step phase: {step.get('id')}", "phase:"))
+        async_contract = step.get("async")
+        if async_contract is not None:
+            required_async = {"trigger", "correlation_key", "expected_status", "timeout_seconds", "interval_seconds", "retries", "repeat_detection", "final_failure"}
+            if not isinstance(async_contract, Mapping) or set(async_contract) != required_async:
+                errors.append(_error(path, "async-step-schema", f"async step contract is incomplete: {step.get('id')}", "async:"))
+            elif (
+                not all(isinstance(async_contract.get(item), str) and async_contract[item].strip() for item in ("trigger", "correlation_key", "expected_status", "repeat_detection", "final_failure"))
+                or not isinstance(async_contract.get("timeout_seconds"), (int, float))
+                or not isinstance(async_contract.get("interval_seconds"), (int, float))
+                or async_contract["timeout_seconds"] <= 0
+                or async_contract["interval_seconds"] <= 0
+                or not isinstance(async_contract.get("retries"), int)
+                or isinstance(async_contract.get("retries"), bool)
+                or async_contract["retries"] < 0
+            ):
+                errors.append(_error(path, "async-step-values", f"async step contract has invalid values: {step.get('id')}", "async:"))
         for field in ("design_rule_id", "protocol_ref"):
             if field in step and (not isinstance(step.get(field), str) or not step[field].strip()):
                 errors.append(_error(path, "step-provenance", f"empty {field}: {step.get('id')}", field + ":"))

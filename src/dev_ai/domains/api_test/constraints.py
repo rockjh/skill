@@ -15,6 +15,7 @@ from typing import Any, Iterable
 sys.dont_write_bytecode = True
 
 from .check_artifact_safety import scan as scan_secrets
+from .design_rules import understanding_errors
 from .manifest_io import first_list, load_data
 from .qa_paths import (
     BRUNO,
@@ -535,6 +536,10 @@ def _design_rule_errors(
     document = load_data(path)
     if not isinstance(document, dict) or document.get("source") != "design":
         return [*retired_errors, _rule_error("DESIGN-001", "design-rules.yaml must declare source: design")]
+    errors: list[str] = [
+        _rule_error("DESIGN-001", message)
+        for message in understanding_errors(document)
+    ]
     rules = [item for item in document.get("rules", []) if isinstance(item, dict)]
     rules_by_id = {str(item.get("id")): item for item in rules if item.get("id")}
     covered = {str(item.get("endpoint_id")) for item in rules if item.get("endpoint_id")}
@@ -554,7 +559,7 @@ def _design_rule_errors(
         )
         if endpoint_id
     }
-    errors: list[str] = list(retired_errors)
+    errors = [*retired_errors, *errors]
     rule_ids = [str(item.get("id")) for item in rules if item.get("id")]
     for rule_id in sorted({item for item in rule_ids if rule_ids.count(item) > 1}):
         errors.append(_rule_error("DESIGN-001", f"design rule ID is duplicated: {rule_id}"))
@@ -605,6 +610,12 @@ def _design_rule_errors(
         for endpoint in first_list(endpoint_doc, "endpoints")
         if endpoint.get("id")
     }
+    endpoint_by_id = {
+        str(endpoint.get("id")): endpoint
+        for _, _, endpoint_doc, _ in records
+        for endpoint in first_list(endpoint_doc, "endpoints")
+        if endpoint.get("id")
+    }
     for endpoint_id in sorted(endpoint_ids - covered - approved):
         errors.append(_rule_error("DESIGN-001", f"endpoint {endpoint_id} has no design rule or approved exclusion"))
     for _, directory, _, case_doc in records:
@@ -637,6 +648,27 @@ def _design_rule_errors(
                     "DESIGN-001",
                     f"logic {logic.get('id')} references unknown design rule {logic.get('design_rule_id')}",
                 ))
+            else:
+                rule = rules_by_id[str(logic.get("design_rule_id"))]
+                expected_endpoint_id = str(rule.get("endpoint_id", ""))
+                logic_endpoint_id = str(logic.get("endpoint_id", ""))
+                if not logic_endpoint_id or logic_endpoint_id != expected_endpoint_id:
+                    errors.append(_rule_error(
+                        "DESIGN-001",
+                        f"logic {logic.get('id')} must identify endpoint {expected_endpoint_id}",
+                    ))
+                endpoint = endpoint_by_id.get(expected_endpoint_id)
+                expected_operation = (
+                    f"{endpoint.get('method')} {endpoint.get('path')}"
+                    if isinstance(endpoint, dict) else ""
+                )
+                if not str(logic.get("openapi_operation", "")).strip() or (
+                    expected_operation and str(logic.get("openapi_operation")) != expected_operation
+                ):
+                    errors.append(_rule_error(
+                        "DESIGN-001",
+                        f"logic {logic.get('id')} must reference OpenAPI operation {expected_operation or '<unknown>'}",
+                    ))
             if logic.get("source_candidate_id") or logic.get("observed_rule_id"):
                 errors.append(_rule_error("DESIGN-001", f"logic {logic.get('id')} references non-design evidence"))
             evidence = logic.get("evidence", []) if isinstance(logic.get("evidence"), list) else []
@@ -889,6 +921,22 @@ def success_assertion_errors(case: dict[str, Any]) -> list[str]:
         step.get("phase") == "assertion" and isinstance(step.get("expected"), dict) and step.get("expected")
         for step in database_steps(case)
     )
+    # A reviewed design may define the business result as a lifecycle state
+    # without exposing a business error/code envelope. Treat that state as a
+    # concrete business assertion only when the case carries the design-backed
+    # expected state; generic protocol status checks remain insufficient.
+    design_state = (
+        case.get("source") == "design"
+        and str(expected.get("state", "")).strip()
+        and any(
+            str(item.get("path")) in {"$.status", "$.state"}
+            and item.get("equals") == expected.get("state")
+            for item in exact
+        )
+    )
+    if design_state:
+        has_business = True
+        has_result = True
     errors: list[str] = []
     if not has_business:
         errors.append(f"success case {case_id} has no exact business-code assertion")
