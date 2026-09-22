@@ -10,9 +10,9 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from dev_ai.cli import console_main
-from dev_ai.core.schema import get_schema, validate_schema
-from dev_ai.domains.business_flow.discovery import scan
+from dltk.cli import console_main
+from dltk.schema import get_schema, validate_schema
+from dltk.business_flow_discovery import scan
 
 
 class BusinessFlowContractTests(unittest.TestCase):
@@ -446,7 +446,7 @@ class BusinessFlowContractTests(unittest.TestCase):
             self.initialize_and_confirm(root)
             code, result = self.invoke("business-flow", "generate", "--project", str(root))
             self.assertEqual(0, code, result)
-            with patch("dev_ai.domains.business_flow.cli.scan", side_effect=AssertionError("resume must use cached evidence")):
+            with patch("dltk.business_flow_cli.scan", side_effect=AssertionError("resume must use cached evidence")):
                 code, result = self.invoke("business-flow", "generate", "--project", str(root), "--resume")
             self.assertEqual(0, code, result)
             progress = json.loads(

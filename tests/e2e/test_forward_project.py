@@ -11,15 +11,15 @@ import textwrap
 import unittest
 from pathlib import Path
 
-from dev_ai import __version__
-from dev_ai.core.artifacts import write_lock
-from dev_ai.core.schema import E2E_GATE_SCHEMA_VERSION
-from dev_ai.domains.e2e.assets import initialize
-from dev_ai.domains.e2e.contracts import generate_artifacts
+from dltk import __version__
+from dltk.artifacts import write_lock
+from dltk.schema import E2E_GATE_SCHEMA_VERSION
+from dltk.e2e_assets import initialize
+from dltk.e2e_contracts import generate_artifacts
 
 
-def _dev_ai(project: Path, command: str, *arguments: str) -> list[str]:
-    return [sys.executable, "-m", "dev_ai", "e2e", command, "--project", str(project), *arguments, "--json"]
+def _dltk(project: Path, command: str, *arguments: str) -> list[str]:
+    return [sys.executable, "-m", "dltk", "e2e", command, "--project", str(project), *arguments, "--json"]
 
 
 def _run(command: list[str], cwd: Path, environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -113,25 +113,25 @@ class ForwardProjectTests(unittest.TestCase):
             missing_environment.pop("EVIDENCE_CONNECTION", None)
             missing_environment.pop("TEST_QUERY_KEY", None)
             discovery_check = _run(
-                _dev_ai(project, "check", "--gate", "discovery"), project, missing_environment
+                _dltk(project, "check", "--gate", "discovery"), project, missing_environment
             )
             self.assertEqual(0, discovery_check.returncode, discovery_check.stdout + discovery_check.stderr)
             missing_check = _run(
-                _dev_ai(project, "check", "--gate", "contracts"), project, missing_environment
+                _dltk(project, "check", "--gate", "contracts"), project, missing_environment
             )
             self.assertNotEqual(0, missing_check.returncode)
             self.assertIn("ready-runtime-values", missing_check.stderr)
 
             commands = (
                 *(
-                    _dev_ai(project, "check", "--gate", gate)
+                    _dltk(project, "check", "--gate", gate)
                     for gate in (
                         "workspace_inventory", "dependency_topology", "initial_configuration", "runtime_probe",
                         "control_matrix", "scenario_split", "scenario_ownership", "shared_integration",
                     )
                 ),
-                _dev_ai(project, "check", "--gate", "static"),
-                _dev_ai(project, "source-status"),
+                _dltk(project, "check", "--gate", "static"),
+                _dltk(project, "source-status"),
             )
             process_environment = os.environ.copy()
             process_environment.update({"EVIDENCE_CONNECTION": "driver-reference", "TEST_QUERY_KEY": "query-key"})
@@ -139,7 +139,7 @@ class ForwardProjectTests(unittest.TestCase):
                 completed = _run(command, project, process_environment)
                 self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
 
-            completed = _run(_dev_ai(project, "run", "-q"), project, process_environment)
+            completed = _run(_dltk(project, "run", "-q"), project, process_environment)
             self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
             envelope = json.loads(completed.stdout)
             self.assertTrue(envelope["ok"])
@@ -447,7 +447,7 @@ class ForwardProjectTests(unittest.TestCase):
 
             import pytest
 
-            from dev_ai.domains.e2e.runtime import preflight, record_business_entry, step_guard
+            from dltk.e2e_runtime import preflight, record_business_entry, step_guard
             from scenarios.读取证据.步骤 import observe_evidence, verify_no_mutation
 
 
@@ -498,7 +498,7 @@ class ForwardProjectTests(unittest.TestCase):
             '''\
             """读取合成证据并记录与真实查询绑定的控制事件。"""
 
-            from dev_ai.domains.e2e.runtime import record_control
+            from dltk.e2e_runtime import record_control
 
 
             def query_evidence(correlation_ref: str) -> dict[str, bool]:

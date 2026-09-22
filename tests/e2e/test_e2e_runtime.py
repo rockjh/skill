@@ -15,7 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC = PROJECT_ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
-RUNTIME = importlib.import_module("dev_ai.domains.e2e.runtime")
+RUNTIME = importlib.import_module("dltk.e2e_runtime")
 
 
 class RuntimeTests(unittest.TestCase):

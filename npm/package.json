@@ -1,19 +1,19 @@
 {
-  "name": "@seres/dev-ai",
-  "version": "6.7.0",
-  "description": "npm installer for the dev-ai Python runtime and skills",
+  "name": "seres-dltk",
+  "version": "7.0.0",
+  "description": "npm installer for the dltk Python runtime and skills",
   "license": "UNLICENSED",
   "bin": {
-    "dev-ai": "bin/dev-ai.js"
+    "dltk": "bin/dltk.js"
   },
   "scripts": {
-    "postinstall": "node postinstall.js"
+    "prepack": "bash scripts/prepack.sh",
+    "postinstall": "node scripts/install.js"
   },
   "files": [
     "bin/",
     "skills/",
-    "vendor/",
-    "postinstall.js",
-    "runtime.js"
+    "dist/",
+    "scripts/"
   ]
 }

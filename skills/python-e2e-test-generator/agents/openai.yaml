@@ -1,4 +1,0 @@
-interface:
-  display_name: "Python E2E Test Generator"
-  short_description: "Discover and generate executable cross-service pytest E2E"
-  default_prompt: "Use $python-e2e-test-generator to build source-backed business context from natural-language design, discover or read-only probe formal protocols, classify controls and owned data, then generate, validate, execute, restore, and report isolated traceable cross-service Python/pytest E2E scenarios."

@@ -1,0 +1,9 @@
+{
+  "schema_version": 3,
+  "source_fingerprint": "example-source-fingerprint",
+  "confirmed": true,
+  "entries": [
+    {"id": "url:POST /relations/sync", "module": "relation-sync", "file": "00-relation-sync.md"},
+    {"id": "message:relation-failed", "module": "notification", "file": "01-notification.md"}
+  ]
+}

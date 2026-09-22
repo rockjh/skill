@@ -19,7 +19,7 @@ if str(SRC) not in sys.path:
 
 class DesignUnderstandingTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.design_rules = importlib.import_module("dev_ai.domains.api_test.design_rules")
+        self.design_rules = importlib.import_module("dltk.api_test_design_rules")
 
     def test_prose_is_understood_without_fixed_markers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -39,7 +39,7 @@ class DesignUnderstandingTests(unittest.TestCase):
             self.assertEqual("derived", rule["evidence_level"])
             self.assertTrue(document["documents"][0]["parser_gap"])
             self.assertTrue(document["parser_diagnostics"][0]["parser_gap"])
-            from dev_ai.core.schema import get_schema, validate_schema
+            from dltk.schema import get_schema, validate_schema
             self.assertEqual(validate_schema(get_schema("api-test.design-rules")["document"], document), [])
             self.assertEqual("exact", rule["mapping_category"])
             self.assertEqual([{"path": "$.status", "equals": "SUCCESS"}], rule["assertions"])
@@ -327,7 +327,7 @@ class DesignUnderstandingTests(unittest.TestCase):
             )
 
     def test_blocked_generation_still_reports_all_output_categories(self) -> None:
-        cli = importlib.import_module("dev_ai.domains.api_test.cli")
+        cli = importlib.import_module("dltk.api_test_cli")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             qa_root = root / "qa"
@@ -353,7 +353,7 @@ class DesignUnderstandingTests(unittest.TestCase):
             self.assertIn("gate_failures=", output.getvalue())
 
     def test_missing_design_writes_a_blocked_audit_report(self) -> None:
-        cli = importlib.import_module("dev_ai.domains.api_test.cli")
+        cli = importlib.import_module("dltk.api_test_cli")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             qa_root = root / "qa"
@@ -369,7 +369,7 @@ class DesignUnderstandingTests(unittest.TestCase):
             self.assertIn("no design source", report["gate_failures"])
 
     def test_generation_exception_is_reported_as_failed_gate(self) -> None:
-        cli = importlib.import_module("dev_ai.domains.api_test.cli")
+        cli = importlib.import_module("dltk.api_test_cli")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             qa_root = root / "qa"
@@ -395,7 +395,7 @@ class DesignUnderstandingTests(unittest.TestCase):
             self.assertTrue(any("flow owner mismatch" in item for item in report["gate_failures"]))
 
     def test_successful_generation_refreshes_final_design_report(self) -> None:
-        cli = importlib.import_module("dev_ai.domains.api_test.cli")
+        cli = importlib.import_module("dltk.api_test_cli")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             qa_root = root / "qa"

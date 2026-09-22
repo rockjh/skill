@@ -1,0 +1,4 @@
+interface:
+  display_name: "Development Lifecycle Toolkit"
+  short_description: "Run unified API, E2E, and business-flow workflows"
+  default_prompt: "Use $get-my-dev-lifecycle-toolkit with the dltk CLI. Choose api-test, e2e, or business-flow from the user's goal, read only the routed references, preserve domain schemas and locks, enforce safety and ownership gates, and return the redacted authoritative report or artifact path."

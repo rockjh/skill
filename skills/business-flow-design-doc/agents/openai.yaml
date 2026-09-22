@@ -1,4 +1,0 @@
-interface:
-  display_name: "Business Flow Design Document"
-  short_description: "Generate source-backed business flow documents"
-  default_prompt: "Use $business-flow-design-doc to scan the selected Git version, map every business entry and reachable error code to one module document, render Mermaid sequences, and run the bidirectional coverage check."

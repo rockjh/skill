@@ -26,12 +26,12 @@ sys.dont_write_bytecode = True
 
 def load_script(name: str):
     aliases = {"bruno_api_test_generator": "cli", "qa_constraints": "constraints"}
-    return importlib.import_module(f"dev_ai.domains.api_test.{aliases.get(name, name)}")
+    return importlib.import_module(f"dltk.api_test_{aliases.get(name, name)}")
 
 
 def module_command(name: str) -> list[str]:
     aliases = {"bruno_api_test_generator": "cli", "qa_constraints": "constraints"}
-    return [sys.executable, "-m", f"dev_ai.domains.api_test.{aliases.get(name, name)}"]
+    return [sys.executable, "-m", f"dltk.api_test_{aliases.get(name, name)}"]
 
 
 def static_preflight_inputs(root: Path) -> tuple[Path, Path]:
@@ -173,15 +173,15 @@ def mock_data_fixture(root: Path, modules: tuple[str, ...] = ("orders", "users")
             "idempotent": True,
             "depends_on": [],
             "ownership": {
-                "namespace_env": "DEV_AI_DATA_NAMESPACE",
+                "namespace_env": "DLTK_DATA_NAMESPACE",
                 "resource": module,
-                "selector": "test_namespace = DEV_AI_DATA_NAMESPACE",
+                "selector": "test_namespace = DLTK_DATA_NAMESPACE",
             },
-            "precheck": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); bru.setVar('DEV_AI_STEP_EXISTS', await exists(ns) ? 'true' : 'false');",
-            "script": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); await create(ns);",
-            "setup_verification": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); if (!await exists(ns)) throw new Error('missing');",
-            "cleanup": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); await remove(ns);",
-            "cleanup_verification": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); if (await exists(ns)) throw new Error('still exists');",
+            "precheck": "const ns = bru.getEnvVar('DLTK_DATA_NAMESPACE'); bru.setVar('DLTK_STEP_EXISTS', await exists(ns) ? 'true' : 'false');",
+            "script": "const ns = bru.getEnvVar('DLTK_DATA_NAMESPACE'); await create(ns);",
+            "setup_verification": "const ns = bru.getEnvVar('DLTK_DATA_NAMESPACE'); if (!await exists(ns)) throw new Error('missing');",
+            "cleanup": "const ns = bru.getEnvVar('DLTK_DATA_NAMESPACE'); await remove(ns);",
+            "cleanup_verification": "const ns = bru.getEnvVar('DLTK_DATA_NAMESPACE'); if (await exists(ns)) throw new Error('still exists');",
         }
         (module_root / "cases.yaml").write_text(yaml.safe_dump({
             "module": module,
@@ -222,7 +222,7 @@ def mock_data_fixture(root: Path, modules: tuple[str, ...] = ("orders", "users")
 
 
 def successful_mock_script(_root, _script, _variables, label):
-    return {"DEV_AI_STEP_EXISTS": "false"} if "precheck" in label else {}
+    return {"DLTK_STEP_EXISTS": "false"} if "precheck" in label else {}
 
 
 class RegressionTests(unittest.TestCase):
@@ -528,12 +528,12 @@ class RegressionTests(unittest.TestCase):
                     "id": "authored-db-fallback", "phase": "setup", "reason": "missing_prerequisite_api",
                     "engine": "mysql", "data_source": "primary", "evidence": ["V1__orders.sql:1"],
                     "estimated_records": 1, "idempotent": True, "depends_on": [],
-                    "ownership": {"namespace_env": "DEV_AI_DATA_NAMESPACE", "resource": "orders", "selector": "id = DEV_AI_DATA_NAMESPACE"},
-                    "precheck": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); bru.setVar('DEV_AI_STEP_EXISTS', await exists(ns) ? 'true' : 'false');",
-                    "script": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); await insertIfMissing(ns);",
-                    "setup_verification": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); if (!await exists(ns)) throw new Error('missing');",
-                    "cleanup": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); await remove(ns);",
-                    "cleanup_verification": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); if (await exists(ns)) throw new Error('still exists');",
+                    "ownership": {"namespace_env": "DLTK_DATA_NAMESPACE", "resource": "orders", "selector": "id = DLTK_DATA_NAMESPACE"},
+                    "precheck": "const ns = bru.getEnvVar('DLTK_DATA_NAMESPACE'); bru.setVar('DLTK_STEP_EXISTS', await exists(ns) ? 'true' : 'false');",
+                    "script": "const ns = bru.getEnvVar('DLTK_DATA_NAMESPACE'); await insertIfMissing(ns);",
+                    "setup_verification": "const ns = bru.getEnvVar('DLTK_DATA_NAMESPACE'); if (!await exists(ns)) throw new Error('missing');",
+                    "cleanup": "const ns = bru.getEnvVar('DLTK_DATA_NAMESPACE'); await remove(ns);",
+                    "cleanup_verification": "const ns = bru.getEnvVar('DLTK_DATA_NAMESPACE'); if (await exists(ns)) throw new Error('still exists');",
                 }]},
             ]
             (module / "cases.yaml").write_text(yaml.safe_dump({"module": "orders", "cases": cases}), encoding="utf-8")
@@ -566,7 +566,7 @@ class RegressionTests(unittest.TestCase):
             self.assertNotEqual(plan["steps"][0]["id"], "authored-db-fallback")
             rendered_cases = yaml.safe_load((module / "cases.yaml").read_text(encoding="utf-8"))["cases"]
             get_case = next(item for item in rendered_cases if item["id"] == "ORDER_GET_SUCCESS")
-            self.assertEqual(get_case["request"]["path_parameters"]["id"], "{{DEV_AI_DATA_ORDERS_ID}}")
+            self.assertEqual(get_case["request"]["path_parameters"]["id"], "{{DLTK_DATA_ORDERS_ID}}")
 
             # Removing the source-backed create API forces the deterministic database fallback.
             endpoints[0]["path"] = "/unrelated"
@@ -599,7 +599,7 @@ class RegressionTests(unittest.TestCase):
 
             def partially_failing(_root, _script, _variables, label):
                 if "precheck" in label:
-                    return {"DEV_AI_STEP_EXISTS": "false"}
+                    return {"DLTK_STEP_EXISTS": "false"}
                 if label == "mock-data setup orders-fixture":
                     raise mock_data.MockDataError("second statement failed after insert")
                 return {}
@@ -633,7 +633,7 @@ class RegressionTests(unittest.TestCase):
 
             def existing(_root, _script, _variables, label):
                 calls.append(label)
-                return {"DEV_AI_STEP_EXISTS": "true"} if "precheck" in label else {}
+                return {"DLTK_STEP_EXISTS": "true"} if "precheck" in label else {}
 
             with mock.patch.object(mock_data, "_execute_script", side_effect=existing):
                 result = mock_data.prepare(
@@ -662,12 +662,12 @@ class RegressionTests(unittest.TestCase):
             result = mock_data._execute_script(
                 Path(directory),
                 "console.log('untrusted-noise'); "
-                "bru.setVar('DEV_AI_STEP_EXISTS', 'false'); "
+                "bru.setVar('DLTK_STEP_EXISTS', 'false'); "
                 "bru.setVar('UNSCOPED_SECRET', 'must-not-return');",
                 variables,
                 "metadata probe",
             )
-            self.assertEqual(result, {"DEV_AI_STEP_EXISTS": "false"})
+            self.assertEqual(result, {"DLTK_STEP_EXISTS": "false"})
             self.assertEqual(variables, result)
 
     def test_source_derived_database_templates_cover_supported_engines(self):
@@ -678,7 +678,7 @@ class RegressionTests(unittest.TestCase):
             "primary_key": ["id"], "references": [], "evidence": ["schema.sql:1"],
         }
         document_entity = {**relational_entity, "source_type": "annotated_entity"}
-        variable_by_entity = {"orders": "DEV_AI_DATA_ORDERS_ID"}
+        variable_by_entity = {"orders": "DLTK_DATA_ORDERS_ID"}
         markers = {
             "oracle": "FROM dual WHERE NOT EXISTS",
             "sqlserver": "WHERE NOT EXISTS",
@@ -1140,7 +1140,7 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(coverage.collection_runtime_errors(root), [])
             request.write_text(
                 request.read_text(encoding="utf-8")
-                + "// dev-ai: auth-start\n",
+                + "// dltk: auth-start\n",
                 encoding="utf-8",
             )
             self.assertTrue(any(
@@ -1272,8 +1272,8 @@ class RegressionTests(unittest.TestCase):
             self.assertFalse((root / "bruno" / "environments").exists())
             self.assertTrue((root / "execution" / "run.bat").is_file())
             self.assertTrue((root / "execution" / "run.sh").is_file())
-            self.assertIn("dev-ai api-test run", (root / "execution" / "run.bat").read_text(encoding="utf-8"))
-            self.assertIn("dev-ai api-test run", (root / "execution" / "run.sh").read_text(encoding="utf-8"))
+            self.assertIn("dltk api-test run", (root / "execution" / "run.bat").read_text(encoding="utf-8"))
+            self.assertIn("dltk api-test run", (root / "execution" / "run.sh").read_text(encoding="utf-8"))
             self.assertEqual(
                 sorted(path.name for path in (root / "execution" / "environments").glob("*.bru")),
                 ["local.bru"],
@@ -1995,9 +1995,9 @@ class RegressionTests(unittest.TestCase):
             {"method": "GET", "path": "/jobs/{id}"},
             sequence=2,
         )
-        self.assertIn("dev-ai:flow:capture:job_id", capture)
-        self.assertIn("dev-ai:flow:use:job_id", use)
-        self.assertIn("dev-ai:flow:absence:$.deletedAt", use)
+        self.assertIn("dltk:flow:capture:job_id", capture)
+        self.assertIn("dltk:flow:use:job_id", use)
+        self.assertIn("dltk:flow:absence:$.deletedAt", use)
 
     def test_database_steps_render_run_level_prerequisite_and_runtime_assertion(self):
         materializer = load_script("materialize_missing_bru")
@@ -2021,15 +2021,15 @@ class RegressionTests(unittest.TestCase):
                     "estimated_records": 1,
                     "idempotent": True,
                     "ownership": {
-                        "namespace_env": "DEV_AI_DATA_NAMESPACE",
+                        "namespace_env": "DLTK_DATA_NAMESPACE",
                         "resource": "thing",
-                        "selector": "test_namespace = DEV_AI_DATA_NAMESPACE",
+                        "selector": "test_namespace = DLTK_DATA_NAMESPACE",
                     },
-                    "precheck": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); const [rows] = await connection.execute('SELECT id FROM thing WHERE id = ?', [ns]); bru.setVar('DEV_AI_STEP_EXISTS', rows.length ? 'true' : 'false');",
-                    "script": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); await connection.execute('INSERT IGNORE INTO thing(id) VALUES (?)', [ns]);",
-                    "setup_verification": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); const [rows] = await connection.execute('SELECT id FROM thing WHERE id = ?', [ns]); if (!rows.length) throw new Error('missing');",
-                    "cleanup": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); await connection.execute('DELETE FROM thing WHERE id = ?', [ns]);",
-                    "cleanup_verification": "const ns = bru.getEnvVar('DEV_AI_DATA_NAMESPACE'); const [rows] = await connection.execute('SELECT id FROM thing WHERE id = ?', [ns]); if (rows.length) throw new Error('cleanup failed');",
+                    "precheck": "const ns = bru.getEnvVar('DLTK_DATA_NAMESPACE'); const [rows] = await connection.execute('SELECT id FROM thing WHERE id = ?', [ns]); bru.setVar('DLTK_STEP_EXISTS', rows.length ? 'true' : 'false');",
+                    "script": "const ns = bru.getEnvVar('DLTK_DATA_NAMESPACE'); await connection.execute('INSERT IGNORE INTO thing(id) VALUES (?)', [ns]);",
+                    "setup_verification": "const ns = bru.getEnvVar('DLTK_DATA_NAMESPACE'); const [rows] = await connection.execute('SELECT id FROM thing WHERE id = ?', [ns]); if (!rows.length) throw new Error('missing');",
+                    "cleanup": "const ns = bru.getEnvVar('DLTK_DATA_NAMESPACE'); await connection.execute('DELETE FROM thing WHERE id = ?', [ns]);",
+                    "cleanup_verification": "const ns = bru.getEnvVar('DLTK_DATA_NAMESPACE'); const [rows] = await connection.execute('SELECT id FROM thing WHERE id = ?', [ns]); if (rows.length) throw new Error('cleanup failed');",
                 },
                 {
                     "phase": "assertion",
@@ -2270,7 +2270,7 @@ class RegressionTests(unittest.TestCase):
                 ])
             self.assertEqual(code, 2)
             command = run.call_args.args[0]
-            self.assertIn("dev_ai.domains.api_test.fetch_local_openapi", command)
+            self.assertIn("dltk.api_test_fetch_local_openapi", command)
             self.assertIn(str(qa_root.resolve() / "contracts" / "openapi.json"), command)
 
     def test_case_documentation_validator_rejects_missing_swimlane(self):
@@ -2605,8 +2605,8 @@ class RegressionTests(unittest.TestCase):
             "status": "pass",
             "assertionResults": [],
             "testResults": [
-                {"name": "dev-ai:flow:capture:job_id", "status": "passed"},
-                {"name": "dev-ai:flow:use:wrong", "status": "failed"},
+                {"name": "dltk:flow:capture:job_id", "status": "passed"},
+                {"name": "dltk:flow:use:wrong", "status": "failed"},
             ],
             "response": {"status": 202, "data": {"jobId": "j-1"}},
         }]}
@@ -3231,7 +3231,7 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("RESOURCE_LIST_INVALID_STATUS", seeded_ids)
         self.assertIn("RESOURCE_LIST_BOUNDARY_PAGENUM", seeded_ids)
 
-    def test_generated_project_does_not_copy_dev_ai_sources(self):
+    def test_generated_project_does_not_copy_dltk_sources(self):
         execution_config = load_script("execution_config")
         with tempfile.TemporaryDirectory() as directory:
             qa_root = Path(directory) / "qa"
@@ -4000,8 +4000,8 @@ class RegressionTests(unittest.TestCase):
             self.assertFalse((qa_root / "execution" / "plans.yaml").exists())
             self.assertIn("tooling: shared-cli", (qa_root / "execution" / "config.yaml").read_text(encoding="utf-8"))
             self.assertIn("cli_timeout: 60", (qa_root / "execution" / "config.yaml").read_text(encoding="utf-8"))
-            self.assertIn("dev-ai api-test run", (qa_root / "execution" / "run.bat").read_text(encoding="utf-8"))
-            self.assertIn("dev-ai api-test run", (qa_root / "execution" / "run.sh").read_text(encoding="utf-8"))
+            self.assertIn("dltk api-test run", (qa_root / "execution" / "run.bat").read_text(encoding="utf-8"))
+            self.assertIn("dltk api-test run", (qa_root / "execution" / "run.sh").read_text(encoding="utf-8"))
             self.assertIn("BRUNO_NPM_BIN", (qa_root / "execution" / "run.bat").read_text(encoding="utf-8"))
             self.assertIn("BRUNO_NODE_HOME", (qa_root / "execution" / "run.sh").read_text(encoding="utf-8"))
 
@@ -4092,7 +4092,7 @@ class RegressionTests(unittest.TestCase):
             self.assertFalse((qa_root / "scripts").exists())
 
             def preflight_run(command, **_kwargs):
-                if "dev_ai.domains.api_test.check_api_coverage" in command:
+                if "dltk.api_test_check_api_coverage" in command:
                     return subprocess.CompletedProcess(command, 0, json.dumps({"static_ok": True}), "")
                 output = Path(command[command.index("--output") + 1])
                 report = {"version": 2, "status": "runnable", "errors": []}
@@ -4227,7 +4227,7 @@ class RegressionTests(unittest.TestCase):
                 mock.patch.object(cli, "materialize"),
                 mock.patch.object(cli, "write_qa_lock"),
                 mock.patch.object(cli, "validate_stage", return_value=[]),
-                mock.patch("dev_ai.domains.api_test.execution_config.load_execution_config", return_value={
+                mock.patch("dltk.api_test_execution_config.load_execution_config", return_value={
                     "coverage_profile": "contract-draft", "active_environment": "local",
                 }),
             ):
@@ -4479,7 +4479,7 @@ class RegressionTests(unittest.TestCase):
                 mock.patch.object(cli, "write_qa_lock"),
                 mock.patch.object(cli, "validate_stage", return_value=[]),
                 mock.patch.object(cli, "run_command", return_value=7) as run,
-                mock.patch("dev_ai.domains.api_test.execution_config.load_execution_config", return_value={
+                mock.patch("dltk.api_test_execution_config.load_execution_config", return_value={
                     "coverage_profile": "contract-draft", "active_environment": "local",
                 }),
             ):

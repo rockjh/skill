@@ -7,11 +7,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from dev_ai.core.schema import E2E_CANDIDATE_KINDS
-from dev_ai.domains.e2e.contracts import merge_protocol_operations, parse_design_documents, parse_protocol_documents
-from dev_ai.domains.e2e.data import classify_data_requirements, generate_request_data
-from dev_ai.domains.e2e.discovery import discover_protocols, read_only_protocol_probe
-from dev_ai.domains.e2e.materialize import _candidate_matrix, _definition, _test_source
+from dltk.schema import E2E_CANDIDATE_KINDS
+from dltk.e2e_contracts import merge_protocol_operations, parse_design_documents, parse_protocol_documents
+from dltk.e2e_data import classify_data_requirements, generate_request_data
+from dltk.e2e_discovery import discover_protocols, read_only_protocol_probe
+from dltk.e2e_materialize import _candidate_matrix, _definition, _test_source
 
 
 class GenericCapabilityTests(unittest.TestCase):
@@ -118,7 +118,7 @@ class GenericCapabilityTests(unittest.TestCase):
                 pass
 
         connection = Connection()
-        with patch("dev_ai.domains.e2e.discovery.http.client.HTTPConnection", return_value=connection):
+        with patch("dltk.e2e_discovery.http.client.HTTPConnection", return_value=connection):
             result = read_only_protocol_probe(["http://127.0.0.1:8080/openapi.json"])
         self.assertEqual("runtime_url", result["sources"][0]["source_type"])
         self.assertTrue(all(method == "GET" for method, _ in connection.calls))

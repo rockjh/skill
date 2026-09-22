@@ -1,4 +1,0 @@
-interface:
-  display_name: "bru-api-test-generator"
-  short_description: "Generate modular Bruno HTTP tests from offline Swagger"
-  default_prompt: "Use $bru-api-test-generator to read every selected design source, build and review the persisted design-understanding matrix with explicit/derived/unknown evidence, then run dev-ai api-test understand before formal generation. Derive modular Bruno tests from the reviewed design and local OpenAPI. Use source only for execution support and test data, require one run-level write authorization, clean only run-owned data with verification, retain redacted evidence, and never adapt design expectations to source or observed behavior."

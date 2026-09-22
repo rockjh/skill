@@ -19,13 +19,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC = PROJECT_ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
-E2E_CLI = importlib.import_module("dev_ai.domains.e2e.cli")
-DISCOVERY = importlib.import_module("dev_ai.domains.e2e.discovery")
-CONTRACTS = importlib.import_module("dev_ai.domains.e2e.contracts")
-STATIC_CHECKS = importlib.import_module("dev_ai.domains.e2e.static_checks")
-SOURCE_VERSIONS = importlib.import_module("dev_ai.domains.e2e.source_versions")
-RUNNER = importlib.import_module("dev_ai.domains.e2e.runner")
-RUNTIME = importlib.import_module("dev_ai.domains.e2e.runtime")
+E2E_CLI = importlib.import_module("dltk.e2e_cli")
+DISCOVERY = importlib.import_module("dltk.e2e_discovery")
+CONTRACTS = importlib.import_module("dltk.e2e_contracts")
+STATIC_CHECKS = importlib.import_module("dltk.e2e_static_checks")
+SOURCE_VERSIONS = importlib.import_module("dltk.e2e_source_versions")
+RUNNER = importlib.import_module("dltk.e2e_runner")
+RUNTIME = importlib.import_module("dltk.e2e_runtime")
 GUARD = SimpleNamespace()
 for _module in (DISCOVERY, CONTRACTS, STATIC_CHECKS, RUNNER):
     for _name in dir(_module):
@@ -874,7 +874,7 @@ class StaticGuardTests(unittest.TestCase):
             self.assertFalse(any("diagram-type" in error or "diagram-scope" in error for error in errors), errors)
 
     def test_project_local_tool_launchers_are_rejected(self) -> None:
-        """生成项目必须通过已安装的 dev-ai 运行。"""
+        """生成项目必须通过已安装的 dltk 运行。"""
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

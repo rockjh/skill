@@ -7,8 +7,8 @@ from pathlib import Path
 
 import yaml
 
-from dev_ai.core.schema import get_schema, validate_schema
-from dev_ai.domains.e2e.contracts import (
+from dltk.schema import get_schema, validate_schema
+from dltk.e2e_contracts import (
     _generation_artifact_errors,
     generate_artifacts,
     map_design_to_protocol,
@@ -161,7 +161,7 @@ class DesignGenerationTests(unittest.TestCase):
                 "steps": [{"id": "create", "protocol_ref": "createOrder", "data_ref": "业务数据.json#/order"}],
             }
             errors = []
-            from dev_ai.domains.e2e.contracts import _scenario_artifact_errors
+            from dltk.e2e_contracts import _scenario_artifact_errors
             errors.extend(_scenario_artifact_errors(root, scenario, definition))
             self.assertTrue(any("protocol-required-field" in error for error in errors))
 
@@ -183,7 +183,7 @@ class DesignGenerationTests(unittest.TestCase):
                 "meta": {"status": "pending_environment"},
                 "steps": [{"id": "create", "protocol_ref": "createOrder", "data_ref": "业务数据.json#/order", "expect": ["missing=COMPLETED"]}],
             }
-            from dev_ai.domains.e2e.contracts import _scenario_artifact_errors
+            from dltk.e2e_contracts import _scenario_artifact_errors
             errors = _scenario_artifact_errors(root, scenario, definition)
             self.assertTrue(any("protocol-response-field" in error for error in errors))
 

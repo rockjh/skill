@@ -4,27 +4,27 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from dev_ai.domains.e2e import assets
+from dltk import e2e_assets as assets
 
 
-DOMAIN_ROOT = Path(__file__).resolve().parents[2] / "src" / "dev_ai" / "domains" / "e2e"
+DOMAIN_ROOT = Path(__file__).resolve().parents[2] / "dltk"
 
 
 class AssetTests(unittest.TestCase):
     def test_guard_implementation_is_partitioned_by_domain_responsibility(self) -> None:
-        self.assertFalse((DOMAIN_ROOT / "_engine.py").exists())
-        self.assertFalse((DOMAIN_ROOT / "design.py").exists())
-        self.assertFalse((DOMAIN_ROOT / "generation.py").exists())
+        self.assertFalse((DOMAIN_ROOT / "e2e_engine.py").exists())
+        self.assertFalse((DOMAIN_ROOT / "e2e_design.py").exists())
+        self.assertFalse((DOMAIN_ROOT / "e2e_generation.py").exists())
         expected = {
-            "discovery.py": "def discovery_errors(",
-            "contracts.py": "def contract_errors(",
-            "static_checks.py": "def static_errors(",
-            "runner.py": "def run_ordered(",
+            "e2e_discovery.py": "def discovery_errors(",
+            "e2e_contracts.py": "def contract_errors(",
+            "e2e_static_checks.py": "def static_errors(",
+            "e2e_runner.py": "def run_ordered(",
         }
         for filename, definition in expected.items():
             source = (DOMAIN_ROOT / filename).read_text(encoding="utf-8")
             self.assertIn(definition, source)
-            self.assertNotIn("from ._engine import", source)
+            self.assertNotIn("e2e_engine", source)
 
     def test_initialize_creates_business_shape_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -39,7 +39,7 @@ class AssetTests(unittest.TestCase):
             self.assertFalse((root / "scripts").exists())
             self.assertFalse((root / "common" / "e2e_runtime.py").exists())
             self.assertEqual([], list(root.rglob("*.py")))
-            self.assertIn("dev-ai e2e run", (root / "run-e2e.sh").read_text(encoding="utf-8"))
+            self.assertIn("dltk e2e run", (root / "run-e2e.sh").read_text(encoding="utf-8"))
             self.assertIn("database_control_enabled: false", (root / "config" / "config.template.yaml").read_text(encoding="utf-8"))
             self.assertEqual([], assets.project_errors(root))
 

@@ -1,0 +1,50 @@
+{
+  "schema_version": 3,
+  "source_fingerprint": "example-source-fingerprint",
+  "effective_git": "example-commit",
+  "confirmed": true,
+  "entry_reviews": [
+    {
+      "id": "url:POST /relations/sync",
+      "trigger": "运营客户端",
+      "purpose": "同步关系并返回受理结果",
+      "input": "设备标识列表",
+      "outcome": "本地受理完成，不代表所有远端操作完成",
+      "failure": "零行领取不访问远端；单项失败继续批次；未知结果保持处理中等待人工确认",
+      "status": "confirmed",
+      "confirmed_by": "业务评审人",
+      "steps": [
+        {"kind": "action", "text": "校验列表非空", "source": "relation_service.py:40", "participant": "当前系统"},
+        {"kind": "action", "text": "条件领取 PENDING 或 FAILED 关系", "source": "relation_service.py:41", "participant": "数据库"},
+        {"kind": "loop", "text": "逐条处理关系", "source": "relation_service.py:52", "participant": "当前系统"},
+        {"kind": "action", "text": "调用资源服务接口", "source": "relation_service.py:55", "participant": "可见外部接口"},
+        {"kind": "end", "text": "结束逐条处理", "source": "relation_service.py:68", "participant": "当前系统"}
+      ]
+    },
+    {
+      "id": "message:relation-failed",
+      "trigger": "消息生产方",
+      "purpose": "消费关系失败事件并发送通知",
+      "input": "关系失败事件",
+      "outcome": "消息被受理，通知发送结果由异步处理决定",
+      "failure": "工作线程失败不会改写已返回的受理响应，失败记录留在任务日志",
+      "status": "confirmed",
+      "confirmed_by": "业务评审人",
+      "steps": [
+        {"kind": "action", "text": "消费 relation-failed 消息", "source": "notification.py:18", "participant": "消息/异步系统"},
+        {"kind": "action", "text": "发送通知", "source": "notification.py:24", "participant": "可见外部接口"}
+      ]
+    }
+  ],
+  "migrations": [
+    {"from": "resource", "to": "relation-sync", "reason": "按关系生命周期拆分"}
+  ],
+  "resolutions": [],
+  "entry_overrides": [],
+  "additional_entries": [],
+  "exclusions": [],
+  "modules": [
+    {"name": "relation-sync", "display_name": "Relation Sync", "rationale": "按关系生命周期、条件领取和资源协作边界归组。", "file": "00-relation-sync.md", "responsibility": "关系领取与远端同步", "objects": ["Relation"], "partners": ["资源服务"], "questions": [], "entry_ids": ["url:POST /relations/sync"]},
+    {"name": "notification", "display_name": "Notification", "rationale": "按失败事件生命周期和消息通知职责归组。", "file": "01-notification.md", "responsibility": "失败事件通知", "objects": ["FailureEvent"], "partners": ["消息系统"], "questions": [], "entry_ids": ["message:relation-failed"]}
+  ]
+}

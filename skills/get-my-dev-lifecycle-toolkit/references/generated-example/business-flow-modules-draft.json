@@ -1,0 +1,36 @@
+{
+  "schema_version": 3,
+  "source_fingerprint": "example-source-fingerprint",
+  "effective_git": "example-commit",
+  "confirmed": false,
+  "entry_reviews": [],
+  "migrations": [],
+  "resolutions": [],
+  "entry_overrides": [],
+  "additional_entries": [],
+  "exclusions": [],
+  "modules": [
+    {
+      "name": "relation-sync",
+      "display_name": "Relation Sync",
+      "rationale": "候选：关系对象、领取状态和资源服务协作关系相近，等待人工确认边界。",
+      "file": "00-relation-sync.md",
+      "responsibility": "待人工确认",
+      "objects": ["Relation"],
+      "partners": ["资源服务"],
+      "questions": ["是否与失败通知共用同一模块"],
+      "entry_ids": ["url:POST /relations/sync"]
+    },
+    {
+      "name": "notification",
+      "display_name": "Notification",
+      "rationale": "候选：消息消费和通知策略生命周期相近，等待人工确认边界。",
+      "file": "01-notification.md",
+      "responsibility": "待人工确认",
+      "objects": ["FailureEvent"],
+      "partners": ["消息系统"],
+      "questions": ["确认消息消费是否独立模块"],
+      "entry_ids": ["message:relation-failed"]
+    }
+  ]
+}

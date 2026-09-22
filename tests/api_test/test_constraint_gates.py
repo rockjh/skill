@@ -22,7 +22,7 @@ if str(SRC) not in sys.path:
 
 def load_script(name: str):
     aliases = {"bruno_api_test_generator": "cli", "qa_constraints": "constraints"}
-    return importlib.import_module(f"dev_ai.domains.api_test.{aliases.get(name, name)}")
+    return importlib.import_module(f"dltk.api_test_{aliases.get(name, name)}")
 
 
 def generated_project(root: Path, design_text: str | None = None) -> tuple[object, object, Path, Path]:
@@ -167,7 +167,7 @@ class ConstraintGateTests(unittest.TestCase):
     def test_source_business_inference_modules_are_removed(self):
         for name in ("analyze_source_logic", "analyze_java_logic", "source_constraints"):
             with self.subTest(module=name):
-                self.assertIsNone(importlib.util.find_spec(f"dev_ai.domains.api_test.{name}"))
+                self.assertIsNone(importlib.util.find_spec(f"dltk.api_test_{name}"))
 
     def test_design_exclusions_require_explicit_approval_when_declared(self):
         design_rules = load_script("design_rules")
@@ -279,7 +279,7 @@ class ConstraintGateTests(unittest.TestCase):
             self.assertTrue(any("must reference OpenAPI operation" in error for error in errors), errors)
 
     def test_generated_design_artifacts_match_scoped_schemas(self):
-        from dev_ai.core.schema import get_schema, validate_schema
+        from dltk.schema import get_schema, validate_schema
 
         with tempfile.TemporaryDirectory() as directory:
             _, _, qa_root, module = generated_project(Path(directory))

@@ -6,10 +6,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from dev_ai.domains.business_flow.cli import _progress
-from dev_ai.domains.business_flow.discovery import scan
-from dev_ai.domains.business_flow.documents import _diagram, _validate_mermaid, apply_module_map, write_discovery
-from dev_ai.domains.business_flow.models import BehaviorEvidence, EntryPoint, GitInfo
+from dltk.business_flow_cli import _progress
+from dltk.business_flow_discovery import scan
+from dltk.business_flow_documents import _diagram, _validate_mermaid, apply_module_map, write_discovery
+from dltk.business_flow_models import BehaviorEvidence, EntryPoint, GitInfo
 
 
 class BusinessFlowV3Tests(unittest.TestCase):

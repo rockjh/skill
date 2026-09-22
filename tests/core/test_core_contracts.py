@@ -4,10 +4,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from dev_ai.core.artifacts import require_lock, write_lock
-from dev_ai.core.errors import DevAIError
-from dev_ai.core.redaction import redact
-from dev_ai.core.schema import CONFIG_SCHEMA, validate_schema
+from dltk.artifacts import require_lock, write_lock
+from dltk.errors import DltkError
+from dltk.redaction import redact
+from dltk.schema import CONFIG_SCHEMA, validate_schema
 
 
 class CoreContractTests(unittest.TestCase):
@@ -30,7 +30,7 @@ class CoreContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             write_lock(root, tool_version="1", domain="e2e", schema_version="old")
-            with self.assertRaisesRegex(DevAIError, "schema"):
+            with self.assertRaisesRegex(DltkError, "schema"):
                 require_lock(root, tool_version="1", domain="e2e", schema_version="new")
 
     def test_config_schema_matches_runtime_optional_polling_contract(self) -> None:

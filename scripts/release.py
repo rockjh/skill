@@ -1,4 +1,4 @@
-"""Build the dev-ai wheel and stage the npm installer payload."""
+"""Build the dltk wheel and stage the npm installer payload."""
 
 from __future__ import annotations
 
@@ -25,34 +25,37 @@ def main() -> int:
     if build.exists():
         shutil.rmtree(build)
     dist.mkdir(parents=True, exist_ok=True)
-    for old_wheel in dist.glob("seres_dev_ai-*.whl"):
+    for old_wheel in dist.glob("*.whl"):
         old_wheel.unlink()
     subprocess.run(
         [sys.executable, "-m", "pip", "wheel", "--no-deps", "--wheel-dir", str(dist), str(ROOT)],
         cwd=ROOT,
         check=True,
     )
-    wheels = sorted(dist.glob("seres_dev_ai-*.whl"))
+    wheels = sorted(dist.glob("dltk-*.whl"))
     if len(wheels) != 1:
-        raise RuntimeError(f"expected one seres-dev-ai wheel, found {len(wheels)}")
+        raise RuntimeError(f"expected one dltk wheel, found {len(wheels)}")
     with zipfile.ZipFile(wheels[0]) as archive:
         names = set(archive.namelist())
-        if "dev_ai/domains/e2e/_engine.py" in names:
+        if any(Path(name).name == "_engine.py" for name in names):
             raise RuntimeError("wheel contains the removed E2E legacy engine")
         entry_points = archive.read(
-            f"seres_dev_ai-{python_version}.dist-info/entry_points.txt"
+            f"dltk-{python_version}.dist-info/entry_points.txt"
         ).decode("utf-8").strip()
-        if entry_points != "[console_scripts]\ndev-ai = dev_ai.cli:console_main":
+        if entry_points != "[console_scripts]\ndltk = dltk.cli:console_main":
             raise RuntimeError(f"unexpected wheel entry points: {entry_points}")
-    vendor = NPM / "vendor"
-    vendor.mkdir(parents=True, exist_ok=True)
-    for old_wheel in vendor.glob("seres_dev_ai-*.whl"):
-        old_wheel.unlink()
-    shutil.copy2(wheels[0], vendor / wheels[0].name)
+    npm_dist = NPM / "dist"
+    if npm_dist.exists():
+        shutil.rmtree(npm_dist)
+    npm_dist.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(wheels[0], npm_dist / wheels[0].name)
     target_skills = NPM / "skills"
     if target_skills.exists():
         shutil.rmtree(target_skills)
-    shutil.copytree(ROOT / "skills", target_skills)
+    shutil.copytree(ROOT / "skills" / "get-my-dev-lifecycle-toolkit", target_skills / "get-my-dev-lifecycle-toolkit")
+    payload = sorted(path.relative_to(target_skills).parts[0] for path in target_skills.iterdir())
+    if payload != ["get-my-dev-lifecycle-toolkit"]:
+        raise RuntimeError(f"unexpected npm Skill payload: {payload}")
     npm = "npm.cmd" if sys.platform == "win32" else "npm"
     subprocess.run([npm, "pack", "--ignore-scripts"], cwd=NPM, check=True)
     return 0

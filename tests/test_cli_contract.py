@@ -8,7 +8,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from dev_ai.cli import console_main
+from dltk.cli import console_main
 
 
 class CliContractTests(unittest.TestCase):
@@ -96,7 +96,7 @@ class CliContractTests(unittest.TestCase):
             self.assertEqual("TARGET_NOT_FOUND", missing["error"]["code"])
 
     def test_mock_data_subcommand_help_is_registered(self) -> None:
-        from dev_ai.domains.api_test.cli import main as api_test_main
+        from dltk.api_test_cli import main as api_test_main
 
         stream = io.StringIO()
         with redirect_stdout(stream), self.assertRaises(SystemExit) as exit_context:
@@ -132,7 +132,7 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertNotIn("--design-file", check["data"]["options"])
 
-        from dev_ai.domains.e2e.cli import main as e2e_main
+        from dltk.e2e_cli import main as e2e_main
 
         for command in ("discover", "generate"):
             stream = io.StringIO()
@@ -163,7 +163,7 @@ class CliContractTests(unittest.TestCase):
             root = Path(temporary)
             code, result = self.invoke("e2e", "init", "--project", str(root))
             self.assertEqual(0, code, result)
-            self.assertTrue((root / ".dev-ai.lock.json").is_file())
+            self.assertTrue((root / ".dltk.lock.json").is_file())
             self.assertFalse((root / "scripts").exists())
             self.assertFalse((root / "common" / "e2e_runtime.py").exists())
             self.assertTrue((root / "scenarios" / "scenario.template.yaml").is_file())
@@ -183,7 +183,7 @@ class CliContractTests(unittest.TestCase):
                 {"bruno", "contracts", "constraints", "execution", "results"},
                 {path.name for path in root.iterdir() if path.is_dir()},
             )
-            self.assertTrue((root / ".dev-ai.lock.json").is_file())
+            self.assertTrue((root / ".dltk.lock.json").is_file())
             self.assertTrue((root / "contracts" / "version-lock.yaml").is_file())
             self.assertFalse((root / "scripts").exists())
             for name in (
@@ -260,7 +260,7 @@ class CliContractTests(unittest.TestCase):
                 "bruno": {"ok": False, "required_for": "api-test.run"},
             }
         }
-        with patch("dev_ai.cli.diagnose", return_value=(checks, False)):
+        with patch("dltk.cli.diagnose", return_value=(checks, False)):
             code, result = self.invoke("doctor")
         self.assertEqual(6, code)
         self.assertEqual("EXTERNAL_UNAVAILABLE", result["error"]["code"])
